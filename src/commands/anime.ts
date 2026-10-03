@@ -128,26 +128,27 @@ async function enrichWithAI(
   if (existing.releaseDate) known.push(`releaseDate: ${existing.releaseDate}`);
 
   const prompt =
-    `You are an anime database expert. Return STRICT JSON only, no markdown, no explanation.\n\n` +
+    `You are a FACTUAL anime database expert. Return STRICT JSON only.\n` +
+    `CRITICAL: If you don't know a fact with HIGH CONFIDENCE, return null for that field. NEVER GUESS or HALLUCINATE.\n\n` +
     `Anime title: ${title}\n\n` +
     (known.length > 0
       ? `Known data (DO NOT change these):\n${known.join('\n')}\n\n`
       : '') +
     `Fill in ONLY these missing fields: ${need.join(', ')}\n\n` +
-    `Output format (JSON):\n` +
+    `Output JSON format:\n` +
     `{\n` +
-    `  "studio": "Studio name or null",\n` +
-    `  "rating": 8.5,\n` +
+    `  "studio": "exact animation studio name or null",\n` +
+    `  "rating": 7.5,\n` +
     `  "genre": ["Action", "Adventure"],\n` +
     `  "releaseDate": "YYYY-MM-DD",\n` +
-    `  "synopsis": "2-3 paragraph synopsis in Indonesian, no spoilers"\n` +
+    `  "synopsis": "factual Indonesian synopsis, no spoilers"\n` +
     `}\n\n` +
-    `Rules:\n` +
-    `- Only include requested fields\n` +
-    `- rating: number 0-10 with 1 decimal\n` +
-    `- synopsis: 100-250 words, Indonesian, no spoiler\n` +
-    `- If unsure, use null\n` +
-    `- Output valid JSON only`;
+    `STRICT RULES:\n` +
+    `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
+    `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
+    `- studio: only the PRIMARY animation studio (not producer)\n` +
+    `- synopsis: factual summary, NOT creative writing\n` +
+    `- Output valid JSON only, no markdown, no explanation`;
 
   console.log(
     `[Anime] AI enrich — need: [${need.join(', ')}], prompt len: ${prompt.length}`
@@ -157,7 +158,7 @@ async function enrichWithAI(
     const raw = await chatAI(
       env,
       [{ role: 'user', content: prompt }],
-      { maxTokens: 900, temperature: 0.2 }
+      { maxTokens: 900, temperature: 0.1, smart: true }
     );
 
     console.log(`[Anime] AI raw response len: ${raw?.length ?? 0}`);
@@ -366,7 +367,7 @@ function extractTitleFromMALUrl(url: string): string | null {
 }
 
 /* ═══════════════════════════════════════════════
-   FETCH CHAIN (Jikan → Kitsu, tanpa AniList)
+   FETCH CHAIN (Jikan → Kitsu)
    ═══════════════════════════════════════════════ */
 
 async function fetchMetadata(query: string): Promise<{
@@ -387,7 +388,7 @@ async function fetchMetadata(query: string): Promise<{
     console.warn('[Anime] Jikan failed:', msg);
   }
 
-  // 2. Kitsu — reliable fallback
+  // 2. Kitsu — reliable, studio di-fetch terpisah
   try {
     const kitsu = await searchKitsu(query);
     if (kitsu) {
@@ -404,7 +405,7 @@ async function fetchMetadata(query: string): Promise<{
 }
 
 /* ═══════════════════════════════════════════════
-   DETECT MISSING UNTUK AI
+   DETECT MISSING
    ═══════════════════════════════════════════════ */
 
 function detectMissing(media: AniListMedia, source: string): string[] {
@@ -504,7 +505,6 @@ export const animeCommand: CommandDefinition = {
         return;
       }
 
-      // Info card
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -512,7 +512,6 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // Deteksi field kosong
       const sourceName = sourceLabel
         .replace(/^📡 Sumber: /, '')
         .replace(/^⚡ Dari cache$/, '');
@@ -544,10 +543,8 @@ export const animeCommand: CommandDefinition = {
           .catch(() => {});
       }
 
-      // Build result
       const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
 
-      // Warning
       const warnLines: string[] = [];
       if (missing.length > 0) {
         warnLines.push('⚠️ <b>Perlu edit manual:</b>');
@@ -557,7 +554,7 @@ export const animeCommand: CommandDefinition = {
         warnLines.push('');
       }
       if (aiUsed.length > 0) {
-        warnLines.push('🤖 <b>Diisi AI (verifikasi ulang):</b>');
+        warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang, bisa halusinasi):</b>');
         for (const f of aiUsed) {
           warnLines.push(`• <code>${escapeHtml(f)}</code>`);
         }
@@ -569,13 +566,11 @@ export const animeCommand: CommandDefinition = {
         });
       }
 
-      // YAML
       await ctx.reply(
         `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(yaml)}</pre>`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // Body
       const bodyMax = 3500;
       const bodyPreview =
         body.length > bodyMax
@@ -587,7 +582,6 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // Cover
       const cover = media.coverImage.extraLarge || media.coverImage.large;
       if (cover && isValidHttpUrl(cover)) {
         try {
