@@ -1,7 +1,7 @@
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from './anilist';
 
-const SHIKIMORI_URL = 'https://shikimori.one/api/anime';
+const SHIKIMORI_URL = 'https://shikimori.one/api/animes';
 
 interface ShikimoriAnime {
   id: number;
