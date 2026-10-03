@@ -5,7 +5,7 @@ export async function fetchWithRetry(
 ): Promise<Response> {
   const retries = opts.retries ?? 0;
   const baseDelay = opts.baseDelay ?? 500;
-  const timeout = opts.timeout ?? 5000;
+  const timeout = opts.timeout ?? 4000;
 
   let lastErr: unknown;
 
@@ -22,7 +22,7 @@ export async function fetchWithRetry(
       lastErr = err;
 
       if (attempt < retries) {
-        await new Promise(r => setTimeout(r, baseDelay));
+        await new Promise((r) => setTimeout(r, baseDelay));
         continue;
       }
       throw err;
