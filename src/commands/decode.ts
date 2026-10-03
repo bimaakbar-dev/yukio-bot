@@ -353,7 +353,7 @@ export const decodeCommand: CommandDefinition = {
   name: 'decode',
   description: 'Decode Base64 / HTML file jadi URL asli',
   usage:
-    '/decode <base64|html>\nKirim file .html/.txt dengan caption /decode',
+  '/decode base64-atau-html\nKirim file .html/.txt dengan caption /decode',
   adminOnly: true,
 
   handler: async (ctx, env) => {
