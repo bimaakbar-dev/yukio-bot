@@ -1,3 +1,11 @@
+import * as ed from '@noble/ed25519';
+import { sha512 } from '@noble/hashes/sha512';
+
+// Set sha512 sync implementation (dibutuhkan @noble/ed25519)
+ed.etc.sha512Sync = (...m: Uint8Array[]): Uint8Array => {
+  return sha512(ed.etc.concatBytes(...m));
+};
+
 export async function verifyDiscordSignature(
   publicKeyHex: string,
   signatureHex: string,
@@ -9,22 +17,16 @@ export async function verifyDiscordSignature(
     const signature = hexToBytes(signatureHex);
     const message = new TextEncoder().encode(timestamp + body);
 
-    const key = await crypto.subtle.importKey(
-      'raw',
-      publicKey.buffer as ArrayBuffer,
-      { name: 'Ed25519' } as any,
-      false,
-      ['verify']
+    console.log(
+      `[Discord] verify — pk:${publicKey.length} sig:${signature.length} msg:${message.length}`
     );
 
-    return await crypto.subtle.verify(
-      { name: 'Ed25519' } as any,
-      key,
-      signature.buffer as ArrayBuffer,
-      message.buffer as ArrayBuffer
-    );
+    const result = await ed.verifyAsync(signature, message, publicKey);
+
+    console.log('[Discord] verify result:', result);
+    return result;
   } catch (err) {
-    console.error('[Discord] signature verify failed:', err);
+    console.error('[Discord] verify error:', err);
     return false;
   }
 }
