@@ -5,6 +5,7 @@ import { handleAnime, handleAnimeButton } from './commands/anime';
 
 export interface DiscordInteraction {
   id: string;
+  application_id: string;
   type: number;
   token: string;
   data?: {
@@ -52,7 +53,9 @@ export async function handleDiscordRequest(
     return new Response('Invalid JSON', { status: 400 });
   }
 
-  console.log('[Discord] type:', interaction.type);
+  console.log(
+    `[Discord] type=${interaction.type} app_id=${interaction.application_id}`
+  );
 
   // PING
   if (interaction.type === 1) {
@@ -83,7 +86,7 @@ export async function handleDiscordRequest(
     console.log(`[Discord] button: ${customId}`);
 
     if (customId.startsWith('an:')) {
-      return handleAnimeButton(interaction, env, customId);
+      return handleAnimeButton(interaction, env, ctx, customId);
     }
 
     return json({
