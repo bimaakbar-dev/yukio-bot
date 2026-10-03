@@ -3,12 +3,7 @@ import { searchAniList, type AniListMedia } from '../services/anilist';
 import { searchJikan, jikanToAniList } from '../services/jikan';
 import { getCache, setCache } from '../lib/cache';
 
-// Cache TTL: 30 hari
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
-// ──────────────────────────────────────────────────────────
-// Mapping helpers
-// ──────────────────────────────────────────────────────────
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
@@ -27,10 +22,6 @@ const STATUS_MAP: Record<string, string> = {
   CANCELLED: 'Hiatus',
   HIATUS: 'Hiatus',
 };
-
-// ──────────────────────────────────────────────────────────
-// Format helpers
-// ──────────────────────────────────────────────────────────
 
 function escapeHtml(s: string): string {
   return s
@@ -87,8 +78,6 @@ function buildYaml(media: AniListMedia): string {
   const d = String(media.startDate?.day ?? 1).padStart(2, '0');
   const releaseDate = `${y}-${mo}-${d}`;
   const addedAt = new Date().toISOString().split('T')[0];
-
-  // Quote title kalau mengandung karakter YAML spesial
   const needsQuote = /[:#&*!|>'"%@`{}[\],]/.test(title);
   const safeTitle = needsQuote
     ? `"${title.replace(/"/g, '\\"')}"`
@@ -108,15 +97,10 @@ episodes: []
 ---`;
 }
 
-// ──────────────────────────────────────────────────────────
-// Fetch metadata dengan fallback
-// ──────────────────────────────────────────────────────────
-
 async function fetchMetadata(query: string): Promise<{
   media: AniListMedia;
   source: 'anilist' | 'jikan';
 } | null> {
-  // 1. Coba AniList (data paling lengkap)
   try {
     const media = await searchAniList(query);
     if (media) return { media, source: 'anilist' };
@@ -124,7 +108,6 @@ async function fetchMetadata(query: string): Promise<{
     console.warn('[Anime] AniList failed:', err);
   }
 
-  // 2. Fallback ke Jikan (MAL)
   try {
     const jikan = await searchJikan(query);
     if (jikan) return { media: jikanToAniList(jikan), source: 'jikan' };
@@ -135,10 +118,6 @@ async function fetchMetadata(query: string): Promise<{
   return null;
 }
 
-// ──────────────────────────────────────────────────────────
-// Command definition
-// ──────────────────────────────────────────────────────────
-
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime',
@@ -146,8 +125,7 @@ export const animeCommand: CommandDefinition = {
   adminOnly: true,
 
   handler: async (ctx, env) => {
-    // Ambil query dari arg atau dari pesan yang di-reply
-    const argQuery = ctx.match?.trim() ?? '';
+    const argQuery = typeof ctx.match === 'string' ? ctx.match.trim() : '';
     const repliedText = ctx.message?.reply_to_message?.text ?? '';
     const query = argQuery || repliedText;
 
@@ -165,10 +143,9 @@ export const animeCommand: CommandDefinition = {
     const loading = await ctx.reply('🔍 Mencari...');
 
     try {
-      // Cek cache D1 dulu
       const cacheKey = `anime:${query.toLowerCase().trim()}`;
       let media = await getCache<AniListMedia>(env.DB, cacheKey);
-      let fromCache = !!media;
+      const fromCache = !!media;
 
       if (!media) {
         const result = await fetchMetadata(query);
@@ -186,7 +163,7 @@ export const animeCommand: CommandDefinition = {
         await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
       }
 
-      // ── Edit loading → info card
+      // Info card
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -194,14 +171,14 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // ── Kirim YAML frontmatter
+      // YAML frontmatter
       const yaml = buildYaml(media);
       await ctx.reply(
         `<b>YAML Frontmatter</b>\n\n<pre><code class="language-yaml">${escapeHtml(yaml)}</code></pre>`,
         { parse_mode: 'HTML' }
       );
 
-      // ── Kirim cover image
+      // Cover image
       const cover = media.coverImage.extraLarge || media.coverImage.large;
       if (cover) {
         try {
@@ -211,7 +188,7 @@ export const animeCommand: CommandDefinition = {
         }
       }
 
-      // ── Info kalau dari cache
+      // Cache notice
       if (fromCache) {
         await ctx.reply('⚡ Dari cache');
       }
