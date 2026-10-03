@@ -216,7 +216,9 @@ function stripHtml(s: string): string {
     .trim();
 }
 
-/** Pilih value pertama yang "ada" (bukan null/undefined/empty string/empty array). */
+/**
+ * Pilih value pertama yang "ada".
+ */
 function pick<T>(...values: (T | null | undefined)[]): T | null {
   for (const v of values) {
     if (v === null || v === undefined) continue;
@@ -225,6 +227,48 @@ function pick<T>(...values: (T | null | undefined)[]): T | null {
     return v;
   }
   return null;
+}
+
+/**
+ * Normalize nama studio — pastikan prefix "Studio " kalau perlu.
+ */
+function normalizeStudioName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) return trimmed;
+
+  const lower = trimmed.toLowerCase();
+
+  const knownKeep = [
+    'studio',
+    'animation',
+    'production',
+    'pictures',
+    'works',
+    'toei',
+    'mappa',
+    'ufotable',
+    'bones',
+    'wit ',
+    'kyoto',
+    'ghibli',
+    'gibli',
+    'shaft',
+    'trigger',
+    'sunrise',
+    'gainax',
+    'madhouse',
+    'a-1',
+    'pierrot',
+    'j.c.staff',
+    'jc staff',
+    'cloverworks',
+  ];
+
+  if (knownKeep.some((k) => lower.includes(k))) {
+    return trimmed;
+  }
+
+  return `Studio ${trimmed}`;
 }
 
 /* ═══════════════════════════════════════════════
@@ -290,7 +334,7 @@ async function enrichWithAI(
     `STRICT RULES:\n` +
     `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
     `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
-    `- studio: only the PRIMARY animation studio (not producer)\n` +
+    `- studio: full official name with "Studio" prefix if applicable (e.g., "Studio Pierrot", "MAPPA")\n` +
     `- synopsis: factual summary in Indonesian, NOT creative writing\n` +
     `- Output valid JSON only, no markdown, no explanation`;
 
@@ -338,10 +382,6 @@ async function enrichWithAI(
   }
 }
 
-/**
- * Bungkus enrichWithAI dengan timeout.
- * Panggil SEKALI saja — kalau gagal, STOP. Tidak retry.
- */
 async function enrichWithAITimeout(
   env: Env,
   title: string,
@@ -425,7 +465,7 @@ function buildResult(
   let studio = media.studios?.nodes?.[0]?.name ?? '';
   if (!studio || studio === 'Unknown') {
     if (enriched?.studio) {
-      studio = enriched.studio;
+      studio = normalizeStudioName(enriched.studio);
       aiUsed.push('studio');
     } else {
       studio = 'Unknown';
@@ -555,20 +595,35 @@ async function fetchAndMerge(query: string): Promise<{
     searchShikimori(query),
   ]);
 
-  const kitsu =
-    kitsuR.status === 'fulfilled' && kitsuR.value
-      ? kitsuToAniList(kitsuR.value)
-      : null;
-  const jikan =
-    jikanR.status === 'fulfilled' && jikanR.value
-      ? jikanToAniList(jikanR.value)
-      : null;
-  const anilist =
-    anilistR.status === 'fulfilled' && anilistR.value ? anilistR.value : null;
-  const shikimori =
-    shikimoriR.status === 'fulfilled' && shikimoriR.value
-      ? shikimoriToAniList(shikimoriR.value)
-      : null;
+  const logStatus = (name: string, r: PromiseSettledResult<unknown>): boolean => {
+    if (r.status === 'fulfilled') {
+      const hasData = r.value !== null && r.value !== undefined;
+      console.log(`[Anime] ${name}: ${hasData ? 'OK' : 'empty result'}`);
+      return hasData;
+    }
+    const err = r.reason;
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Anime] ${name}: FAILED — ${msg}`);
+    return false;
+  };
+
+  const hasKitsu = logStatus('Kitsu', kitsuR);
+  const hasJikan = logStatus('Jikan', jikanR);
+  const hasAniList = logStatus('AniList', anilistR);
+  const hasShikimori = logStatus('Shikimori', shikimoriR);
+
+  const kitsu = hasKitsu
+    ? kitsuToAniList((kitsuR as PromiseFulfilledResult<any>).value)
+    : null;
+  const jikan = hasJikan
+    ? jikanToAniList((jikanR as PromiseFulfilledResult<any>).value)
+    : null;
+  const anilist = hasAniList
+    ? (anilistR as PromiseFulfilledResult<AniListMedia>).value
+    : null;
+  const shikimori = hasShikimori
+    ? shikimoriToAniList((shikimoriR as PromiseFulfilledResult<any>).value)
+    : null;
 
   const sources: string[] = [];
   if (kitsu) sources.push('Kitsu');
@@ -584,7 +639,14 @@ async function fetchAndMerge(query: string): Promise<{
 
   if (sources.length === 0) return null;
 
-  // ─── Merge: prioritas per field ───
+  const studioLog = [
+    `Kitsu=${kitsu?.studios?.nodes?.[0]?.name ?? '-'}`,
+    `Jikan=${jikan?.studios?.nodes?.[0]?.name ?? '-'}`,
+    `AniList=${anilist?.studios?.nodes?.[0]?.name ?? '-'}`,
+    `Shikimori=${shikimori?.studios?.nodes?.[0]?.name ?? '-'}`,
+  ].join(' | ');
+  console.log(`[Anime] studio per source: ${studioLog}`);
+
   const merged: AniListMedia = {
     id: anilist?.id ?? jikan?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
 
@@ -627,7 +689,6 @@ async function fetchAndMerge(query: string): Promise<{
         ) ?? '',
     },
 
-    // AniList description paling bagus formatnya; Jikan/Kitsu sebagai fallback
     description: pick(
       anilist?.description,
       jikan?.description,
@@ -662,7 +723,6 @@ async function fetchAndMerge(query: string): Promise<{
       shikimori?.episodes
     ),
 
-    // AniList genre paling lengkap
     genres:
       pick(
         anilist?.genres,
@@ -671,7 +731,6 @@ async function fetchAndMerge(query: string): Promise<{
         shikimori?.genres
       ) ?? [],
 
-    // AniList score 0-100 (base), Jikan/Kitsu 0-100 (sudah dikonversi)
     averageScore: pick(
       anilist?.averageScore,
       jikan?.averageScore,
@@ -679,14 +738,14 @@ async function fetchAndMerge(query: string): Promise<{
       shikimori?.averageScore
     ),
 
-    // Studio: Jikan (MAL) paling akurat, lalu AniList, lalu Kitsu, lalu Shikimori
+    // Studio: Jikan paling akurat, lalu AniList, lalu Kitsu, lalu Shikimori
     studios: {
       nodes:
         pick(
           jikan?.studios.nodes,
           anilist?.studios.nodes,
-          kitsu?.studios.nodes,
-          shikimori?.studios.nodes
+          shikimori?.studios.nodes,
+          kitsu?.studios.nodes
         ) ?? [],
     },
 
@@ -821,7 +880,7 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      let need = detectMissing(media);
+      const need = detectMissing(media);
       console.log(`[Anime] missing after merge: [${need.join(', ') || 'none'}]`);
 
       let enriched: Enriched | null = null;
@@ -832,7 +891,6 @@ export const animeCommand: CommandDefinition = {
           { parse_mode: 'HTML' }
         );
 
-        // Panggil AI SEKALI — kalau gagal, STOP, tidak retry
         enriched = await enrichWithAITimeout(
           env,
           pickTitle(media),
