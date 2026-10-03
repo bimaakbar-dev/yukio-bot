@@ -93,32 +93,21 @@ episodes: []
 ---`;
 }
 
-/* ==========================================================
-   DETEKSI & EXTRACT MAL URL
-   ========================================================== */
+/* ─── Deteksi URL MAL ─── */
 
 function isMALUrl(s: string): boolean {
   return /^https?:\/\/(www\.)?myanimelist\.net\/anime\/\d+/i.test(s.trim());
 }
 
-function extractMALId(url: string): string | null {
-  const m = url.match(/myanimelist\.net\/anime\/(\d+)/i);
-  return m?.[1] ?? null;
-}
-
 function extractTitleFromMALUrl(url: string): string | null {
-  // URL: https://myanimelist.net/anime/62811/Kimi_no_Koto_ga_...
   const m = url.match(/myanimelist\.net\/anime\/\d+\/([^\/\?#]+)/i);
   if (!m) return null;
-
-  // Decode URL-encoded + replace underscore dengan spasi
-  const slug = decodeURIComponent(m[1]).replace(/_/g, ' ').trim();
-  return slug || null;
+  const slug = m[1];
+  if (!slug) return null;
+  return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
 
-/* ==========================================================
-   FETCH METADATA — CHAIN
-   ========================================================== */
+/* ─── Fetch chain ─── */
 
 async function fetchMetadata(query: string): Promise<{
   media: AniListMedia;
@@ -164,14 +153,12 @@ async function fetchMetadata(query: string): Promise<{
   return null;
 }
 
-/* ==========================================================
-   COMMAND
-   ========================================================== */
+/* ─── Command ─── */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime',
-  usage: '/anime jujutsu kaisen\n/anime https://myanimelist.net/anime/40748',
+  usage: '/anime jujutsu kaisen',
   adminOnly: true,
 
   handler: async (ctx, env) => {
@@ -186,7 +173,7 @@ export const animeCommand: CommandDefinition = {
           '<code>/anime jujutsu kaisen</code>\n\n' +
           '<b>Atau URL MyAnimeList:</b>\n' +
           '<code>/anime https://myanimelist.net/anime/40748</code>',
-        { parseMode: 'HTML' } as any
+        { parse_mode: 'HTML' }
       );
       return;
     }
@@ -198,31 +185,21 @@ export const animeCommand: CommandDefinition = {
       let sourceLabel = '';
       let searchQuery = query;
 
-      // ─── Mode MAL URL: extract judul dari slug ───
+      // Mode MAL URL: extract judul dari slug
       if (isMALUrl(query)) {
-        const malId = extractMALId(query);
         const titleFromSlug = extractTitleFromMALUrl(query);
-
         if (titleFromSlug) {
           searchQuery = titleFromSlug;
-        } else if (!malId) {
-          await ctx.api.editMessageText(
-            ctx.chat!.id,
-            loading.message_id,
-            '❌ URL MyAnimeList tidak valid.'
-          );
-          return;
         }
       }
 
-      // ─── Cari via cache ───
+      // Cek cache
       const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
       media = await getCache<AniListMedia>(env.DB, cacheKey);
 
       if (media) {
         sourceLabel = '⚡ Dari cache';
       } else {
-        // ─── Fetch dari API chain ───
         const result = await fetchMetadata(searchQuery);
         if (result) {
           media = result.media;
@@ -231,7 +208,6 @@ export const animeCommand: CommandDefinition = {
         }
       }
 
-      // ─── Tidak ketemu ───
       if (!media) {
         await ctx.api.editMessageText(
           ctx.chat!.id,
@@ -246,7 +222,7 @@ export const animeCommand: CommandDefinition = {
         return;
       }
 
-      // ─── Info card ───
+      // Info card
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -254,14 +230,14 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // ─── YAML ───
+      // YAML
       const yaml = buildYaml(media);
       await ctx.reply(
         `<b>YAML Frontmatter</b>\n\n<pre><code class="language-yaml">${escapeHtml(yaml)}</code></pre>`,
         { parse_mode: 'HTML' }
       );
 
-      // ─── Cover ───
+      // Cover
       const cover = media.coverImage.extraLarge || media.coverImage.large;
       if (cover) {
         try {
@@ -271,7 +247,6 @@ export const animeCommand: CommandDefinition = {
         }
       }
 
-      // ─── Source label ───
       if (sourceLabel) {
         await ctx.reply(sourceLabel);
       }
