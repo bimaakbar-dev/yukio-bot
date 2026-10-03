@@ -2,16 +2,18 @@ import type { CommandDefinition } from './registry';
 import type { Context, Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../services/anilist';
+import { searchAniList } from '../services/anilist';
 import { searchJikan, jikanToAniList } from '../services/jikan';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
+import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
 import { getCache, setCache } from '../lib/cache';
 import { chatAI } from '../services/ai';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const AI_TIMEOUT_MS = 5000;
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 menit
+const AI_TIMEOUT_MS = 3000;
+const SESSION_TTL_MS = 30 * 60 * 1000;
 
 type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
 type AnimeType = 'TV' | 'Movie' | 'OVA' | 'ONA' | 'Special';
@@ -214,16 +216,6 @@ function stripHtml(s: string): string {
     .trim();
 }
 
-function isEnglish(text: string): boolean {
-  const lower = text.toLowerCase();
-  const engWords = [
-    ' the ', ' is ', ' and ', ' of ', ' to ', ' a ', ' in ',
-    ' that ', ' with ', ' his ', ' her ',
-  ];
-  const matches = engWords.filter((w) => lower.includes(w)).length;
-  return matches >= 3;
-}
-
 /* ═══════════════════════════════════════════════
    AI ENRICHMENT
    ═══════════════════════════════════════════════ */
@@ -377,8 +369,7 @@ interface BuildResult {
 
 function buildResult(
   media: AniListMedia,
-  enriched: Enriched | null,
-  sourceName: string
+  enriched: Enriched | null
 ): BuildResult {
   const missing: string[] = [];
   const aiUsed: string[] = [];
@@ -478,14 +469,8 @@ function buildResult(
 
   let synopsis = synopsisRaw;
   const isTooShort = !synopsis || synopsis.length < 50;
-  const isEnglishText = synopsis ? isEnglish(synopsis) : false;
-  const needsTranslation = isEnglishText && sourceName !== 'AniList';
 
-  if (
-    (isTooShort || needsTranslation) &&
-    enriched?.synopsis &&
-    enriched.synopsis.length > 50
-  ) {
+  if (isTooShort && enriched?.synopsis && enriched.synopsis.length > 50) {
     synopsis = enriched.synopsis;
     aiUsed.push('synopsis');
   }
@@ -499,10 +484,6 @@ function buildResult(
 
   return { yaml, body: synopsis, missing, aiUsed };
 }
-
-/* ═══════════════════════════════════════════════
-   INFO CARD
-   ═══════════════════════════════════════════════ */
 
 function buildInfoMessage(media: AniListMedia): string {
   const title = pickTitle(media);
@@ -527,10 +508,6 @@ function buildInfoMessage(media: AniListMedia): string {
   );
 }
 
-/* ═══════════════════════════════════════════════
-   MAL URL
-   ═══════════════════════════════════════════════ */
-
 function isMALUrl(s: string): boolean {
   return /^https?:\/\/(www\.)?myanimelist\.net\/anime\/\d+/i.test(s.trim());
 }
@@ -544,7 +521,7 @@ function extractTitleFromMALUrl(url: string): string | null {
 }
 
 /* ═══════════════════════════════════════════════
-   FETCH CHAIN
+   FETCH CHAIN: Kitsu → Jikan → AniList → Shikimori
    ═══════════════════════════════════════════════ */
 
 async function fetchMetadata(query: string): Promise<{
@@ -553,46 +530,77 @@ async function fetchMetadata(query: string): Promise<{
 } | null> {
   const errors: string[] = [];
 
+  // 1. Kitsu — primary, reliable dari Cloudflare Worker
   const t1 = Date.now();
-  try {
-    const jikan = await searchJikan(query);
-    if (jikan) {
-      console.log(`[Anime] Jikan OK in ${Date.now() - t1}ms`);
-      return { media: jikanToAniList(jikan), source: 'Jikan (MAL)' };
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`Jikan: ${msg}`);
-    console.warn(`[Anime] Jikan failed in ${Date.now() - t1}ms:`, msg);
-  }
-
-  const t2 = Date.now();
   try {
     const kitsu = await searchKitsu(query);
     if (kitsu) {
-      console.log(`[Anime] Kitsu OK in ${Date.now() - t2}ms`);
+      console.log(`[Anime] Kitsu OK in ${Date.now() - t1}ms`);
       return { media: kitsuToAniList(kitsu), source: 'Kitsu' };
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`Kitsu: ${msg}`);
-    console.warn(`[Anime] Kitsu failed in ${Date.now() - t2}ms:`, msg);
+    console.warn(`[Anime] Kitsu failed in ${Date.now() - t1}ms:`, msg);
+  }
+
+  // 2. Jikan (MAL)
+  const t2 = Date.now();
+  try {
+    const jikan = await searchJikan(query);
+    if (jikan) {
+      console.log(`[Anime] Jikan OK in ${Date.now() - t2}ms`);
+      return { media: jikanToAniList(jikan), source: 'Jikan (MAL)' };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`Jikan: ${msg}`);
+    console.warn(`[Anime] Jikan failed in ${Date.now() - t2}ms:`, msg);
+  }
+
+  // 3. AniList
+  const t3 = Date.now();
+  try {
+    const anilist = await searchAniList(query);
+    if (anilist) {
+      console.log(`[Anime] AniList OK in ${Date.now() - t3}ms`);
+      return { media: anilist, source: 'AniList' };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`AniList: ${msg}`);
+    console.warn(`[Anime] AniList failed in ${Date.now() - t3}ms:`, msg);
+  }
+
+  // 4. Shikimori
+  const t4 = Date.now();
+  try {
+    const shiki = await searchShikimori(query);
+    if (shiki) {
+      console.log(`[Anime] Shikimori OK in ${Date.now() - t4}ms`);
+      return { media: shikimoriToAniList(shiki), source: 'Shikimori' };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`Shikimori: ${msg}`);
+    console.warn(`[Anime] Shikimori failed in ${Date.now() - t4}ms:`, msg);
   }
 
   console.warn('[Anime] All APIs failed:', errors);
   return null;
 }
 
-function detectMissing(media: AniListMedia, source: string): string[] {
+/* ═══════════════════════════════════════════════
+   DETECT MISSING
+   ═══════════════════════════════════════════════ */
+
+function detectMissing(media: AniListMedia): string[] {
   const need: string[] = [];
 
   const studio = media.studios?.nodes?.[0]?.name;
   if (!studio || studio === 'Unknown') need.push('studio');
 
-  if (
-    typeof media.averageScore !== 'number' ||
-    media.averageScore <= 0
-  ) {
+  if (typeof media.averageScore !== 'number' || media.averageScore <= 0) {
     need.push('rating');
   }
 
@@ -603,8 +611,6 @@ function detectMissing(media: AniListMedia, source: string): string[] {
   const desc = media.description ?? '';
   const cleanDesc = stripHtml(desc);
   if (!cleanDesc || cleanDesc.length < 50) {
-    need.push('synopsis');
-  } else if (isEnglish(cleanDesc) && source !== 'AniList') {
     need.push('synopsis');
   }
 
@@ -617,7 +623,7 @@ function detectMissing(media: AniListMedia, source: string): string[] {
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
-  description: 'Cari metadata anime → YAML + sinopsis',
+  description: 'Cari metadata anime → tombol convert YAML',
   usage: '/anime jujutsu kaisen',
   adminOnly: true,
 
@@ -690,10 +696,7 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      const sourceName = sourceLabel
-        .replace(/^📡 Sumber: /, '')
-        .replace(/^⚡ Dari cache$/, '');
-      const need = detectMissing(media, sourceName);
+      const need = detectMissing(media);
 
       let enriched: Enriched | null = null;
 
@@ -726,22 +729,15 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
-      const { yaml, body, missing, aiUsed } = buildResult(
-        media,
-        enriched,
-        sourceName
-      );
+      const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
 
-      // Simpan ke DB, tunggu user klik tombol
       const sessionId = await saveSession(env.DB, ctx.from!.id, {
         yaml,
         body,
         missing,
         aiUsed,
         cover:
-          media.coverImage.extraLarge ||
-          media.coverImage.large ||
-          null,
+          media.coverImage.extraLarge || media.coverImage.large || null,
         sourceLabel: sourceLabel || null,
       });
 
@@ -787,7 +783,6 @@ export const animeCommand: CommandDefinition = {
    ═══════════════════════════════════════════════ */
 
 export function setupAnimeCallbacks(bot: Bot, env: Env): void {
-  // Convert ke YAML
   bot.callbackQuery(/^an:y:([a-f0-9]+)$/, async (ctx) => {
     const [, sessionId] = ctx.match as RegExpMatchArray;
     if (!sessionId) {
@@ -801,7 +796,9 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         text: '⏱️ Session kadaluarsa. Ulangi /anime.',
         show_alert: true,
       });
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      await ctx
+        .editMessageReplyMarkup({ reply_markup: undefined })
+        .catch(() => {});
       return;
     }
 
@@ -812,7 +809,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
 
     await ctx.answerCallbackQuery({ text: '📋 Convert...' });
 
-    // Hapus tombol
     await ctx
       .editMessageReplyMarkup({ reply_markup: undefined })
       .catch(() => {});
@@ -820,16 +816,17 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     const missing: string[] = JSON.parse(session.missing);
     const aiUsed: string[] = JSON.parse(session.ai_used);
 
-    // Warning
     const warnLines: string[] = [];
     if (missing.length > 0) {
       warnLines.push('⚠️ <b>Perlu edit manual:</b>');
-      for (const f of missing) warnLines.push(`• <code>${escapeHtml(f)}</code>`);
+      for (const f of missing)
+        warnLines.push(`• <code>${escapeHtml(f)}</code>`);
       warnLines.push('');
     }
     if (aiUsed.length > 0) {
       warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang):</b>');
-      for (const f of aiUsed) warnLines.push(`• <code>${escapeHtml(f)}</code>`);
+      for (const f of aiUsed)
+        warnLines.push(`• <code>${escapeHtml(f)}</code>`);
     }
     if (warnLines.length > 0) {
       await ctx.reply(warnLines.join('\n'), {
@@ -838,13 +835,11 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       });
     }
 
-    // YAML
     await ctx.reply(
       `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(session.yaml)}</pre>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
 
-    // Body
     const bodyMax = 3500;
     const bodyPreview =
       session.body.length > bodyMax
@@ -856,7 +851,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
 
-    // Cover
     if (session.cover && isValidHttpUrl(session.cover)) {
       try {
         await ctx.replyWithPhoto(session.cover);
@@ -865,16 +859,13 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       }
     }
 
-    // Source
     if (session.source_label) {
       await ctx.reply(session.source_label);
     }
 
-    // Hapus session
     await deleteSession(env.DB, sessionId);
   });
 
-  // Batal
   bot.callbackQuery(/^an:x:([a-f0-9]+)$/, async (ctx) => {
     const [, sessionId] = ctx.match as RegExpMatchArray;
     if (!sessionId) {
