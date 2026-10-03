@@ -4,10 +4,7 @@ import { registerCommands } from './commands/registry';
 import { setupBusinessHandler } from './business/autoReply';
 import { cleanupCache } from './lib/cache';
 import { isAdmin } from './lib/permissions';
-import {
-  handleDocumentAuto,
-  setupDecodeCallbacks,
-} from './commands/decode';
+import { handleDocumentAuto } from './commands/decode';
 
 function createBot(env: Env): Bot {
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
@@ -29,22 +26,15 @@ function createBot(env: Env): Bot {
 
   setupBusinessHandler(bot, env);
 
-  // ─────────────────────────────────────────────
-  // Auto-decode file .html / .txt dari admin
-  // ─────────────────────────────────────────────
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
 
-    // Skip kalau caption-nya command (biar /decode command yang handle)
     if (caption.startsWith('/')) return;
 
-    // Hanya di private chat
     if (ctx.chat?.type !== 'private') return;
 
-    // Hanya dari admin
     if (!isAdmin(ctx.from?.id, env)) return;
 
-    // Hanya .html / .txt
     const name = ctx.message.document.file_name ?? '';
     if (!/\.(html?|txt)$/i.test(name)) return;
 
@@ -55,9 +45,6 @@ function createBot(env: Env): Bot {
       await ctx.reply('❌ Auto-decode gagal. Coba /decode.').catch(() => {});
     }
   });
-
-  // Setup callback tombol pagination & selesai
-  setupDecodeCallbacks(bot, env);
 
   bot.catch((err) => {
     console.error('[Bot] error:', err.error);
@@ -88,7 +75,7 @@ export default {
         return await handler(request);
       } catch (err) {
         console.error('[Worker] webhook error:', err);
-        return new Response('Internal Server Error', { status: 500 });
+        return new Response('OK', { status: 200 });
       }
     }
 
@@ -103,20 +90,6 @@ export default {
     try {
       const cleaned = await cleanupCache(env.DB);
       console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
-
-      // Cleanup session decode yang expired (>1 jam)
-      try {
-        const res = await env.DB
-          .prepare('DELETE FROM temp_decode WHERE expires_at < ?')
-          .bind(Date.now())
-          .run();
-        const sessionCleaned = res.meta?.changes ?? 0;
-        if (sessionCleaned > 0) {
-          console.log(`[Cron] Cleaned ${sessionCleaned} expired decode sessions`);
-        }
-      } catch {
-        // Tabel belum ada — skip
-      }
     } catch (err) {
       console.error('[Cron] cleanup error:', err);
     }
