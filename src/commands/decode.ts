@@ -13,7 +13,7 @@ const MAX_FILE_CHARS = 300_000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_LAYERS = 5;
 const MAX_CANDIDATES = 800;
-const MAX_PARAM_DEPTH = 2;
+const MAX_PARAM_DEPTH = 3;
 const PAGE_CHAR_BUDGET = 3500;
 const SESSION_TTL_MS = 60 * 60 * 1000;
 
@@ -25,8 +25,10 @@ const BASE64_PARAM_NAMES = new Set([
 const VIDEO_EXT_RE = /\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i;
 const VIDEO_HOSTS = [
   'player.', 'streamtape', 'dood', 'filemoon', 'voe', 'mp4upload',
-  'mixdrop', 'abyss', 'framezi', 'kturb', 'pixeldrain', 'vikingfile',
-  'buzzheavier', 'mega.nz', 'doply',
+  'mixdrop', 'iixdrop',
+  'abyss', 'abyssplayer',
+  'framezi', 'kturbo',
+  'pixeldrain', 'vikingfile', 'buzzheavier', 'mega.nz', 'doply',
 ];
 
 const WRAPPER_HOSTS = [
@@ -366,16 +368,13 @@ function expandUrlParams(url: string, depth = 0): string[] {
     if (!value || value.length < 12) continue;
     if (!BASE64_PARAM_NAMES.has(key.toLowerCase())) continue;
 
-    if (isLikelyBase64(value)) {
-      const decoded = decodeBase64(value);
-      if (decoded && isPrintable(decoded)) {
-        const trimmed = decoded.trim();
-        if (/^https?:\/\//i.test(trimmed)) {
-          for (const sub of expandUrlParams(trimmed, depth + 1)) out.add(sub);
-        }
-      }
+    // Case A: value sudah URL langsung (searchParams auto-decode)
+    if (/^https?:\/\//i.test(value)) {
+      for (const sub of expandUrlParams(value, depth + 1)) out.add(sub);
+      continue;
     }
 
+    // Case B: value masih URL-encoded (double-encoded)
     if (/^https?%3A/i.test(value)) {
       try {
         const dec = decodeURIComponent(value);
@@ -384,6 +383,17 @@ function expandUrlParams(url: string, depth = 0): string[] {
         }
       } catch {
         /* ignore */
+      }
+    }
+
+    // Case C: value base64
+    if (isLikelyBase64(value)) {
+      const decoded = decodeBase64(value);
+      if (decoded && isPrintable(decoded)) {
+        const trimmed = decoded.trim();
+        if (/^https?:\/\//i.test(trimmed)) {
+          for (const sub of expandUrlParams(trimmed, depth + 1)) out.add(sub);
+        }
       }
     }
   }
@@ -827,7 +837,6 @@ export function setupDecodeCallbacks(bot: Bot, env: Env): void {
       offset += session.pages[i]?.length ?? 0;
     }
 
-    // Rebuild summary dari seluruh pages
     const allItems: ResolvedEntry[] = session.pages.flat().map((p) => ({
       url: p.url,
       resolution: p.resolution,
