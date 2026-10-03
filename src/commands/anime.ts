@@ -3,7 +3,6 @@ import type { Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../services/anilist';
 import { searchAniList } from '../services/anilist';
-import { searchJikan, jikanToAniList } from '../services/jikan';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
 import { getCache, setCache } from '../lib/cache';
@@ -216,9 +215,6 @@ function stripHtml(s: string): string {
     .trim();
 }
 
-/**
- * Pilih value pertama yang "ada".
- */
 function pick<T>(...values: (T | null | undefined)[]): T | null {
   for (const v of values) {
     if (v === null || v === undefined) continue;
@@ -229,9 +225,6 @@ function pick<T>(...values: (T | null | undefined)[]): T | null {
   return null;
 }
 
-/**
- * Normalize nama studio — pastikan prefix "Studio " kalau perlu.
- */
 function normalizeStudioName(name: string): string {
   const trimmed = name.trim();
   if (!trimmed) return trimmed;
@@ -580,6 +573,7 @@ function extractTitleFromMALUrl(url: string): string | null {
 
 /* ═══════════════════════════════════════════════
    PARALLEL FETCH + MERGE
+   Chain: Kitsu + Shikimori + AniList (tanpa Jikan)
    ═══════════════════════════════════════════════ */
 
 async function fetchAndMerge(query: string): Promise<{
@@ -588,14 +582,16 @@ async function fetchAndMerge(query: string): Promise<{
 } | null> {
   const t0 = Date.now();
 
-  const [kitsuR, jikanR, anilistR, shikimoriR] = await Promise.allSettled([
+  const [kitsuR, shikimoriR, anilistR] = await Promise.allSettled([
     searchKitsu(query),
-    searchJikan(query),
-    searchAniList(query),
     searchShikimori(query),
+    searchAniList(query),
   ]);
 
-  const logStatus = (name: string, r: PromiseSettledResult<unknown>): boolean => {
+  const logStatus = (
+    name: string,
+    r: PromiseSettledResult<unknown>
+  ): boolean => {
     if (r.status === 'fulfilled') {
       const hasData = r.value !== null && r.value !== undefined;
       console.log(`[Anime] ${name}: ${hasData ? 'OK' : 'empty result'}`);
@@ -608,28 +604,23 @@ async function fetchAndMerge(query: string): Promise<{
   };
 
   const hasKitsu = logStatus('Kitsu', kitsuR);
-  const hasJikan = logStatus('Jikan', jikanR);
-  const hasAniList = logStatus('AniList', anilistR);
   const hasShikimori = logStatus('Shikimori', shikimoriR);
+  const hasAniList = logStatus('AniList', anilistR);
 
   const kitsu = hasKitsu
     ? kitsuToAniList((kitsuR as PromiseFulfilledResult<any>).value)
     : null;
-  const jikan = hasJikan
-    ? jikanToAniList((jikanR as PromiseFulfilledResult<any>).value)
+  const shikimori = hasShikimori
+    ? shikimoriToAniList((shikimoriR as PromiseFulfilledResult<any>).value)
     : null;
   const anilist = hasAniList
     ? (anilistR as PromiseFulfilledResult<AniListMedia>).value
     : null;
-  const shikimori = hasShikimori
-    ? shikimoriToAniList((shikimoriR as PromiseFulfilledResult<any>).value)
-    : null;
 
   const sources: string[] = [];
   if (kitsu) sources.push('Kitsu');
-  if (jikan) sources.push('Jikan');
-  if (anilist) sources.push('AniList');
   if (shikimori) sources.push('Shikimori');
+  if (anilist) sources.push('AniList');
 
   console.log(
     `[Anime] parallel fetch done in ${Date.now() - t0}ms — sources: [${
@@ -641,33 +632,29 @@ async function fetchAndMerge(query: string): Promise<{
 
   const studioLog = [
     `Kitsu=${kitsu?.studios?.nodes?.[0]?.name ?? '-'}`,
-    `Jikan=${jikan?.studios?.nodes?.[0]?.name ?? '-'}`,
-    `AniList=${anilist?.studios?.nodes?.[0]?.name ?? '-'}`,
     `Shikimori=${shikimori?.studios?.nodes?.[0]?.name ?? '-'}`,
+    `AniList=${anilist?.studios?.nodes?.[0]?.name ?? '-'}`,
   ].join(' | ');
   console.log(`[Anime] studio per source: ${studioLog}`);
 
   const merged: AniListMedia = {
-    id: anilist?.id ?? jikan?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
+    id: anilist?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
 
     title: {
       romaji:
         pick(
           kitsu?.title.romaji,
-          anilist?.title.romaji,
-          jikan?.title.romaji,
-          shikimori?.title.romaji
+          shikimori?.title.romaji,
+          anilist?.title.romaji
         ) ?? 'Unknown',
       english: pick(
         kitsu?.title.english,
         anilist?.title.english,
-        jikan?.title.english,
         shikimori?.title.english
       ),
       native: pick(
         kitsu?.title.native,
         anilist?.title.native,
-        jikan?.title.native,
         shikimori?.title.native
       ),
     },
@@ -677,48 +664,38 @@ async function fetchAndMerge(query: string): Promise<{
         pick(
           anilist?.coverImage.extraLarge,
           kitsu?.coverImage.extraLarge,
-          jikan?.coverImage.extraLarge,
           shikimori?.coverImage.extraLarge
         ) ?? '',
       large:
         pick(
           anilist?.coverImage.large,
           kitsu?.coverImage.large,
-          jikan?.coverImage.large,
           shikimori?.coverImage.large
         ) ?? '',
     },
 
-    description: pick(
-      anilist?.description,
-      jikan?.description,
-      kitsu?.description
-    ),
+    description: pick(anilist?.description, kitsu?.description),
 
     format: pick(
       anilist?.format,
-      jikan?.format,
       kitsu?.format,
       shikimori?.format
     ) ?? 'TV',
 
     status: pick(
       anilist?.status,
-      jikan?.status,
       kitsu?.status,
       shikimori?.status
     ) ?? 'RELEASING',
 
     seasonYear: pick(
       anilist?.seasonYear,
-      jikan?.seasonYear,
       kitsu?.seasonYear,
       shikimori?.seasonYear
     ),
 
     episodes: pick(
       anilist?.episodes,
-      jikan?.episodes,
       kitsu?.episodes,
       shikimori?.episodes
     ),
@@ -726,25 +703,22 @@ async function fetchAndMerge(query: string): Promise<{
     genres:
       pick(
         anilist?.genres,
-        jikan?.genres,
-        kitsu?.genres,
-        shikimori?.genres
+        shikimori?.genres,
+        kitsu?.genres
       ) ?? [],
 
     averageScore: pick(
       anilist?.averageScore,
-      jikan?.averageScore,
-      kitsu?.averageScore,
-      shikimori?.averageScore
+      shikimori?.averageScore,
+      kitsu?.averageScore
     ),
 
-    // Studio: Jikan paling akurat, lalu AniList, lalu Kitsu, lalu Shikimori
+    // Studio: Shikimori paling akurat, lalu AniList, lalu Kitsu
     studios: {
       nodes:
         pick(
-          jikan?.studios.nodes,
-          anilist?.studios.nodes,
           shikimori?.studios.nodes,
+          anilist?.studios.nodes,
           kitsu?.studios.nodes
         ) ?? [],
     },
@@ -752,19 +726,16 @@ async function fetchAndMerge(query: string): Promise<{
     startDate: {
       year: pick(
         anilist?.startDate.year,
-        jikan?.startDate.year,
         kitsu?.startDate.year,
         shikimori?.startDate.year
       ),
       month: pick(
         anilist?.startDate.month,
-        jikan?.startDate.month,
         kitsu?.startDate.month,
         shikimori?.startDate.month
       ),
       day: pick(
         anilist?.startDate.day,
-        jikan?.startDate.day,
         kitsu?.startDate.day,
         shikimori?.startDate.day
       ),
@@ -851,21 +822,22 @@ export const animeCommand: CommandDefinition = {
         console.log(`[Anime] cache hit at ${Date.now() - T0}ms`);
       } else {
         const result = await fetchAndMerge(searchQuery);
-		if (result) {
-  		media = result.media;
-  		sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
+        if (result) {
+          media = result.media;
+          sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
 
-  		const hasStudio =
-    		media.studios?.nodes?.[0]?.name &&
-    		media.studios.nodes[0].name !== 'Unknown';
+          // Cache hanya kalau studio ada
+          const hasStudio =
+            media.studios?.nodes?.[0]?.name &&
+            media.studios.nodes[0].name !== 'Unknown';
 
-  		if (hasStudio) {
-    		await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
-    		console.log('[Anime] cached (studio present)');
-  		} else {
-    		console.log('[Anime] NOT cached (studio missing) — biar retry fresh');
-  		}
-		}
+          if (hasStudio) {
+            await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
+            console.log('[Anime] cached (studio present)');
+          } else {
+            console.log('[Anime] NOT cached (studio missing)');
+          }
+        }
         console.log(`[Anime] fetch stage done at ${Date.now() - T0}ms`);
       }
 
@@ -891,56 +863,59 @@ export const animeCommand: CommandDefinition = {
       );
 
       const need = detectMissing(media);
-      console.log(`[Anime] missing after merge: [${need.join(', ') || 'none'}]`);
+      console.log(
+        `[Anime] missing after merge: [${need.join(', ') || 'none'}]`
+      );
 
       let enriched: Enriched | null = null;
 
-	  if (need.length > 0) {
-  	  const aiLoading = await ctx.reply(
-    	`🤖 AI melengkapi: <code>${need.join(', ')}</code>...`,
-    	{ parse_mode: 'HTML' }
-  	  );
+      if (need.length > 0) {
+        const aiLoading = await ctx.reply(
+          `🤖 AI melengkapi: <code>${need.join(', ')}</code>...`,
+          { parse_mode: 'HTML' }
+        );
 
-  	  enriched = await enrichWithAITimeout(
-        env,
-        pickTitle(media),
-        {
-      studio: media.studios?.nodes?.[0]?.name,
-      rating: media.averageScore ? media.averageScore / 10 : null,
-      genre: media.genres,
-      releaseDate: media.startDate?.year
-        ? `${media.startDate.year}-01-01`
-        : null,
-    },
-    need
-  );
+        enriched = await enrichWithAITimeout(
+          env,
+          pickTitle(media),
+          {
+            studio: media.studios?.nodes?.[0]?.name,
+            rating: media.averageScore ? media.averageScore / 10 : null,
+            genre: media.genres,
+            releaseDate: media.startDate?.year
+              ? `${media.startDate.year}-01-01`
+              : null,
+          },
+          need
+        );
 
-  console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
+        console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
 
-  if (enriched) {
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        aiLoading.message_id,
-        `✅ AI selesai: <code>${need.join(', ')}</code>`,
-        { parse_mode: 'HTML' }
-      )
-      .catch(() => {});
-  } else {
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        aiLoading.message_id,
-        `⚠️ AI tidak bisa melengkapi: <code>${need.join(', ')}</code>\n` +
-          `<i>Field ini perlu diisi manual.</i>`,
-        { parse_mode: 'HTML' }
-      )
-      .catch(() => {});
-    	console.warn('[Anime] AI failed or timeout — no retry');
-  		}
-		} else {
-  		console.log('[Anime] no AI needed — skipping');
-		}
+        if (enriched) {
+          await ctx.api
+            .editMessageText(
+              ctx.chat!.id,
+              aiLoading.message_id,
+              `✅ AI selesai: <code>${need.join(', ')}</code>`,
+              { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
+        } else {
+          await ctx.api
+            .editMessageText(
+              ctx.chat!.id,
+              aiLoading.message_id,
+              `⚠️ AI tidak bisa melengkapi: <code>${need.join(
+                ', '
+              )}</code>\n<i>Field ini perlu diisi manual.</i>`,
+              { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
+          console.warn('[Anime] AI failed or timeout — no retry');
+        }
+      } else {
+        console.log('[Anime] no AI needed — skipping');
+      }
 
       const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
 
