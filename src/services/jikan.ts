@@ -1,5 +1,5 @@
 import { fetchWithRetry } from '../lib/http';
-import type { AniListMedia } from './anilist';
+import type { AniListMedia } from '../types/anime';
 
 const JIKAN_URL = 'https://api.jikan.moe/v4/anime';
 
@@ -38,11 +38,6 @@ interface JikanResponse {
   data: JikanAnime[];
 }
 
-/**
- * Cari anime di Jikan (MyAnimeList).
- * Rate limit: unlimited daily, 3 req/detik, 60 req/menit.
- * Timeout 8s + retry 1x — Jikan kadang 504 saat server MAL sibuk.
- */
 export async function searchJikan(title: string): Promise<JikanAnime | null> {
   const url = `${JIKAN_URL}?q=${encodeURIComponent(title)}&limit=1`;
 
@@ -80,17 +75,17 @@ export function jikanToAniList(jikan: JikanAnime): AniListMedia {
     jikan.images?.jpg?.image_url ||
     '';
 
-  const genres = Array.isArray(jikan.genres)
+  const genres: string[] = Array.isArray(jikan.genres)
     ? jikan.genres
-        .map((g) => g?.name)
-        .filter((n): n is string => typeof n === 'string' && n.length > 0)
+        .map((g): string => g?.name ?? '')
+        .filter((n: string): boolean => n.length > 0)
     : [];
 
-  const studios = Array.isArray(jikan.studios)
+  const studios: { name: string }[] = Array.isArray(jikan.studios)
     ? jikan.studios
-        .map((s) => s?.name)
-        .filter((n): n is string => typeof n === 'string' && n.length > 0)
-        .map((name) => ({ name }))
+        .map((s): string => s?.name ?? '')
+        .filter((n: string): boolean => n.length > 0)
+        .map((name: string): { name: string } => ({ name }))
     : [];
 
   const from = jikan.aired?.prop?.from;
