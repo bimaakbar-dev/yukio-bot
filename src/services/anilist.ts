@@ -1,3 +1,5 @@
+import { fetchWithRetry } from '../lib/http';
+
 const ANILIST_URL = 'https://graphql.anilist.co';
 
 const ANILIST_QUERY = `
@@ -6,6 +8,7 @@ const ANILIST_QUERY = `
       id
       title { romaji english native }
       coverImage { extraLarge large }
+      description
       format
       status
       seasonYear
@@ -29,6 +32,7 @@ export interface AniListMedia {
     extraLarge: string;
     large: string;
   };
+  description: string | null;
   format: string;
   status: string;
   seasonYear: number | null;
@@ -63,7 +67,7 @@ interface AniListResponse {
 export async function searchAniList(
   title: string
 ): Promise<AniListMedia | null> {
-  const res = await fetch(ANILIST_URL, {
+  const res = await fetchWithRetry(ANILIST_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -75,7 +79,6 @@ export async function searchAniList(
     }),
   });
 
-  // Handle HTTP error (429 rate limit, 403 degraded, 500 server error)
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
     throw new Error(`AniList HTTP ${res.status}: ${errBody.slice(0, 100)}`);
@@ -83,7 +86,6 @@ export async function searchAniList(
 
   const json = (await res.json()) as AniListResponse;
 
-  // GraphQL error meskipun HTTP 200
   if (json.errors?.length) {
     const msg = json.errors[0]?.message ?? 'Unknown GraphQL error';
     throw new Error(`AniList GraphQL: ${msg}`);
