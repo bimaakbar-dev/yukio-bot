@@ -23,10 +23,6 @@ const STATUS_MAP: Record<string, AnimeStatus> = {
   CANCELLED: 'Hiatus', HIATUS: 'Hiatus',
 };
 
-/* ═══════════════════════════════════════════════
-   DB
-   ═══════════════════════════════════════════════ */
-
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
 
@@ -115,10 +111,6 @@ async function deleteSession(db: D1Database, sessionId: string) {
   }
 }
 
-/* ═══════════════════════════════════════════════
-   HELPERS
-   ═══════════════════════════════════════════════ */
-
 function pickTitle(media: AniListMedia): string {
   return media.title.romaji || media.title.english || media.title.native || 'Unknown';
 }
@@ -175,9 +167,21 @@ function truncate(s: string, max: number): string {
   return s.slice(0, max - 20) + '\n… [truncated]';
 }
 
-/* ═══════════════════════════════════════════════
-   AI ENRICHMENT
-   ═══════════════════════════════════════════════ */
+function splitForDiscord(s: string, max: number): string[] {
+  if (s.length <= max) return [s];
+  const parts: string[] = [];
+  let current = '';
+  for (const line of s.split('\n')) {
+    if (current.length + line.length + 1 > max && current.length > 0) {
+      parts.push(current);
+      current = line;
+    } else {
+      current = current ? `${current}\n${line}` : line;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
 
 interface Enriched {
   studio?: string | null;
@@ -250,10 +254,6 @@ async function enrichWithAITimeout(
   }
 }
 
-/* ═══════════════════════════════════════════════
-   FETCH + MERGE
-   ═══════════════════════════════════════════════ */
-
 async function fetchAndMerge(query: string): Promise<{
   media: AniListMedia;
   sources: string[];
@@ -305,10 +305,6 @@ async function fetchAndMerge(query: string): Promise<{
 
   return { media: merged, sources };
 }
-
-/* ═══════════════════════════════════════════════
-   BUILD YAML + BODY
-   ═══════════════════════════════════════════════ */
 
 interface BuildResult {
   yaml: string; body: string; missing: string[]; aiUsed: string[];
@@ -408,10 +404,6 @@ function buildResult(media: AniListMedia, enriched: Enriched | null): BuildResul
   return { yaml, body: synopsis, missing, aiUsed };
 }
 
-/* ═══════════════════════════════════════════════
-   DISCORD API
-   ═══════════════════════════════════════════════ */
-
 const DISCORD_API = 'https://discord.com/api/v10';
 
 async function editOriginal(
@@ -420,14 +412,11 @@ async function editOriginal(
   body: Record<string, unknown>
 ): Promise<void> {
   const url = `${DISCORD_API}/webhooks/${appId}/${interactionToken}/messages/@original`;
-  console.log(`[Discord] editOriginal → appId=${appId}`);
-
   const res = await fetch(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-
   if (!res.ok) {
     const err = await res.text().catch(() => '');
     console.error('[Discord] editOriginal failed:', res.status, err.slice(0, 200));
@@ -440,22 +429,16 @@ async function sendFollowup(
   body: Record<string, unknown>
 ): Promise<void> {
   const url = `${DISCORD_API}/webhooks/${appId}/${interactionToken}`;
-
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-
   if (!res.ok) {
     const err = await res.text().catch(() => '');
     console.error('[Discord] followup failed:', res.status, err.slice(0, 200));
   }
 }
-
-/* ═══════════════════════════════════════════════
-   /anime HANDLER
-   ═══════════════════════════════════════════════ */
 
 export function handleAnime(
   interaction: DiscordInteraction,
@@ -479,7 +462,9 @@ async function processAnime(interaction: DiscordInteraction, env: Env): Promise<
   }
 
   const query =
-    (interaction.data?.options?.find((o) => o.name === 'search')?.value as string) ?? '';
+    (interaction.data?.options?.find(
+      (o) => o.name === 'search' || o.name === 'query'
+    )?.value as string) ?? '';
 
   if (!query) {
     await editOriginal(appId, token, { content: '❌ Query kosong.' });
@@ -577,22 +562,16 @@ async function processAnime(interaction: DiscordInteraction, env: Env): Promise<
   }
 }
 
-/* ═══════════════════════════════════════════════
-   BUTTON HANDLER
-   ═══════════════════════════════════════════════ */
-
 export function handleAnimeButton(
   interaction: DiscordInteraction,
   env: Env,
   ctx: ExecutionContext,
   customId: string
 ): Response {
-  // Wajib deferred dulu, karena tombol butuh acknowledge <3 detik
   ctx.waitUntil(processButton(interaction, env, customId));
   return new Response(JSON.stringify({ type: 6 }), {
     headers: { 'Content-Type': 'application/json' },
   });
-  // type 6 = DEFERRED_UPDATE_MESSAGE
 }
 
 async function processButton(
@@ -626,7 +605,6 @@ async function processButton(
     return;
   }
 
-  // Batal
   if (action === 'x') {
     await deleteSession(env.DB, sessionId);
     await editOriginal(appId, token, {
@@ -636,9 +614,7 @@ async function processButton(
     return;
   }
 
-  // Convert
   if (action === 'y') {
-    // Update message jadi status
     await editOriginal(appId, token, {
       content: '📋 **Generating YAML...**',
       components: [],
@@ -663,29 +639,29 @@ async function processButton(
       });
     }
 
-    await sendFollowup(appId, token, {
-      content:
-        `📋 **YAML Frontmatter**\n\n` +
-        `\`\`\`yaml\n${truncate(session.yaml, 1900)}\n\`\`\``,
-    });
-
-    await sendFollowup(appId, token, {
-      content:
-        `📝 **Body (Sinopsis)**\n\n` +
-        `\`\`\`\n${truncate(session.body, 1900)}\n\`\`\``,
-    });
-
-    const embed: Record<string, unknown> = { color: 0x8b5cf6 };
     if (session.cover && isValidHttpUrl(session.cover)) {
-      embed.image = { url: session.cover };
-    }
-    if (session.source_label) {
-      embed.footer = { text: session.source_label };
+      await sendFollowup(appId, token, {
+        embeds: [{ color: 0x8b5cf6, image: { url: session.cover } }],
+      });
     }
 
-    await sendFollowup(appId, token, { embeds: [embed] });
+    const fullMd = `${session.yaml}\n\n${session.body}`;
+    const parts = splitForDiscord(fullMd, 1900);
 
-    // Update original message
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i] ?? '';
+      const header =
+        parts.length > 1
+          ? `📄 **Markdown** (${i + 1}/${parts.length})\n\n`
+          : `📄 **Markdown File**\n\n`;
+      const footer =
+        i === parts.length - 1 ? '\n\n<i>Tap untuk copy</i>' : '';
+
+      await sendFollowup(appId, token, {
+        content: header + '```markdown\n' + part + '\n```' + footer,
+      });
+    }
+
     await editOriginal(appId, token, {
       content: '✅ **Selesai!**',
       components: [],
