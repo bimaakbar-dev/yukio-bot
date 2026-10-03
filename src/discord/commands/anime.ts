@@ -479,7 +479,7 @@ async function processAnime(interaction: DiscordInteraction, env: Env): Promise<
   }
 
   const query =
-    (interaction.data?.options?.find((o) => o.name === 'query')?.value as string) ?? '';
+    (interaction.data?.options?.find((o) => o.name === 'search')?.value as string) ?? '';
 
   if (!query) {
     await editOriginal(appId, token, { content: '❌ Query kosong.' });
