@@ -1,0 +1,21 @@
+{
+  "name": "yukio-bot",
+  "version": "1.0.0",
+  "description": "Yukio Bot — Personal assistant Telegram bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  }
+}
