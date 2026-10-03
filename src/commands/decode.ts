@@ -1,11 +1,15 @@
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
+import type { Env } from '../types/env';
 import { InlineKeyboard } from 'grammy';
 
 const MAX_INPUT_LEN = 8000;
+const MAX_FILE_CHARS = 300_000;
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_LAYERS = 5;
 const MAX_OUTPUT_PREVIEW = 3500;
 const MAX_URLS_SHOWN = 10;
+const MAX_CANDIDATES = 800;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -28,10 +32,11 @@ function decodeBase64(input: string): string | null {
   try {
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8', {
+      fatal: false,
+      ignoreBOM: false,
+    }).decode(bytes);
   } catch {
     return null;
   }
@@ -98,7 +103,6 @@ function multiLayerDecode(input: string): DecodeResult | null {
 function extractBase64Candidates(html: string): string[] {
   const found = new Map<string, number>();
 
-  // Priority 1: atob("...")
   for (const m of html.matchAll(
     /atob\s*\(\s*["']([A-Za-z0-9+/=\-_]{16,})["']\s*\)/gi
   )) {
@@ -106,7 +110,6 @@ function extractBase64Candidates(html: string): string[] {
     if (c && !found.has(c)) found.set(c, 1);
   }
 
-  // Priority 2: data-* attributes
   for (const m of html.matchAll(
     /data-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/gi
   )) {
@@ -114,8 +117,8 @@ function extractBase64Candidates(html: string): string[] {
     if (c && !found.has(c)) found.set(c, 2);
   }
 
-  // Priority 3: general long base64-like blobs
   for (const m of html.matchAll(/[A-Za-z0-9+/\-_]{24,}={0,2}/g)) {
+    if (found.size >= MAX_CANDIDATES) break;
     const c = m[0];
     if (c && !found.has(c)) found.set(c, 3);
   }
@@ -131,16 +134,13 @@ interface Candidate {
   isUrl: boolean;
 }
 
-async function handleHtmlInput(ctx: Context, html: string): Promise<void> {
+async function processHtml(ctx: Context, html: string): Promise<void> {
   const candidates = extractBase64Candidates(html);
 
   if (candidates.length === 0) {
     await ctx.reply(
       '🌐 <b>HTML terdeteksi</b>\n\n' +
-        '❌ Tidak ada kandidat Base64 ditemukan.\n\n' +
-        '<i>Cari manual di view-source: <code>atob(</code>, ' +
-        '<code>data-*</code>, atau string panjang di dalam ' +
-        '<code>&lt;script&gt;</code>.</i>',
+        '❌ Tidak ada kandidat Base64 ditemukan.',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
     return;
@@ -211,7 +211,7 @@ async function handleHtmlInput(ctx: Context, html: string): Promise<void> {
   });
 }
 
-async function handleBase64Input(ctx: Context, input: string): Promise<void> {
+async function processBase64(ctx: Context, input: string): Promise<void> {
   const result = multiLayerDecode(input);
 
   if (!result) {
@@ -219,7 +219,6 @@ async function handleBase64Input(ctx: Context, input: string): Promise<void> {
       input.length > 80 ? input.slice(0, 40) + '…' + input.slice(-20) : input;
     await ctx.reply(
       '❌ <b>Gagal decode</b>\n\n' +
-        'Input tidak terdeteksi sebagai Base64 valid.\n\n' +
         '<b>Input:</b>\n' +
         `<code>${escapeHtml(preview)}</code>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
@@ -228,13 +227,10 @@ async function handleBase64Input(ctx: Context, input: string): Promise<void> {
   }
 
   const lines: string[] = [];
-  lines.push('✅ <b>Decode berhasil</b>');
-  lines.push('');
+  lines.push('✅ <b>Decode berhasil</b>\n');
   lines.push(`📥 Input: <code>${input.length}</code> char`);
   lines.push(`🔄 Layer: <b>${result.layers}x</b>`);
-  lines.push(`📤 Output: <code>${result.output.length}</code> char`);
-  lines.push(`🏷️ Tipe: ${result.isUrl ? '🔗 URL' : '📄 Teks'}`);
-  lines.push('');
+  lines.push(`🏷️ Tipe: ${result.isUrl ? '🔗 URL' : '📄 Teks'}\n`);
 
   if (result.isUrl) {
     lines.push('<b>URL:</b>');
@@ -264,28 +260,134 @@ async function handleBase64Input(ctx: Context, input: string): Promise<void> {
   });
 }
 
+async function downloadDocText(
+  ctx: Context,
+  env: Env
+): Promise<string | null> {
+  const doc =
+    ctx.message?.document ?? ctx.message?.reply_to_message?.document;
+  if (!doc) return null;
+
+  const size = doc.file_size ?? 0;
+  if (size > MAX_FILE_BYTES) {
+    await ctx.reply(
+      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${
+        MAX_FILE_BYTES / 1024 / 1024
+      } MB).`,
+      { parse_mode: 'HTML' }
+    );
+    return null;
+  }
+
+  const name = doc.file_name ?? '';
+  const mime = doc.mime_type ?? '';
+  const allowedExt = /\.(html?|txt|json|js|css)$/i.test(name);
+  const allowedMime = /^text\/|json|javascript/i.test(mime);
+  if (!allowedExt && !allowedMime) {
+    await ctx.reply(
+      `❌ Tipe file tidak didukung: <code>${escapeHtml(
+        name || mime || '?'
+      )}</code>\n\n` +
+        '<i>Kirim .html, .htm, .txt, .json, atau .js</i>',
+      { parse_mode: 'HTML' }
+    );
+    return null;
+  }
+
+  const loading = await ctx.reply('📥 Download file...');
+
+  try {
+    const file = await ctx.api.getFile(doc.file_id);
+    if (!file.file_path) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '❌ Tidak dapat path file dari Telegram.'
+      );
+      return null;
+    }
+
+    const url = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Gagal download: HTTP ${res.status}`
+      );
+      return null;
+    }
+
+    let text = await res.text();
+
+    if (text.length > MAX_FILE_CHARS) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `⚠️ File <b>${text.length.toLocaleString()}</b> char > limit ` +
+          `<b>${MAX_FILE_CHARS.toLocaleString()}</b>. Dipotong ke bagian awal.`,
+        { parse_mode: 'HTML' }
+      );
+      text = text.slice(0, MAX_FILE_CHARS);
+    } else {
+      await ctx.api
+        .deleteMessage(ctx.chat!.id, loading.message_id)
+        .catch(() => {});
+    }
+
+    return text;
+  } catch (err: any) {
+    console.error('[Decode] download error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error download: ${escapeHtml(err?.message ?? 'unknown')}`
+      )
+      .catch(() => {});
+    return null;
+  }
+}
+
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
-  description: 'Decode Base64 jadi URL/teks (support HTML)',
-  usage: '/decode <base64|html>\nAtau reply pesan berisi Base64/HTML',
+  description: 'Decode Base64 / HTML file jadi URL asli',
+  usage:
+    '/decode <base64|html>\nKirim file .html/.txt dengan caption /decode',
   adminOnly: true,
 
-  handler: async (ctx) => {
+  handler: async (ctx, env) => {
+    const doc =
+      ctx.message?.document ?? ctx.message?.reply_to_message?.document;
+    if (doc) {
+      const text = await downloadDocText(ctx, env);
+      if (!text) return;
+
+      if (looksLikeHtml(text)) {
+        await processHtml(ctx, text);
+      } else if (isLikelyBase64(text)) {
+        await processBase64(ctx, text.trim());
+      } else {
+        await processHtml(ctx, text);
+      }
+      return;
+    }
+
     const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
     const repliedText = ctx.message?.reply_to_message?.text ?? '';
     const input = arg || repliedText;
 
     if (!input) {
       await ctx.reply(
-        '<b>🔓 Decode Base64</b>\n\n' +
-          '<b>Cara pakai:</b>\n' +
+        '<b>🔓 Decode Base64 / HTML</b>\n\n' +
+          '<b>Mode teks:</b>\n' +
           '<code>/decode aHR0cHM6Ly8...</code>\n\n' +
-          'Atau reply ke pesan berisi Base64 / HTML, lalu kirim <code>/decode</code>.\n\n' +
-          '<b>Support:</b>\n' +
-          '• Base64 standar & URL-safe\n' +
-          '• Multi-layer (max 5x)\n' +
-          '• <b>HTML view-source</b> — auto-extract dari <code>atob()</code>, <code>data-*</code>, script\n' +
-          '• Auto-detect padding',
+          '<b>Mode reply:</b>\n' +
+          'Reply ke pesan berisi Base64/HTML → kirim <code>/decode</code>\n\n' +
+          '<b>Mode file:</b>\n' +
+          'Kirim file <code>.html</code> / <code>.txt</code> dengan caption <code>/decode</code>\n' +
+          'atau reply ke file dengan <code>/decode</code>\n\n' +
+          '<b>Limit:</b> teks 8.000 char · file 2 MB / 300.000 char',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
@@ -294,17 +396,16 @@ export const decodeCommand: CommandDefinition = {
     if (input.length > MAX_INPUT_LEN) {
       await ctx.reply(
         `❌ Input terlalu panjang: <b>${input.length}</b> char (max ${MAX_INPUT_LEN}).\n\n` +
-          '<i>Kalau HTML-nya besar, potong dulu bagian yang ada ' +
-          '<code>atob()</code>, <code>data-*</code>, atau script intinya.</i>',
+          '<i>Kalau HTML-nya besar, kirim sebagai file document.</i>',
         { parse_mode: 'HTML' }
       );
       return;
     }
 
     if (looksLikeHtml(input)) {
-      await handleHtmlInput(ctx, input);
+      await processHtml(ctx, input);
     } else {
-      await handleBase64Input(ctx, input);
+      await processBase64(ctx, input);
     }
   },
 };
