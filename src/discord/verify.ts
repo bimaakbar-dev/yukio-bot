@@ -11,17 +11,17 @@ export async function verifyDiscordSignature(
 
     const key = await crypto.subtle.importKey(
       'raw',
-      publicKey,
-      { name: 'Ed25519' } as AlgorithmIdentifier,
+      publicKey.buffer as ArrayBuffer,
+      { name: 'Ed25519' } as any,
       false,
       ['verify']
     );
 
     return await crypto.subtle.verify(
-      { name: 'Ed25519' } as AlgorithmIdentifier,
+      { name: 'Ed25519' } as any,
       key,
-      signature,
-      message
+      signature.buffer as ArrayBuffer,
+      message.buffer as ArrayBuffer
     );
   } catch (err) {
     console.error('[Discord] signature verify failed:', err);
