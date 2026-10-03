@@ -162,11 +162,6 @@ function normalizeStudioName(name: string): string {
   return `Studio ${t}`;
 }
 
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return s.slice(0, max - 20) + '\n… [truncated]';
-}
-
 function splitForDiscord(s: string, max: number): string[] {
   if (s.length <= max) return [s];
   const parts: string[] = [];
