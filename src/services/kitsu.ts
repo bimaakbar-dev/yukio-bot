@@ -25,7 +25,7 @@ interface KitsuAnime {
   };
   relationships?: {
     categories?: { data: { type: string; id: string }[] };
-    studios?: { data: { type: string; id: string }[] };
+    productions?: { data: { type: string; id: string }[] };
   };
 }
 
@@ -35,6 +35,7 @@ interface KitsuIncluded {
   attributes: {
     title?: string;
     name?: string;
+    role?: string;
   };
 }
 
@@ -49,15 +50,13 @@ interface KitsuSearchResult {
   studios: string[];
 }
 
-/**
- * Cari anime di Kitsu + ambil studio via endpoint terpisah.
- */
 export async function searchKitsu(
   title: string
 ): Promise<KitsuSearchResult | null> {
+  // Include productions — di sinilah studio tersimpan
   const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(
     title
-  )}&include=categories&page[limit]=1`;
+  )}&include=categories,productions&page[limit]=1`;
 
   const res = await fetchWithRetry(url, {
     headers: {
@@ -78,7 +77,7 @@ export async function searchKitsu(
 
   const included = json.included ?? [];
 
-  // Extract genre dari included
+  // ─── Genre ───
   const categoryIds = (anime.relationships?.categories?.data ?? []).map(
     (r) => r.id
   );
@@ -88,40 +87,21 @@ export async function searchKitsu(
     .filter((t): t is string => !!t)
     .slice(0, 5);
 
-  // Fetch studio terpisah — akurat, tidak perlu AI
-  const studios = await fetchKitsuStudios(anime.id);
+  // ─── Studio dari productions (role === "studio") ───
+  const productionIds = (anime.relationships?.productions?.data ?? []).map(
+    (r) => r.id
+  );
+  const studios = included
+    .filter(
+      (i) =>
+        i.type === 'productions' &&
+        productionIds.includes(i.id) &&
+        i.attributes.role === 'studio'
+    )
+    .map((i) => i.attributes.name)
+    .filter((s): s is string => !!s);
 
-  return { anime, genres, studios };
-}
-
-/**
- * Fetch studio dari endpoint terpisah Kitsu.
- * Endpoint: /anime/{id}/studios
- */
-async function fetchKitsuStudios(animeId: string): Promise<string[]> {
-  try {
-    const url = `${KITSU_URL}/${animeId}/studios`;
-    const res = await fetchWithRetry(url, {
-      headers: {
-        Accept: 'application/vnd.api+json',
-        'User-Agent': 'yukio-bot/1.0',
-      },
-    });
-
-    if (!res.ok) return [];
-
-    const json = (await res.json()) as {
-      data?: { attributes: { name: string } }[];
-    };
-
-    return (json.data ?? [])
-      .map((s) => s.attributes.name)
-      .filter((s) => s && s.trim())
-      .slice(0, 3);
-  } catch (err) {
-    console.warn('[Kitsu] studios fetch failed:', err);
-    return [];
-  }
+  return { anime, genres, studios: studios.slice(0, 3) };
 }
 
 export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
