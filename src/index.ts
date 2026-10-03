@@ -78,10 +78,9 @@ async function getBot(env: Env): Promise<Bot> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // Health check
     if (url.pathname === '/health' || url.pathname === '/') {
       return new Response(
         JSON.stringify({
@@ -93,7 +92,6 @@ export default {
       );
     }
 
-    // Debug Telegram
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
@@ -121,14 +119,13 @@ export default {
       }
     }
 
-    // Discord — register slash commands (buka di browser sekali)
     if (url.pathname === '/discord/register') {
       return registerDiscordCommands(env);
     }
 
     // Discord — interaction endpoint
     if (url.pathname === '/discord') {
-      return handleDiscordRequest(request, env);
+      return handleDiscordRequest(request, env, ctx);
     }
 
     // Telegram — webhook
