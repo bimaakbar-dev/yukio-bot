@@ -1,22 +1,15 @@
 import type { CommandDefinition } from './registry';
-import type { Context, Bot } from 'grammy';
+import type { Context } from 'grammy';
 import type { Env } from '../types/env';
-import { InlineKeyboard } from 'grammy';
 import type { D1Database } from '@cloudflare/workers-types';
 
-/* ═══════════════════════════════════════════════
-   CONSTANTS
-   ═══════════════════════════════════════════════ */
-
 const MAX_INPUT_LEN = 8000;
-const MAX_FILE_CHARS = 300_000;
+const MAX_FILE_CHARS = 2 * 1024 * 1024;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_LAYERS = 5;
 const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
-const PAGE_CHAR_BUDGET = 3500;
-const YAML_CHAR_BUDGET = 3500;
-const SESSION_TTL_MS = 60 * 60 * 1000;
+const MSG_BUDGET = 3800;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -34,89 +27,14 @@ const VIDEO_HOSTS = [
 const WRAPPER_HOSTS = ['animesail.xyz', '154999000.xyz'];
 
 const SERVER_ALIASES: Record<string, string> = {
-  abyss: 'abyss',
-  dodo: 'doply',
-  doply: 'doply',
-  pixel: 'pixeldrain',
-  pixeldrain: 'pixeldrain',
-  viking: 'vikingfile',
-  vikingfile: 'vikingfile',
-  mix: 'mixdrop',
-  mixdrop: 'mixdrop',
-  buzi: 'buzzheavier',
-  buzzheavier: 'buzzheavier',
-  mp4: 'mp4upload',
-  mp4upload: 'mp4upload',
-  mega: 'mega',
-  lokal: 'lokal',
-  kamado: 'kamado',
-  pancal: 'pancal',
+  abyss: 'abyss', dodo: 'doply', doply: 'doply',
+  pixel: 'pixeldrain', pixeldrain: 'pixeldrain',
+  viking: 'vikingfile', vikingfile: 'vikingfile',
+  mix: 'mixdrop', mixdrop: 'mixdrop',
+  buzi: 'buzzheavier', buzzheavier: 'buzzheavier',
+  mp4: 'mp4upload', mp4upload: 'mp4upload',
+  mega: 'mega', lokal: 'lokal', kamado: 'kamado', pancal: 'pancal',
 };
-
-/* ═══════════════════════════════════════════════
-   DB
-   ═══════════════════════════════════════════════ */
-
-let dbReady = false;
-let dbInitPromise: Promise<void> | null = null;
-
-async function ensureDb(db: D1Database): Promise<void> {
-  if (dbReady) return;
-  if (dbInitPromise) return dbInitPromise;
-
-  dbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS temp_decode (
-            session_id  TEXT PRIMARY KEY,
-            chat_id     INTEGER NOT NULL,
-            user_id     INTEGER NOT NULL,
-            pages       TEXT NOT NULL,
-            total       INTEGER NOT NULL,
-            page_count  INTEGER NOT NULL,
-            created_at  INTEGER NOT NULL,
-            expires_at  INTEGER NOT NULL
-          )`
-        )
-        .run();
-
-      await db
-        .prepare('CREATE INDEX IF NOT EXISTS idx_temp_expires ON temp_decode(expires_at)')
-        .run();
-
-      await db
-        .prepare('CREATE INDEX IF NOT EXISTS idx_temp_chat ON temp_decode(chat_id)')
-        .run();
-
-      dbReady = true;
-    } catch (err) {
-      console.error('[Decode] DB init error:', err);
-      dbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return dbInitPromise;
-}
-
-/* ═══════════════════════════════════════════════
-   TYPES
-   ═══════════════════════════════════════════════ */
-
-interface PageItem {
-  url: string;
-  resolution: string | null;
-  server: string | null;
-}
-
-interface TempSession {
-  session_id: string;
-  user_id: number;
-  pages: PageItem[][];
-  total: number;
-  page_count: number;
-}
 
 interface RawEntry {
   base64: string;
@@ -129,97 +47,108 @@ interface ResolvedEntry {
   server: string | null;
 }
 
-/* ═══════════════════════════════════════════════
-   SESSION
-   ═══════════════════════════════════════════════ */
+interface FileRef {
+  id: number;
+  label: string;
+  filename: string | null;
+  file_id: string;
+  created_at: number;
+  last_accessed: number;
+}
 
-async function createSession(
-  db: D1Database,
-  chatId: number,
-  userId: number,
-  pages: PageItem[][]
-): Promise<string> {
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS file_refs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            label         TEXT UNIQUE NOT NULL,
+            filename      TEXT,
+            file_id       TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            last_accessed INTEGER NOT NULL
+          )`
+        )
+        .run();
+      await db
+        .prepare('CREATE INDEX IF NOT EXISTS idx_file_refs_accessed ON file_refs(last_accessed DESC)')
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[Decode] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+async function getFileRef(db: D1Database, label: string): Promise<FileRef | null> {
   await ensureDb(db);
+  const row = await db
+    .prepare('SELECT * FROM file_refs WHERE label = ?')
+    .bind(label)
+    .first<FileRef>();
+  if (!row) return null;
+  db.prepare('UPDATE file_refs SET last_accessed = ? WHERE id = ?')
+    .bind(Date.now(), row.id)
+    .run()
+    .catch(() => {});
+  return row;
+}
 
-  const sessionId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+async function saveFileRef(
+  db: D1Database,
+  label: string,
+  filename: string | null,
+  fileId: string
+): Promise<{ replaced: boolean }> {
+  await ensureDb(db);
+  const existing = await db
+    .prepare('SELECT id FROM file_refs WHERE label = ?')
+    .bind(label)
+    .first<{ id: number }>();
+
   const now = Date.now();
-  const total = pages.reduce((s, p) => s + p.length, 0);
-
   await db
     .prepare(
-      `INSERT INTO temp_decode
-         (session_id, chat_id, user_id, pages, total, page_count, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO file_refs (label, filename, file_id, created_at, last_accessed)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(label) DO UPDATE SET
+         filename = excluded.filename,
+         file_id = excluded.file_id,
+         last_accessed = excluded.last_accessed`
     )
-    .bind(
-      sessionId,
-      chatId,
-      userId,
-      JSON.stringify(pages),
-      total,
-      pages.length,
-      now,
-      now + SESSION_TTL_MS
-    )
+    .bind(label, filename, fileId, now, now)
     .run();
 
-  return sessionId;
+  return { replaced: !!existing };
 }
 
-async function getSession(
-  db: D1Database,
-  sessionId: string
-): Promise<TempSession | null> {
+async function listFileRefs(db: D1Database, limit = 30): Promise<FileRef[]> {
   await ensureDb(db);
-
-  const row = await db
+  const res = await db
     .prepare(
-      'SELECT session_id, user_id, pages, total, page_count, expires_at FROM temp_decode WHERE session_id = ?'
+      'SELECT id, label, filename, file_id, created_at, last_accessed FROM file_refs ORDER BY last_accessed DESC LIMIT ?'
     )
-    .bind(sessionId)
-    .first<{
-      session_id: string;
-      user_id: number;
-      pages: string;
-      total: number;
-      page_count: number;
-      expires_at: number;
-    }>();
-
-  if (!row) return null;
-
-  if (row.expires_at < Date.now()) {
-    await db
-      .prepare('DELETE FROM temp_decode WHERE session_id = ?')
-      .bind(sessionId)
-      .run()
-      .catch(() => {});
-    return null;
-  }
-
-  return {
-    session_id: row.session_id,
-    user_id: row.user_id,
-    pages: JSON.parse(row.pages),
-    total: row.total,
-    page_count: row.page_count,
-  };
+    .bind(limit)
+    .all<FileRef>();
+  return res.results ?? [];
 }
 
-async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
-  try {
-    await db
-      .prepare('DELETE FROM temp_decode WHERE session_id = ?')
-      .bind(sessionId)
-      .run();
-  } catch (err) {
-    console.error('[Decode] delete error:', err);
-  }
+async function deleteFileRef(db: D1Database, label: string): Promise<boolean> {
+  await ensureDb(db);
+  const res = await db.prepare('DELETE FROM file_refs WHERE label = ?').bind(label).run();
+  return (res.meta?.changes ?? 0) > 0;
 }
-
-/* ═══════════════════════════════════════════════
-   HELPERS
-   ═══════════════════════════════════════════════ */
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -249,16 +178,11 @@ function decodeBase64(input: string): string | null {
   const b64 = normalizeBase64(input);
   if (!b64) return null;
   try {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder('utf-8', {
-      fatal: false,
-      ignoreBOM: false,
-    }).decode(bytes);
-  } catch {
-    return null;
-  }
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false, ignoreBOM: false }).decode(bytes);
+  } catch { return null; }
 }
 
 function isLikelyBase64(s: string): boolean {
@@ -281,11 +205,8 @@ function isPrintable(s: string): boolean {
 function looksLikeHtml(s: string): boolean {
   if (s.length < 30) return false;
   return (
-    /<!DOCTYPE/i.test(s) ||
-    /<html[\s>]/i.test(s) ||
-    /<script[\s>]/i.test(s) ||
-    /<iframe[\s>]/i.test(s) ||
-    /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
+    /<!DOCTYPE/i.test(s) || /<html[\s>]/i.test(s) || /<script[\s>]/i.test(s) ||
+    /<iframe[\s>]/i.test(s) || /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
   );
 }
 
@@ -299,9 +220,7 @@ function isWrapper(url: string): boolean {
   try {
     const h = new URL(url).hostname.toLowerCase();
     return WRAPPER_HOSTS.some((w) => h === w || h.endsWith('.' + w));
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 function parseResolution(label: string | null): string | null {
@@ -323,59 +242,51 @@ function resolutionRank(r: string | null): number {
   return isNaN(n) ? -1 : n;
 }
 
-/* ═══════════════════════════════════════════════
-   URL EXTRACTION
-   ═══════════════════════════════════════════════ */
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/\.(html?|txt|json)$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40) || `file-${Date.now()}`;
+}
 
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
   const cleaned = htmlDecode(s);
   const trimmed = cleaned.trim();
-
-  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) {
-    found.add(trimmed);
-    return [...found];
-  }
+  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) { found.add(trimmed); return [...found]; }
 
   for (const m of cleaned.matchAll(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi)) {
     const u = htmlDecode(m[1] ?? '');
     if (/^https?:\/\//i.test(u)) found.add(u);
   }
-
   if (found.size === 0) {
     for (const m of cleaned.matchAll(/src\s*=\s*["'](https?:\/\/[^"']+)["']/gi)) {
       const u = htmlDecode(m[1] ?? '');
       if (u) found.add(u);
     }
   }
-
   if (found.size === 0) {
     for (const m of cleaned.matchAll(/href\s*=\s*["'](https?:\/\/[^"']+)["']/gi)) {
       const u = htmlDecode(m[1] ?? '');
       if (u) found.add(u);
     }
   }
-
   if (found.size === 0) {
     for (const m of cleaned.matchAll(/https?:\/\/[^\s"'<>()\\]+/g)) {
       const u = htmlDecode(m[0]);
       if (u) found.add(u);
     }
   }
-
   return [...found];
 }
 
 function expandUrlParams(url: string, depth = 0): string[] {
   const out = new Set<string>([url]);
   if (depth > MAX_PARAM_DEPTH) return [...out];
-
   let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return [...out];
-  }
+  try { parsed = new URL(url); } catch { return [...out]; }
 
   for (const [key, value] of parsed.searchParams.entries()) {
     if (!value || value.length < 12) continue;
@@ -385,18 +296,14 @@ function expandUrlParams(url: string, depth = 0): string[] {
       for (const sub of expandUrlParams(value, depth + 1)) out.add(sub);
       continue;
     }
-
     if (/^https?%3A/i.test(value)) {
       try {
         const dec = decodeURIComponent(value);
         if (/^https?:\/\//i.test(dec)) {
           for (const sub of expandUrlParams(dec, depth + 1)) out.add(sub);
         }
-      } catch {
-        /* ignore */
-      }
+      } catch { /* ignore */ }
     }
-
     if (isLikelyBase64(value)) {
       const decoded = decodeBase64(value);
       if (decoded && isPrintable(decoded)) {
@@ -407,7 +314,6 @@ function expandUrlParams(url: string, depth = 0): string[] {
       }
     }
   }
-
   return [...out];
 }
 
@@ -421,19 +327,16 @@ function multiLayerDecode(input: string): DecodeResult | null {
   if (!isLikelyBase64(input)) return null;
   let current = input.trim();
   let layers = 0;
-
   for (let i = 0; i < MAX_LAYERS; i++) {
     const decoded = decodeBase64(current);
     if (decoded === null || decoded === current) break;
     if (!isPrintable(decoded)) break;
     current = decoded;
     layers++;
-
     const urls = extractUrlsFromDecoded(current);
     if (urls.length > 0) break;
     if (!isLikelyBase64(current)) break;
   }
-
   if (layers === 0) return null;
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
@@ -470,37 +373,22 @@ function extractEntries(html: string): RawEntry[] {
   return entries;
 }
 
-/* ═══════════════════════════════════════════════
-   RESOLVE
-   ═══════════════════════════════════════════════ */
-
 function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   const resolved = new Map<string, { resolution: string | null; server: string | null }>();
   const unresolved = new Map<string, { resolution: string | null; server: string | null }>();
 
-  function resolve(
-    url: string,
-    resolution: string | null,
-    server: string | null,
-    depth: number,
-    seen: Set<string>
-  ): void {
+  function resolve(url: string, resolution: string | null, server: string | null, depth: number, seen: Set<string>): void {
     if (depth > 4 || seen.has(url)) return;
     seen.add(url);
-
     const children = expandUrlParams(url).filter((u) => u !== url);
-
     if (isWrapper(url)) {
       if (children.length === 0) {
-        if (!resolved.has(url) && !unresolved.has(url)) {
-          unresolved.set(url, { resolution, server });
-        }
+        if (!resolved.has(url) && !unresolved.has(url)) unresolved.set(url, { resolution, server });
       } else {
         for (const c of children) resolve(c, resolution, server, depth + 1, seen);
       }
       return;
     }
-
     if (!resolved.has(url)) resolved.set(url, { resolution, server });
     for (const c of children) resolve(c, resolution, server, depth + 1, seen);
   }
@@ -508,82 +396,67 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   for (const e of entries) {
     const dec = multiLayerDecode(e.base64);
     if (!dec || dec.urls.length === 0) continue;
-
     const resolution = parseResolution(e.label);
     const server = parseServerName(e.label);
-    for (const url of dec.urls) {
-      resolve(url, resolution, server, 0, new Set());
-    }
+    for (const url of dec.urls) resolve(url, resolution, server, 0, new Set());
   }
 
   const final: ResolvedEntry[] = [];
   for (const [url, info] of resolved) {
-    if (isVideoUrl(url)) {
-      final.push({ url, resolution: info.resolution, server: info.server });
-    }
+    if (isVideoUrl(url)) final.push({ url, resolution: info.resolution, server: info.server });
   }
-
   if (final.length === 0) {
-    for (const [url, info] of unresolved) {
-      final.push({ url, resolution: info.resolution, server: info.server });
-    }
+    for (const [url, info] of unresolved) final.push({ url, resolution: info.resolution, server: info.server });
   }
-
   final.sort((a, b) => {
     const ra = resolutionRank(a.resolution);
     const rb = resolutionRank(b.resolution);
     if (ra !== rb) return rb - ra;
     return a.url.length - b.url.length;
   });
-
   return final;
 }
 
-/* ═══════════════════════════════════════════════
-   PAGINATION
-   ═══════════════════════════════════════════════ */
+function buildUrlList(items: ResolvedEntry[], label?: string): string {
+  const lines: string[] = [];
+  lines.push('🎬 <b>URL Video</b>');
+  if (label) lines.push(`🏷️ <code>${escapeHtml(label)}</code>`);
+  lines.push(`📊 Total: <b>${items.length}</b>`);
+  lines.push('');
 
-function paginate(items: ResolvedEntry[], budget = PAGE_CHAR_BUDGET): PageItem[][] {
-  const pages: PageItem[][] = [];
-  let cur: PageItem[] = [];
-  let curLen = 0;
-
-  for (const item of items) {
-    const lineLen = item.url.length + 20;
-    if (curLen + lineLen > budget && cur.length > 0) {
-      pages.push(cur);
-      cur = [];
-      curLen = 0;
-    }
-    cur.push({ url: item.url, resolution: item.resolution, server: item.server });
-    curLen += lineLen;
+  const byRes = new Map<string, ResolvedEntry[]>();
+  for (const it of items) {
+    const key = it.resolution ?? 'Lainnya';
+    if (!byRes.has(key)) byRes.set(key, []);
+    byRes.get(key)!.push(it);
   }
-  if (cur.length > 0) pages.push(cur);
-  return pages.length > 0 ? pages : [[]];
+  const sortedKeys = [...byRes.keys()].sort((a, b) => resolutionRank(b) - resolutionRank(a));
+
+  let n = 1;
+  for (const key of sortedKeys) {
+    lines.push(`━━━ ${escapeHtml(key)} ━━━`);
+    for (const it of byRes.get(key)!) {
+      lines.push(`${n}. <code>${escapeHtml(it.url)}</code>`);
+      n++;
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trim();
 }
 
-/* ═══════════════════════════════════════════════
-   YAML BUILDER
-   ═══════════════════════════════════════════════ */
-
-function buildYaml(items: PageItem[]): string {
+function buildYaml(items: ResolvedEntry[]): string {
   const byQuality = new Map<string, { name: string; url: string }[]>();
-
   for (const item of items) {
     const q = item.resolution ?? 'Unknown';
     if (!byQuality.has(q)) byQuality.set(q, []);
     byQuality.get(q)!.push({ name: item.server ?? 'unknown', url: item.url });
   }
-
-  const qualities = [...byQuality.keys()].sort(
-    (a, b) => resolutionRank(b) - resolutionRank(a)
-  );
+  const qualities = [...byQuality.keys()].sort((a, b) => resolutionRank(b) - resolutionRank(a));
 
   const lines: string[] = [];
   lines.push('episodes:');
   lines.push('  - number: 1');
   lines.push('    streams:');
-
   for (const q of qualities) {
     lines.push(`      - quality: "${q}"`);
     lines.push('        servers:');
@@ -592,205 +465,111 @@ function buildYaml(items: PageItem[]): string {
       lines.push(`            url: "${s.url}"`);
     }
   }
-
   return lines.join('\n');
 }
 
-function paginateYaml(yaml: string, budget = YAML_CHAR_BUDGET): string[] {
-  if (yaml.length <= budget) return [yaml];
-  const lines = yaml.split('\n');
-  const pages: string[] = [];
-  let cur: string[] = [];
-  let curLen = 0;
-
-  for (const line of lines) {
-    if (curLen + line.length + 1 > budget && cur.length > 0) {
-      pages.push(cur.join('\n'));
-      cur = [];
-      curLen = 0;
+function splitMessage(text: string, budget = MSG_BUDGET): string[] {
+  if (text.length <= budget) return [text];
+  const parts: string[] = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    const prospective = current ? current + '\n' + line : line;
+    if (prospective.length > budget && current.length > 0) {
+      parts.push(current);
+      current = line;
+    } else {
+      current = prospective;
     }
-    cur.push(line);
-    curLen += line.length + 1;
   }
-  if (cur.length > 0) pages.push(cur.join('\n'));
-  return pages;
+  if (current) parts.push(current);
+  return parts;
 }
 
-/* ═══════════════════════════════════════════════
-   RENDER
-   ═══════════════════════════════════════════════ */
-
-function summaryByResolution(items: ResolvedEntry[]): string {
-  const counts = new Map<string, number>();
-  for (const it of items) {
-    const key = it.resolution ?? 'Lainnya';
-    counts.set(key, (counts.get(key) ?? 0) + 1);
+async function sendResult(ctx: Context, items: ResolvedEntry[], label?: string): Promise<void> {
+  const urlList = buildUrlList(items, label);
+  for (const part of splitMessage(urlList)) {
+    await ctx.reply(part, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
   }
-  const sorted = [...counts.entries()].sort((a, b) => {
-    const ra = resolutionRank(a[0]);
-    const rb = resolutionRank(b[0]);
-    return rb - ra;
-  });
-  return sorted.map(([res, n]) => `${res} (${n})`).join(' · ');
-}
-
-function renderPage(opts: {
-  sessionId: string;
-  pageIdx: number;
-  pageCount: number;
-  items: PageItem[];
-  total: number;
-  offset: number;
-  summary: string;
-}): { text: string; keyboard: InlineKeyboard } {
-  const { sessionId, pageIdx, pageCount, items, total, offset, summary } = opts;
-
-  const lines: string[] = [];
-  lines.push('🎬 <b>URL Video</b>');
-  lines.push('');
-  lines.push(`Total: <b>${total}</b>  ·  Halaman <b>${pageIdx + 1}/${pageCount}</b>`);
-  if (summary) lines.push(`📊 ${summary}`);
-  lines.push('');
-
-  let lastRes: string | null | undefined = undefined;
-  items.forEach((item, i) => {
-    const res = item.resolution;
-    if (res !== lastRes) {
-      if (lastRes !== undefined) lines.push('');
-      lines.push(`━━━ ${res ? escapeHtml(res) : 'Lainnya'} ━━━`);
-      lastRes = res;
-    }
-    lines.push(`${offset + i + 1}. <code>${escapeHtml(item.url)}</code>`);
-  });
-
-  const kb = new InlineKeyboard();
-
-  if (pageIdx > 0) kb.text('⬅ Prev', `dc:p:${sessionId}:${pageIdx - 1}`);
-  else kb.text('·', 'dc:noop');
-  kb.text(`${pageIdx + 1}/${pageCount}`, 'dc:noop');
-  if (pageIdx < pageCount - 1) kb.text('Next ➡', `dc:p:${sessionId}:${pageIdx + 1}`);
-  else kb.text('·', 'dc:noop');
-  kb.row();
-
-  kb.text('📋 YAML', `dc:y:${sessionId}`);
-  kb.text('✅ Selesai', `dc:x:${sessionId}`);
-  kb.row();
-
-  items.slice(0, 3).forEach((item, i) => {
-    if (item.url.length < 1900) {
-      const icon = item.resolution ? `🎬 ${item.resolution}` : `🎬 ${offset + i + 1}`;
-      kb.url(icon, item.url);
-      if ((i + 1) % 3 === 0) kb.row();
-    }
-  });
-
-  return { text: lines.join('\n'), keyboard: kb };
-}
-
-/* ═══════════════════════════════════════════════
-   PROCESS INPUT
-   ═══════════════════════════════════════════════ */
-
-async function processInput(
-  ctx: Context,
-  env: Env,
-  input: string,
-  sourceType: 'base64' | 'html'
-): Promise<void> {
-  const loading = await ctx.reply(
-    sourceType === 'html' ? '🌐 Proses HTML...' : '🔓 Proses Base64...'
-  );
-
-  try {
-    const entries =
-      sourceType === 'html'
-        ? extractEntries(input)
-        : [{ base64: input, label: null }];
-
-    if (entries.length === 0) {
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        '❌ Tidak ada Base64 yang ditemukan.'
-      );
-      return;
-    }
-
-    const videos = collectResolvedVideos(entries);
-
-    if (videos.length === 0) {
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        `❌ Tidak ada URL video.\n\n<i>Dari ${entries.length} kandidat, tidak ada URL video valid.</i>`,
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-
-    const pages = paginate(videos);
-    const summary = summaryByResolution(videos);
-    const sessionId = await createSession(
-      env.DB,
-      ctx.chat!.id,
-      ctx.from!.id,
-      pages
-    );
-
-    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-
-    const { text, keyboard } = renderPage({
-      sessionId,
-      pageIdx: 0,
-      pageCount: pages.length,
-      items: pages[0] ?? [],
-      total: videos.length,
-      offset: 0,
-      summary,
-    });
-
-    await ctx.reply(text, {
+  const yaml = buildYaml(items);
+  for (const part of splitMessage(yaml)) {
+    await ctx.reply(`📋 <b>YAML</b>\n\n<pre>${escapeHtml(part)}</pre>`, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
-      reply_markup: keyboard,
     });
-  } catch (err: any) {
-    console.error('[Decode] process error:', err);
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
-      )
-      .catch(() => {});
   }
 }
 
-/* ═══════════════════════════════════════════════
-   DOWNLOAD FILE
-   ═══════════════════════════════════════════════ */
+async function downloadByFileId(
+  ctx: Context,
+  env: Env,
+  fileId: string,
+  showLoading: boolean
+): Promise<string | null> {
+  let loadingId: number | null = null;
+  if (showLoading) {
+    const m = await ctx.reply('📥 Ambil dari Telegram...');
+    loadingId = m.message_id;
+  }
 
-async function downloadDocText(ctx: Context, env: Env): Promise<string | null> {
+  try {
+    const file = await ctx.api.getFile(fileId);
+    if (!file.file_path) throw new Error('no file_path');
+
+    const url = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    let text = await res.text();
+    if (text.length > MAX_FILE_CHARS) text = text.slice(0, MAX_FILE_CHARS);
+
+    if (loadingId) {
+      await ctx.api.deleteMessage(ctx.chat!.id, loadingId).catch(() => {});
+    }
+    return text;
+  } catch (err: any) {
+    const msg = err?.message ?? 'unknown';
+    console.error('[Decode] download failed:', msg);
+    if (loadingId) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loadingId,
+          `❌ Gagal ambil file dari Telegram: <code>${escapeHtml(msg)}</code>\n\n` +
+            `<i>File mungkin sudah dihapus. Upload ulang ya.</i>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    } else {
+      await ctx.reply(
+        `❌ Gagal ambil file: <code>${escapeHtml(msg)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+    return null;
+  }
+}
+
+async function downloadDocText(
+  ctx: Context,
+  env: Env
+): Promise<{ text: string; fileId: string; filename: string } | null> {
   const doc = ctx.message?.document ?? ctx.message?.reply_to_message?.document;
   if (!doc) return null;
 
   const size = doc.file_size ?? 0;
   if (size > MAX_FILE_BYTES) {
-    await ctx.reply(`❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b>.`, {
-      parse_mode: 'HTML',
-    });
+    await ctx.reply(
+      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${MAX_FILE_BYTES / 1024 / 1024} MB).\n\n<i>Potong dulu HTML-nya.</i>`,
+      { parse_mode: 'HTML' }
+    );
     return null;
   }
 
   const name = doc.file_name ?? '';
   const mime = doc.mime_type ?? '';
-  const ok =
-    /\.(html?|txt|json|js|css)$/i.test(name) ||
-    /^text\/|json|javascript/i.test(mime);
+  const ok = /\.(html?|txt|json|js|css)$/i.test(name) || /^text\/|json|javascript/i.test(mime);
   if (!ok) {
-    await ctx.reply(`❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`, {
-      parse_mode: 'HTML',
-    });
+    await ctx.reply(`❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`, { parse_mode: 'HTML' });
     return null;
   }
 
@@ -806,8 +585,65 @@ async function downloadDocText(ctx: Context, env: Env): Promise<string | null> {
     let text = await res.text();
     if (text.length > MAX_FILE_CHARS) text = text.slice(0, MAX_FILE_CHARS);
     await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-    return text;
+    return { text, fileId: doc.file_id, filename: name || 'unnamed' };
   } catch (err: any) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error download: ${escapeHtml(err?.message ?? 'unknown')}`
+      )
+      .catch(() => {});
+    return null;
+  }
+}
+
+function processText(input: string, sourceType: 'base64' | 'html'): ResolvedEntry[] | null {
+  const entries = sourceType === 'html' ? extractEntries(input) : [{ base64: input, label: null }];
+  if (entries.length === 0) return null;
+  const videos = collectResolvedVideos(entries);
+  return videos.length > 0 ? videos : null;
+}
+
+export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
+  const result = await downloadDocText(ctx, env);
+  if (!result) return;
+
+  const { text, fileId, filename } = result;
+  const sourceType: 'base64' | 'html' = looksLikeHtml(text) ? 'html' : 'base64';
+
+  const loading = await ctx.reply('🌐 Proses...');
+  try {
+    const videos = processText(text, sourceType);
+    if (!videos || videos.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '❌ Tidak ada URL video yang bisa diekstrak.'
+      );
+      return;
+    }
+
+    const label = slugify(filename);
+    const { replaced } = await saveFileRef(env.DB, label, filename, fileId);
+
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    await ctx.reply(
+      replaced
+        ? `♻️ Update: <code>${escapeHtml(label)}</code>`
+        : `💾 Tersimpan: <code>${escapeHtml(label)}</code>`,
+      { parse_mode: 'HTML' }
+    );
+
+    await sendResult(ctx, videos, label);
+
+    await ctx.reply(
+      `💡 Akses lagi: <code>/decode ${escapeHtml(label)}</code>`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (err: any) {
+    console.error('[Decode] auto error:', err);
     await ctx.api
       .editMessageText(
         ctx.chat!.id,
@@ -815,178 +651,19 @@ async function downloadDocText(ctx: Context, env: Env): Promise<string | null> {
         `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
       )
       .catch(() => {});
-    return null;
   }
 }
-
-/* ═══════════════════════════════════════════════
-   AUTO HANDLER
-   ═══════════════════════════════════════════════ */
-
-export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
-  const text = await downloadDocText(ctx, env);
-  if (!text) return;
-
-  if (looksLikeHtml(text)) {
-    await processInput(ctx, env, text, 'html');
-  } else if (isLikelyBase64(text)) {
-    await processInput(ctx, env, text.trim(), 'base64');
-  } else {
-    await processInput(ctx, env, text, 'html');
-  }
-}
-
-/* ═══════════════════════════════════════════════
-   CALLBACKS
-   ═══════════════════════════════════════════════ */
-
-export function setupDecodeCallbacks(bot: Bot, env: Env): void {
-  bot.callbackQuery(/^dc:p:([a-f0-9]+):(\d+)$/, async (ctx) => {
-    const [, sessionId, pageStr] = ctx.match as RegExpMatchArray;
-    const pageIdx = parseInt(pageStr ?? '0', 10);
-    if (!sessionId) {
-      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
-      return;
-    }
-
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({
-        text: '⏱️ Session kadaluarsa. Kirim ulang file.',
-        show_alert: true,
-      });
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-      return;
-    }
-
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
-      return;
-    }
-
-    if (pageIdx < 0 || pageIdx >= session.page_count) {
-      await ctx.answerCallbackQuery({ text: '❌ Halaman tidak ada' });
-      return;
-    }
-
-    let offset = 0;
-    for (let i = 0; i < pageIdx; i++) offset += session.pages[i]?.length ?? 0;
-
-    const allItems: ResolvedEntry[] = session.pages.flat().map((p) => ({
-      url: p.url,
-      resolution: p.resolution,
-      server: p.server,
-    }));
-    const summary = summaryByResolution(allItems);
-
-    const { text, keyboard } = renderPage({
-      sessionId,
-      pageIdx,
-      pageCount: session.page_count,
-      items: session.pages[pageIdx] ?? [],
-      total: session.total,
-      offset,
-      summary,
-    });
-
-    await ctx.editMessageText(text, {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      reply_markup: keyboard,
-    });
-    await ctx.answerCallbackQuery();
-  });
-
-  bot.callbackQuery(/^dc:y:([a-f0-9]+)$/, async (ctx) => {
-    const [, sessionId] = ctx.match as RegExpMatchArray;
-    if (!sessionId) {
-      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
-      return;
-    }
-
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({ text: '⏱️ Session kadaluarsa.', show_alert: true });
-      return;
-    }
-
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
-      return;
-    }
-
-    const allItems: PageItem[] = session.pages.flat();
-    const yaml = buildYaml(allItems);
-    const parts = paginateYaml(yaml);
-
-    await ctx.answerCallbackQuery({ text: '📋 Generate YAML...' });
-
-    for (let i = 0; i < parts.length; i++) {
-      const header =
-        parts.length > 1
-          ? `📋 <b>YAML Streams</b> (part ${i + 1}/${parts.length})\n\n`
-          : '📋 <b>YAML Streams</b>\n\n';
-      const footer = i === parts.length - 1 ? '\n\n<i>Tap code block untuk copy.</i>' : '';
-
-      await ctx.reply(header + `<pre>${escapeHtml(parts[i] ?? '')}</pre>` + footer, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      });
-    }
-  });
-
-  bot.callbackQuery(/^dc:x:([a-f0-9]+)$/, async (ctx) => {
-    const [, sessionId] = ctx.match as RegExpMatchArray;
-    if (!sessionId) {
-      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
-      return;
-    }
-
-    const session = await getSession(env.DB, sessionId);
-    if (session && ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
-      return;
-    }
-
-    await deleteSession(env.DB, sessionId);
-
-    await ctx
-      .editMessageText('✅ <b>Selesai</b> — data sudah dihapus dari DB.', {
-        parse_mode: 'HTML',
-        reply_markup: undefined,
-      })
-      .catch(() => {});
-
-    await ctx.answerCallbackQuery({ text: '🗑️ Session dihapus' });
-  });
-
-  bot.callbackQuery('dc:noop', async (ctx) => {
-    await ctx.answerCallbackQuery();
-  });
-}
-
-/* ═══════════════════════════════════════════════
-   COMMAND
-   ═══════════════════════════════════════════════ */
 
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
-  description: 'Decode HTML/Base64 → URL video',
-  usage: '/decode base64-atau-html',
+  description: 'Decode HTML/Base64 atau buka tersimpan',
+  usage: '/decode <base64|html|label>',
   adminOnly: true,
 
   handler: async (ctx, env) => {
     const doc = ctx.message?.document ?? ctx.message?.reply_to_message?.document;
     if (doc) {
-      const text = await downloadDocText(ctx, env);
-      if (!text) return;
-      if (looksLikeHtml(text)) {
-        await processInput(ctx, env, text, 'html');
-      } else if (isLikelyBase64(text)) {
-        await processInput(ctx, env, text.trim(), 'base64');
-      } else {
-        await processInput(ctx, env, text, 'html');
-      }
+      await handleDocumentAuto(ctx, env);
       return;
     }
 
@@ -996,29 +673,136 @@ export const decodeCommand: CommandDefinition = {
 
     if (!input) {
       await ctx.reply(
-        '<b>🔓 Decode → URL Video</b>\n\n' +
-          '<b>Mode teks:</b> <code>/decode aHR0cHM6...</code>\n' +
-          '<b>Mode reply:</b> reply ke pesan → /decode\n' +
-          '<b>Mode file:</b> kirim .html/.txt → auto proses\n\n' +
-          '<b>Tombol:</b>\n' +
-          '📋 YAML — generate untuk copy ke .md\n' +
-          '✅ Selesai — hapus session',
+        '<b>🔓 Decode</b>\n\n' +
+          '<b>Kirim file</b> <code>.html</code> / <code>.txt</code> → auto proses + simpan\n' +
+          '<b>One-shot:</b> <code>/decode &lt;base64&gt;</code>\n' +
+          '<b>Buka tersimpan:</b> <code>/decode &lt;label&gt;</code>\n' +
+          '<b>List:</b> <code>/list</code>\n' +
+          '<b>Hapus:</b> <code>/delete &lt;label&gt;</code>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
     }
 
+    if (!looksLikeHtml(input) && !isLikelyBase64(input) && input.length < 60) {
+      const ref = await getFileRef(env.DB, input);
+      if (ref) {
+        const text = await downloadByFileId(ctx, env, ref.file_id, true);
+        if (!text) return;
+
+        const sourceType: 'base64' | 'html' = looksLikeHtml(text) ? 'html' : 'base64';
+        const loading = await ctx.reply('🌐 Proses...');
+        try {
+          const videos = processText(text, sourceType);
+          if (!videos || videos.length === 0) {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              loading.message_id,
+              '❌ Tidak ada URL video yang bisa diekstrak.'
+            );
+            return;
+          }
+          await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+          await sendResult(ctx, videos, ref.label);
+        } catch (err: any) {
+          await ctx.api
+            .editMessageText(
+              ctx.chat!.id,
+              loading.message_id,
+              `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
+            )
+            .catch(() => {});
+        }
+        return;
+      }
+    }
+
     if (input.length > MAX_INPUT_LEN) {
-      await ctx.reply(`❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`, {
+      await ctx.reply(`❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    const sourceType: 'base64' | 'html' = looksLikeHtml(input) ? 'html' : 'base64';
+    const loading = await ctx.reply('🔓 Proses...');
+    try {
+      const videos = processText(input, sourceType);
+      if (!videos || videos.length === 0) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          '❌ Tidak ada URL video yang bisa diekstrak.'
+        );
+        return;
+      }
+      await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+      await sendResult(ctx, videos);
+    } catch (err: any) {
+      console.error('[Decode] error:', err);
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
+        )
+        .catch(() => {});
+    }
+  },
+};
+
+export const listCommand: CommandDefinition = {
+  name: 'list',
+  description: 'Lihat file referensi tersimpan',
+  usage: '/list',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const rows = await listFileRefs(env.DB, 30);
+    if (rows.length === 0) {
+      await ctx.reply('📭 Belum ada file tersimpan.\n\n<i>Kirim file .html/.txt ke bot untuk mulai.</i>', {
         parse_mode: 'HTML',
       });
       return;
     }
 
-    if (looksLikeHtml(input)) {
-      await processInput(ctx, env, input, 'html');
+    const lines: string[] = [];
+    lines.push(`📚 <b>File Tersimpan (${rows.length})</b>\n`);
+    for (const r of rows) {
+      const days = Math.floor((Date.now() - r.last_accessed) / 86400000);
+      const age = days === 0 ? 'hari ini' : days === 1 ? '1 hari lalu' : `${days} hari lalu`;
+      const fname = r.filename ? ` — <i>${escapeHtml(r.filename)}</i>` : '';
+      lines.push(`• <code>${escapeHtml(r.label)}</code>${fname} — <i>${age}</i>`);
+    }
+    lines.push('');
+    lines.push('<i>Buka ulang: <code>/decode &lt;label&gt;</code></i>');
+
+    await ctx.reply(lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  },
+};
+
+export const deleteCommand: CommandDefinition = {
+  name: 'delete',
+  description: 'Hapus referensi file',
+  usage: '/delete <label>',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    if (!arg) {
+      await ctx.reply('Usage: <code>/delete &lt;label&gt;</code>', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const ok = await deleteFileRef(env.DB, arg);
+    if (ok) {
+      await ctx.reply(
+        `✅ <code>${escapeHtml(arg)}</code> dihapus dari DB.\n\n<i>File HTML di Telegram tetap ada.</i>`,
+        { parse_mode: 'HTML' }
+      );
     } else {
-      await processInput(ctx, env, input, 'base64');
+      await ctx.reply(`❌ Tidak ada: <code>${escapeHtml(arg)}</code>`, { parse_mode: 'HTML' });
     }
   },
 };
