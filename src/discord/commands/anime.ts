@@ -23,10 +23,6 @@ const STATUS_MAP: Record<string, AnimeStatus> = {
   CANCELLED: 'Hiatus', HIATUS: 'Hiatus',
 };
 
-/* ═══════════════════════════════════════════════
-   DB: SESSIONS (pakai temp_anime, prefix d_)
-   ═══════════════════════════════════════════════ */
-
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
 
@@ -129,10 +125,6 @@ async function deleteSession(db: D1Database, sessionId: string) {
   }
 }
 
-/* ═══════════════════════════════════════════════
-   HELPERS
-   ═══════════════════════════════════════════════ */
-
 function pickTitle(media: AniListMedia): string {
   return media.title.romaji || media.title.english || media.title.native || 'Unknown';
 }
@@ -188,10 +180,6 @@ function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, max - 20) + '\n… [truncated]';
 }
-
-/* ═══════════════════════════════════════════════
-   AI ENRICHMENT
-   ═══════════════════════════════════════════════ */
 
 interface Enriched {
   studio?: string | null;
@@ -264,10 +252,6 @@ async function enrichWithAITimeout(
   }
 }
 
-/* ═══════════════════════════════════════════════
-   FETCH + MERGE
-   ═══════════════════════════════════════════════ */
-
 async function fetchAndMerge(query: string): Promise<{
   media: AniListMedia;
   sources: string[];
@@ -322,10 +306,6 @@ async function fetchAndMerge(query: string): Promise<{
 
   return { media: merged, sources };
 }
-
-/* ═══════════════════════════════════════════════
-   BUILD YAML + BODY
-   ═══════════════════════════════════════════════ */
 
 interface BuildResult {
   yaml: string;
@@ -428,10 +408,6 @@ function buildResult(media: AniListMedia, enriched: Enriched | null): BuildResul
   return { yaml, body: synopsis, missing, aiUsed };
 }
 
-/* ═══════════════════════════════════════════════
-   DISCORD API HELPERS
-   ═══════════════════════════════════════════════ */
-
 const DISCORD_API = 'https://discord.com/api/v10';
 
 async function editOriginal(
@@ -468,14 +444,6 @@ async function sendFollowup(
   }
 }
 
-/* ═══════════════════════════════════════════════
-   HANDLERS
-   ═══════════════════════════════════════════════ */
-
-/**
- * Entry point dari handler.ts. Return deferred response (type 5) langsung,
- * proses lanjut di background via ctx.waitUntil().
- */
 export function handleAnime(
   interaction: DiscordInteraction,
   env: Env,
@@ -499,7 +467,7 @@ async function processAnime(
   }
 
   const query =
-    (interaction.data?.options?.find((o) => o.name === 'query')?.value as string) ?? '';
+    (interaction.data?.options?.find((o) => o.name === 'search')?.value as string) ?? '';
 
   if (!query) {
     await editOriginal(env, token, { content: '❌ Query kosong.' });
@@ -518,7 +486,6 @@ async function processAnime(
 
     const { media, sources } = result;
 
-    // Detect missing
     const need: string[] = [];
     const studio = media.studios?.nodes?.[0]?.name;
     if (!studio || studio === 'Unknown') need.push('studio');
@@ -528,7 +495,6 @@ async function processAnime(
     const cleanDesc = stripHtml(media.description ?? '');
     if (!cleanDesc || cleanDesc.length < 50) need.push('synopsis');
 
-    // AI enrich
     let enriched: Enriched | null = null;
     if (need.length > 0) {
       enriched = await enrichWithAITimeout(
@@ -546,14 +512,12 @@ async function processAnime(
 
     const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
 
-    // Simpan session
     const sessionId = await saveSession(env.DB, parseInt(userId, 10), {
       yaml, body, missing, aiUsed,
       cover: media.coverImage.extraLarge || media.coverImage.large || null,
       sourceLabel: `📡 Sumber: ${sources.join(' + ')}`,
     });
 
-    // Info card
     const title = pickTitle(media);
     const year = media.startDate?.year ?? media.seasonYear ?? '-';
     const studioName = media.studios?.nodes?.[0]?.name ?? 'Unknown';
@@ -603,17 +567,12 @@ async function processAnime(
   }
 }
 
-/* ═══════════════════════════════════════════════
-   BUTTON HANDLERS
-   ═══════════════════════════════════════════════ */
-
 export async function handleAnimeButton(
   interaction: DiscordInteraction,
   env: Env,
   customId: string
 ): Promise<Response> {
   const parts = customId.split(':');
-  // an:y:SESSIONID atau an:x:SESSIONID
   const action = parts[1];
   const sessionId = parts[2];
 
@@ -641,7 +600,6 @@ export async function handleAnimeButton(
     });
   }
 
-  // Batal
   if (action === 'x') {
     await deleteSession(env.DB, sessionId);
     return json({
@@ -653,9 +611,7 @@ export async function handleAnimeButton(
     });
   }
 
-  // Convert
   if (action === 'y') {
-    // Update message: hapus button, tampil status
     await editOriginal(env, interaction.token, {
       content: '📋 **Generating YAML...**',
       components: [],
@@ -664,7 +620,6 @@ export async function handleAnimeButton(
     const missing: string[] = JSON.parse(session.missing);
     const aiUsed: string[] = JSON.parse(session.ai_used);
 
-    // Warning
     if (missing.length > 0 || aiUsed.length > 0) {
       const warns: string[] = [];
       if (missing.length > 0) {
@@ -681,21 +636,18 @@ export async function handleAnimeButton(
       });
     }
 
-    // YAML
     await sendFollowup(env, interaction.token, {
       content:
         `📋 **YAML Frontmatter**\n\n` +
         `\`\`\`yaml\n${truncate(session.yaml, 1900)}\n\`\`\``,
     });
 
-    // Sinopsis
     await sendFollowup(env, interaction.token, {
       content:
         `📝 **Body (Sinopsis)**\n\n` +
         `\`\`\`\n${truncate(session.body, 1900)}\n\`\`\``,
     });
 
-    // Cover + source
     const embed: Record<string, unknown> = {
       color: 0x8b5cf6,
     };
@@ -710,10 +662,7 @@ export async function handleAnimeButton(
       embeds: [embed],
     });
 
-    // Hapus session
     await deleteSession(env.DB, sessionId);
-
-    // Response ke Discord (wajib)
     return json({
       type: 7,
       data: {
