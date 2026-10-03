@@ -79,6 +79,34 @@ export default {
       }
     }
 
+    if (url.pathname === '/debug') {
+      const t0 = Date.now();
+      try {
+        const res = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`
+        );
+        const data = await res.json();
+        return new Response(
+          JSON.stringify({
+            ok: res.ok,
+            status: res.status,
+            elapsed: Date.now() - t0,
+            data,
+          }, null, 2),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            elapsed: Date.now() - t0,
+            error: err?.message ?? String(err),
+          }, null, 2),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 
