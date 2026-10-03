@@ -25,6 +25,7 @@ interface KitsuAnime {
   };
   relationships?: {
     categories?: { data: { type: string; id: string }[] };
+    studios?: { data: { type: string; id: string }[] };
   };
 }
 
@@ -45,8 +46,12 @@ interface KitsuResponse {
 interface KitsuSearchResult {
   anime: KitsuAnime;
   genres: string[];
+  studios: string[];
 }
 
+/**
+ * Cari anime di Kitsu + ambil studio via endpoint terpisah.
+ */
 export async function searchKitsu(
   title: string
 ): Promise<KitsuSearchResult | null> {
@@ -73,6 +78,7 @@ export async function searchKitsu(
 
   const included = json.included ?? [];
 
+  // Extract genre dari included
   const categoryIds = (anime.relationships?.categories?.data ?? []).map(
     (r) => r.id
   );
@@ -82,11 +88,44 @@ export async function searchKitsu(
     .filter((t): t is string => !!t)
     .slice(0, 5);
 
-  return { anime, genres };
+  // Fetch studio terpisah — akurat, tidak perlu AI
+  const studios = await fetchKitsuStudios(anime.id);
+
+  return { anime, genres, studios };
+}
+
+/**
+ * Fetch studio dari endpoint terpisah Kitsu.
+ * Endpoint: /anime/{id}/studios
+ */
+async function fetchKitsuStudios(animeId: string): Promise<string[]> {
+  try {
+    const url = `${KITSU_URL}/${animeId}/studios`;
+    const res = await fetchWithRetry(url, {
+      headers: {
+        Accept: 'application/vnd.api+json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    });
+
+    if (!res.ok) return [];
+
+    const json = (await res.json()) as {
+      data?: { attributes: { name: string } }[];
+    };
+
+    return (json.data ?? [])
+      .map((s) => s.attributes.name)
+      .filter((s) => s && s.trim())
+      .slice(0, 3);
+  } catch (err) {
+    console.warn('[Kitsu] studios fetch failed:', err);
+    return [];
+  }
 }
 
 export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
-  const { anime, genres } = result;
+  const { anime, genres, studios } = result;
   const attr = anime.attributes;
 
   const format = (attr.subtype || 'TV').toUpperCase();
@@ -122,7 +161,9 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     episodes: attr.episodeCount,
     genres,
     averageScore,
-    studios: { nodes: [] },
+    studios: {
+      nodes: studios.map((name) => ({ name })),
+    },
     startDate: {
       year: date?.getFullYear() ?? null,
       month: date ? date.getMonth() + 1 : null,
