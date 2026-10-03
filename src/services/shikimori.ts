@@ -36,23 +36,56 @@ interface ShikimoriAnime {
 export async function searchShikimori(
   title: string
 ): Promise<ShikimoriAnime | null> {
-  const url = `${SHIKIMORI_URL}?search=${encodeURIComponent(title)}&limit=1`;
+  // 1. Search — dapat id + data basic
+  const searchUrl = `${SHIKIMORI_URL}?search=${encodeURIComponent(
+    title
+  )}&limit=1`;
 
-  const res = await fetchWithRetry(url, {
+  const searchRes = await fetchWithRetry(searchUrl, {
     headers: {
       Accept: 'application/json',
       'User-Agent': 'yukio-bot/1.0',
     },
   });
 
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error(`Shikimori HTTP ${res.status}: ${errBody.slice(0, 100)}`);
+  if (!searchRes.ok) {
+    const errBody = await searchRes.text().catch(() => '');
+    throw new Error(
+      `Shikimori search HTTP ${searchRes.status}: ${errBody.slice(0, 100)}`
+    );
   }
 
-  const json = (await res.json()) as ShikimoriAnime[];
-  if (!Array.isArray(json)) return null;
-  return json[0] ?? null;
+  const list = (await searchRes.json()) as ShikimoriAnime[];
+  if (!Array.isArray(list) || list.length === 0) return null;
+
+  const basic = list[0];
+  if (!basic?.id) return null;
+
+  // 2. Fetch detail — dapat studios lengkap
+  try {
+    const detailUrl = `${SHIKIMORI_URL}/${basic.id}`;
+    const detailRes = await fetchWithRetry(detailUrl, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    });
+
+    if (detailRes.ok) {
+      const detail = (await detailRes.json()) as ShikimoriAnime;
+      console.log(
+        `[Shikimori] detail fetched — studios: ${
+          detail.studios?.length ?? 0
+        }`
+      );
+      return detail;
+    }
+  } catch (err) {
+    console.warn('[Shikimori] detail fetch failed, using basic:', err);
+  }
+
+  // Fallback: pakai data basic
+  return basic;
 }
 
 export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
@@ -73,7 +106,6 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
 
   const averageScore = s.score ? Math.round(parseFloat(s.score) * 10) : null;
 
-  // Image defensive
   const imgOrig = s.image?.original ?? '';
   const imgPrev = s.image?.preview ?? '';
   const original = imgOrig
@@ -89,14 +121,12 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
 
   const date = s.aired_on ? new Date(s.aired_on) : null;
 
-  // Genres defensive
   const genres = Array.isArray(s.genres)
     ? s.genres
         .map((g) => g?.name)
         .filter((n): n is string => typeof n === 'string' && n.length > 0)
     : [];
 
-  // Studios defensive
   const studios = Array.isArray(s.studios)
     ? s.studios
         .filter((st) => st && st.real && st.name)
