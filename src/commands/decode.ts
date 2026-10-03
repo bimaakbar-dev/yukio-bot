@@ -29,8 +29,13 @@ const VIDEO_HOSTS = [
   'buzzheavier', 'mega.nz', 'doply',
 ];
 
+const WRAPPER_HOSTS = [
+  'animesail.xyz',
+  '154999000.xyz',
+];
+
 /* ═══════════════════════════════════════════════
-   DB: AUTO-CREATE TABLE (idempotent, dijalankan sekali per isolate)
+   DB: AUTO-CREATE TABLE
    ═══════════════════════════════════════════════ */
 
 let dbReady = false;
@@ -81,22 +86,41 @@ async function ensureDb(db: D1Database): Promise<void> {
 }
 
 /* ═══════════════════════════════════════════════
-   SESSION HELPERS (inline)
+   TYPES
    ═══════════════════════════════════════════════ */
+
+interface PageItem {
+  url: string;
+  resolution: string | null;
+}
 
 interface TempSession {
   session_id: string;
   user_id: number;
-  pages: string[][];
+  pages: PageItem[][];
   total: number;
   page_count: number;
 }
+
+interface RawEntry {
+  base64: string;
+  label: string | null;
+}
+
+interface ResolvedEntry {
+  url: string;
+  resolution: string | null;
+}
+
+/* ═══════════════════════════════════════════════
+   SESSION HELPERS
+   ═══════════════════════════════════════════════ */
 
 async function createSession(
   db: D1Database,
   chatId: number,
   userId: number,
-  pages: string[][]
+  pages: PageItem[][]
 ): Promise<string> {
   await ensureDb(db);
 
@@ -257,6 +281,27 @@ function isVideoUrl(url: string): boolean {
   return VIDEO_HOSTS.some((h) => lower.includes(h));
 }
 
+function isWrapper(url: string): boolean {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    return WRAPPER_HOSTS.some((w) => h === w || h.endsWith('.' + w));
+  } catch {
+    return false;
+  }
+}
+
+function parseResolution(label: string | null): string | null {
+  if (!label) return null;
+  const m = label.match(/\b(\d{3,4})p\b/i);
+  return m && m[1] ? `${m[1]}p` : null;
+}
+
+function resolutionRank(r: string | null): number {
+  if (!r) return -1;
+  const n = parseInt(r.replace(/p$/i, ''), 10);
+  return isNaN(n) ? -1 : n;
+}
+
 /* ═══════════════════════════════════════════════
    URL EXTRACTION
    ═══════════════════════════════════════════════ */
@@ -373,84 +418,168 @@ function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
-function extractBase64Candidates(html: string): string[] {
-  const found = new Map<string, number>();
+/* ═══════════════════════════════════════════════
+   EXTRACT ENTRIES (base64 + label)
+   ═══════════════════════════════════════════════ */
 
+function extractEntries(html: string): RawEntry[] {
+  const entries: RawEntry[] = [];
+  const seen = new Set<string>();
+
+  // Priority 1: <option data-*="BASE64">Label 720p</option>
+  for (const m of html.matchAll(
+    /<option\b[^>]*?\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["'][^>]*?>([^<]*)<\/option>/gi
+  )) {
+    const b64 = m[1];
+    const label = (m[2] ?? '').trim();
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+    entries.push({ base64: b64, label: label || null });
+  }
+
+  // Priority 2: atob("...")
   for (const m of html.matchAll(
     /atob\s*\(\s*["']([A-Za-z0-9+/=\-_]{16,})["']\s*\)/gi
   )) {
-    const c = m[1];
-    if (c && !found.has(c)) found.set(c, 1);
+    const b64 = m[1];
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+    entries.push({ base64: b64, label: null });
   }
 
-  for (const m of html.matchAll(
-    /data-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/gi
-  )) {
-    const c = m[1];
-    if (c && !found.has(c)) found.set(c, 2);
-  }
-
+  // Priority 3: generic long base64-like
   for (const m of html.matchAll(/[A-Za-z0-9+/\-_]{24,}={0,2}/g)) {
-    if (found.size >= MAX_CANDIDATES) break;
-    const c = m[0];
-    if (c && !found.has(c)) found.set(c, 3);
+    if (entries.length >= MAX_CANDIDATES) break;
+    const b64 = m[0];
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+    entries.push({ base64: b64, label: null });
   }
 
-  return [...found.entries()]
-    .sort((a, b) => a[1] - b[1] || b[0].length - a[0].length)
-    .map(([c]) => c);
+  return entries;
 }
 
-function collectVideoUrls(candidates: string[]): string[] {
-  const videos = new Set<string>();
+/* ═══════════════════════════════════════════════
+   RESOLVE WRAPPER → URL ASLI + RESOLUSI
+   ═══════════════════════════════════════════════ */
 
-  for (const raw of candidates) {
-    const res = multiLayerDecode(raw);
-    if (!res || res.urls.length === 0) continue;
+function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
+  const resolved = new Map<string, string | null>();
+  const unresolved = new Map<string, string | null>();
 
-    for (const url of res.urls) {
-      if (isVideoUrl(url)) videos.add(url);
-      for (const expanded of expandUrlParams(url)) {
-        if (expanded !== url && isVideoUrl(expanded)) videos.add(expanded);
+  function resolve(
+    url: string,
+    resolution: string | null,
+    depth: number,
+    seen: Set<string>
+  ): void {
+    if (depth > 4 || seen.has(url)) return;
+    seen.add(url);
+
+    const children = expandUrlParams(url).filter((u) => u !== url);
+
+    if (isWrapper(url)) {
+      if (children.length === 0) {
+        if (!resolved.has(url) && !unresolved.has(url)) {
+          unresolved.set(url, resolution);
+        }
+      } else {
+        for (const c of children) resolve(c, resolution, depth + 1, seen);
       }
+      return;
+    }
+
+    if (!resolved.has(url)) resolved.set(url, resolution);
+    for (const c of children) resolve(c, resolution, depth + 1, seen);
+  }
+
+  for (const e of entries) {
+    const dec = multiLayerDecode(e.base64);
+    if (!dec || dec.urls.length === 0) continue;
+
+    const resolution = parseResolution(e.label);
+    for (const url of dec.urls) {
+      resolve(url, resolution, 0, new Set());
     }
   }
 
-  return [...videos];
+  // Filter video
+  const final: ResolvedEntry[] = [];
+  for (const [url, res] of resolved) {
+    if (isVideoUrl(url)) final.push({ url, resolution: res });
+  }
+
+  // Fallback kalau kosong: tampilkan wrapper buntu
+  if (final.length === 0) {
+    for (const [url, res] of unresolved) {
+      final.push({ url, resolution: res });
+    }
+  }
+
+  // Sort: resolusi tertinggi dulu, lalu URL pendek dulu
+  final.sort((a, b) => {
+    const ra = resolutionRank(a.resolution);
+    const rb = resolutionRank(b.resolution);
+    if (ra !== rb) return rb - ra;
+    return a.url.length - b.url.length;
+  });
+
+  return final;
 }
 
-function paginate(urls: string[], budget = PAGE_CHAR_BUDGET): string[][] {
-  const pages: string[][] = [];
-  let cur: string[] = [];
+/* ═══════════════════════════════════════════════
+   PAGINATION
+   ═══════════════════════════════════════════════ */
+
+function paginate(items: ResolvedEntry[], budget = PAGE_CHAR_BUDGET): PageItem[][] {
+  const pages: PageItem[][] = [];
+  let cur: PageItem[] = [];
   let curLen = 0;
 
-  urls.forEach((url, i) => {
-    const lineLen = `${i + 1}. <code>${url}</code>\n`.length;
+  for (const item of items) {
+    const lineLen = item.url.length + 20;
     if (curLen + lineLen > budget && cur.length > 0) {
       pages.push(cur);
       cur = [];
       curLen = 0;
     }
-    cur.push(url);
+    cur.push({ url: item.url, resolution: item.resolution });
     curLen += lineLen;
-  });
+  }
   if (cur.length > 0) pages.push(cur);
   return pages.length > 0 ? pages : [[]];
 }
 
 /* ═══════════════════════════════════════════════
-   RENDER HALAMAN
+   RENDER HALAMAN (dengan group by resolusi)
    ═══════════════════════════════════════════════ */
+
+function summaryByResolution(items: ResolvedEntry[]): string {
+  const counts = new Map<string, number>();
+  for (const it of items) {
+    const key = it.resolution ?? 'Lainnya';
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  const sorted = [...counts.entries()].sort((a, b) => {
+    const ra = resolutionRank(a[0] === 'Lainnya' ? null : a[0]);
+    const rb = resolutionRank(b[0] === 'Lainnya' ? null : b[0]);
+    return rb - ra;
+  });
+
+  return sorted.map(([res, n]) => `${res} (${n})`).join(' · ');
+}
 
 function renderPage(opts: {
   sessionId: string;
   pageIdx: number;
   pageCount: number;
-  urls: string[];
+  items: PageItem[];
   total: number;
   offset: number;
+  summary: string;
 }): { text: string; keyboard: InlineKeyboard } {
-  const { sessionId, pageIdx, pageCount, urls, total, offset } = opts;
+  const { sessionId, pageIdx, pageCount, items, total, offset, summary } = opts;
 
   const lines: string[] = [];
   lines.push('🎬 <b>URL Video</b>');
@@ -458,32 +587,36 @@ function renderPage(opts: {
   lines.push(
     `Total: <b>${total}</b>  ·  Halaman <b>${pageIdx + 1}/${pageCount}</b>`
   );
+  if (summary) lines.push(`📊 ${summary}`);
   lines.push('');
 
-  urls.forEach((u, i) => {
-    lines.push(`${offset + i + 1}. <code>${escapeHtml(u)}</code>`);
+  // Header resolusi muncul saat berubah dari item sebelumnya
+  let lastRes: string | null | undefined = undefined;
+  items.forEach((item, i) => {
+    const res = item.resolution;
+    if (res !== lastRes) {
+      if (lastRes !== undefined) lines.push('');
+      lines.push(`━━━ ${res ? escapeHtml(res) : 'Lainnya'} ━━━`);
+      lastRes = res;
+    }
+    lines.push(`${offset + i + 1}. <code>${escapeHtml(item.url)}</code>`);
   });
 
   const kb = new InlineKeyboard();
 
-  if (pageIdx > 0) {
-    kb.text('⬅ Prev', `dc:p:${sessionId}:${pageIdx - 1}`);
-  } else {
-    kb.text('·', 'dc:noop');
-  }
+  if (pageIdx > 0) kb.text('⬅ Prev', `dc:p:${sessionId}:${pageIdx - 1}`);
+  else kb.text('·', 'dc:noop');
   kb.text(`${pageIdx + 1}/${pageCount}`, 'dc:noop');
-  if (pageIdx < pageCount - 1) {
-    kb.text('Next ➡', `dc:p:${sessionId}:${pageIdx + 1}`);
-  } else {
-    kb.text('·', 'dc:noop');
-  }
+  if (pageIdx < pageCount - 1) kb.text('Next ➡', `dc:p:${sessionId}:${pageIdx + 1}`);
+  else kb.text('·', 'dc:noop');
   kb.row();
 
   kb.text('✅ Selesai & Hapus', `dc:x:${sessionId}`).row();
 
-  urls.slice(0, 3).forEach((u, i) => {
-    if (u.length < 1900) {
-      kb.url(`🎬 Buka ${offset + i + 1}`, u);
+  items.slice(0, 3).forEach((item, i) => {
+    if (item.url.length < 1900) {
+      const icon = item.resolution ? `🎬 ${item.resolution}` : `🎬 ${offset + i + 1}`;
+      kb.url(icon, item.url);
       if ((i + 1) % 3 === 0) kb.row();
     }
   });
@@ -506,10 +639,12 @@ async function processInput(
   );
 
   try {
-    const candidates =
-      sourceType === 'html' ? extractBase64Candidates(input) : [input];
+    const entries =
+      sourceType === 'html'
+        ? extractEntries(input)
+        : [{ base64: input, label: null }];
 
-    if (candidates.length === 0) {
+    if (entries.length === 0) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -518,21 +653,21 @@ async function processInput(
       return;
     }
 
-    const videos = collectVideoUrls(candidates);
+    const videos = collectResolvedVideos(entries);
 
     if (videos.length === 0) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
         `❌ Tidak ada URL video.\n\n` +
-          `<i>Dari ${candidates.length} kandidat Base64, ` +
-          `tidak ada yang decode ke URL video.</i>`,
+          `<i>Dari ${entries.length} kandidat, tidak ada URL video valid.</i>`,
         { parse_mode: 'HTML' }
       );
       return;
     }
 
     const pages = paginate(videos);
+    const summary = summaryByResolution(videos);
     const sessionId = await createSession(
       env.DB,
       ctx.chat!.id,
@@ -548,9 +683,10 @@ async function processInput(
       sessionId,
       pageIdx: 0,
       pageCount: pages.length,
-      urls: pages[0] ?? [],
+      items: pages[0] ?? [],
       total: videos.length,
       offset: 0,
+      summary,
     });
 
     await ctx.reply(text, {
@@ -656,7 +792,6 @@ export async function handleDocumentAuto(
    ═══════════════════════════════════════════════ */
 
 export function setupDecodeCallbacks(bot: Bot, env: Env): void {
-  // Pagination
   bot.callbackQuery(/^dc:p:([a-f0-9]+):(\d+)$/, async (ctx) => {
     const [, sessionId, pageStr] = ctx.match as RegExpMatchArray;
     const pageIdx = parseInt(pageStr ?? '0', 10);
@@ -692,13 +827,21 @@ export function setupDecodeCallbacks(bot: Bot, env: Env): void {
       offset += session.pages[i]?.length ?? 0;
     }
 
+    // Rebuild summary dari seluruh pages
+    const allItems: ResolvedEntry[] = session.pages.flat().map((p) => ({
+      url: p.url,
+      resolution: p.resolution,
+    }));
+    const summary = summaryByResolution(allItems);
+
     const { text, keyboard } = renderPage({
       sessionId,
       pageIdx,
       pageCount: session.page_count,
-      urls: session.pages[pageIdx] ?? [],
+      items: session.pages[pageIdx] ?? [],
       total: session.total,
       offset,
+      summary,
     });
 
     await ctx.editMessageText(text, {
@@ -709,7 +852,6 @@ export function setupDecodeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery();
   });
 
-  // Selesai & hapus
   bot.callbackQuery(/^dc:x:([a-f0-9]+)$/, async (ctx) => {
     const [, sessionId] = ctx.match as RegExpMatchArray;
     if (!sessionId) {
@@ -735,7 +877,6 @@ export function setupDecodeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '🗑️ Session dihapus' });
   });
 
-  // Noop
   bot.callbackQuery('dc:noop', async (ctx) => {
     await ctx.answerCallbackQuery();
   });
@@ -747,7 +888,7 @@ export function setupDecodeCallbacks(bot: Bot, env: Env): void {
 
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
-  description: 'Decode HTML/Base64 → URL video',
+  description: 'Decode HTML/Base64 → URL video (group by resolusi)',
   usage: '/decode base64-atau-html',
   adminOnly: true,
 
@@ -777,8 +918,8 @@ export const decodeCommand: CommandDefinition = {
           '<b>Mode teks:</b> <code>/decode aHR0cHM6...</code>\n' +
           '<b>Mode reply:</b> reply ke pesan → /decode\n' +
           '<b>Mode file:</b> kirim .html/.txt → auto proses\n\n' +
-          '<i>Hanya URL video yang ditampilkan.\n' +
-          'Buffer sementara di DB (1 jam), auto-hapus setelah klik ✅.</i>',
+          '<i>URL dikelompokkan berdasarkan resolusi (720p, 480p, ...).\n' +
+          'Wrapper animesail auto-dibuang.</i>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
