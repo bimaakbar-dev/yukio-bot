@@ -1,14 +1,9 @@
 import type { Env } from '../types/env';
 
-/**
- * Model list — dicoba berurutan sampai ada yang berhasil.
- * Model ringan duluan karena lebih stabil di Workers AI.
- */
 const MODELS = [
-  '@cf/meta/llama-3.1-8b-instruct',
-  '@cf/meta/llama-3-8b-instruct',
-  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
-  '@cf/mistral/mistral-7b-instruct-v0.1',
+  '@cf/ibm-granite/granite-4.0-h-micro',    
+  '@cf/meta/llama-3.2-1b-instruct',     
+  '@cf/qwen/qwen3-30b-a3b-fp8',              '@cf/meta/llama-3.1-8b-instruct-fp8-fast,
 ];
 
 interface AIMessage {
