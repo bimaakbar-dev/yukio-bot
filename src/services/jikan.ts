@@ -49,7 +49,7 @@ export async function searchJikan(title: string): Promise<JikanAnime | null> {
         'User-Agent': 'yukio-bot/1.0',
       },
     },
-    { retries: 1, baseDelay: 1000, timeout: 8000 }
+    { retries: 0, timeout: 4000 }
   );
 
   if (!res.ok) {
@@ -71,9 +71,7 @@ export function jikanToAniList(jikan: JikanAnime): AniListMedia {
   const averageScore = jikan.score ? Math.round(jikan.score * 10) : null;
 
   const cover =
-    jikan.images?.jpg?.large_image_url ||
-    jikan.images?.jpg?.image_url ||
-    '';
+    jikan.images?.jpg?.large_image_url || jikan.images?.jpg?.image_url || '';
 
   const genres: string[] = Array.isArray(jikan.genres)
     ? jikan.genres
