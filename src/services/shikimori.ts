@@ -40,12 +40,16 @@ export async function searchShikimori(
     title
   )}&limit=1`;
 
-  const searchRes = await fetchWithRetry(searchUrl, {
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'yukio-bot/1.0',
+  const searchRes = await fetchWithRetry(
+    searchUrl,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
     },
-  });
+    { retries: 0, timeout: 4000 }
+  );
 
   if (!searchRes.ok) {
     const errBody = await searchRes.text().catch(() => '');
@@ -63,12 +67,16 @@ export async function searchShikimori(
   // Fetch detail — studio hanya ada di endpoint ini
   try {
     const detailUrl = `${SHIKIMORI_URL}/${basic.id}`;
-    const detailRes = await fetchWithRetry(detailUrl, {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'yukio-bot/1.0',
+    const detailRes = await fetchWithRetry(
+      detailUrl,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'yukio-bot/1.0',
+        },
       },
-    });
+      { retries: 0, timeout: 4000 }
+    );
 
     if (detailRes.ok) {
       const detail = (await detailRes.json()) as ShikimoriAnime;
