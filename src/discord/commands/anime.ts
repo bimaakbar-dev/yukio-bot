@@ -649,11 +649,9 @@ async function processButton(
         parts.length > 1
           ? `📄 **Markdown** (${i + 1}/${parts.length})\n\n`
           : `📄 **Markdown File**\n\n`;
-      const footer =
-        i === parts.length - 1 ? '\n\n<i>Tap untuk copy</i>' : '';
 
       await sendFollowup(appId, token, {
-        content: header + '```markdown\n' + part + '\n```' + footer,
+        content: header + '```markdown\n' + part + '\n```',
       });
     }
 
