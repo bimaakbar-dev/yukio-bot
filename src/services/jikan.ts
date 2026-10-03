@@ -1,3 +1,4 @@
+import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from './anilist';
 
 const JIKAN_URL = 'https://api.jikan.moe/v4/anime';
@@ -7,6 +8,7 @@ interface JikanAnime {
   title: string;
   title_english: string | null;
   title_japanese: string | null;
+  synopsis: string | null;
   images: {
     jpg: {
       large_image_url: string;
@@ -44,7 +46,7 @@ interface JikanResponse {
 export async function searchJikan(title: string): Promise<JikanAnime | null> {
   const url = `${JIKAN_URL}?q=${encodeURIComponent(title)}&limit=1`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     headers: {
       'Accept': 'application/json',
       'User-Agent': 'yukio-bot/1.0',
@@ -65,19 +67,13 @@ export async function searchJikan(title: string): Promise<JikanAnime | null> {
  * Biar handler tidak perlu bedakan source.
  */
 export function jikanToAniList(jikan: JikanAnime): AniListMedia {
-  // Status mapping: Jikan bahasa manusiawi → AniList enum
   let status = 'RELEASING';
   if (jikan.status?.includes('Finished')) status = 'FINISHED';
   else if (jikan.status?.includes('Not yet')) status = 'NOT_YET_RELEASED';
   else if (jikan.status?.includes('On Hiatus')) status = 'HIATUS';
 
-  // Format mapping: Jikan sudah kapital (TV, Movie, OVA, ONA, Special)
   const format = (jikan.type || 'TV').toUpperCase();
-
-  // Rating: Jikan 0-10 → AniList 0-100
   const averageScore = jikan.score ? Math.round(jikan.score * 10) : null;
-
-  // Cover: prefer large, fallback ke image_url
   const cover =
     jikan.images.jpg.large_image_url || jikan.images.jpg.image_url;
 
@@ -92,6 +88,7 @@ export function jikanToAniList(jikan: JikanAnime): AniListMedia {
       extraLarge: cover,
       large: cover,
     },
+    description: jikan.synopsis,
     format,
     status,
     seasonYear: jikan.year,
