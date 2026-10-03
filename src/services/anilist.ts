@@ -59,11 +59,6 @@ interface AniListResponse {
   }[];
 }
 
-/**
- * Cari anime di AniList berdasarkan judul.
- * Return null kalau tidak ada hasil.
- * Throw error kalau API error (rate limit, dll).
- */
 export async function searchAniList(
   title: string
 ): Promise<AniListMedia | null> {
