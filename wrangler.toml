@@ -15,7 +15,7 @@ binding = "AI"
 [[d1_databases]]
 binding = "DB"
 database_name = "yukio-db"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
+database_id = "8b0b931d-b4f7-41c0-885b-6e90c11c8bb7"
 
 # ──────────────────────────────────────────────────────────
 # Observability — log otomatis di Cloudflare Dashboard
