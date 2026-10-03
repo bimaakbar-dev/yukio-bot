@@ -1,0 +1,3183 @@
+=== REPO DUMP ===
+Generated: Sat Oct  3 15:52:05 UTC 2026
+Commit: bf38068
+
+=== STRUCTURE ===
+.
+./src
+./src/business
+./src/commands
+./src/lib
+./src/services
+./src/types
+
+=== FILES ===
+./.github/workflows/deploy.yml
+./.github/workflows/dump.yml
+./.github/workflows/generate-lock.yml
+./.gitignore
+./README.md
+./package.json
+./src/business/autoReply.ts
+./src/commands/ai.ts
+./src/commands/anime.ts
+./src/commands/clearcache.ts
+./src/commands/decode.ts
+./src/commands/help.ts
+./src/commands/list.ts
+./src/commands/ping.ts
+./src/commands/registry.ts
+./src/commands/status.ts
+./src/index.ts
+./src/lib/cache.ts
+./src/lib/http.ts
+./src/lib/permissions.ts
+./src/services/ai.ts
+./src/services/anilist.ts
+./src/services/animeapi.ts
+./src/services/jikan.ts
+./src/services/kitsu.ts
+./src/types/env.ts
+./tsconfig.json
+./wrangler.toml
+
+=== CONTENTS ===
+
+=== DUMP COMPLETE ===
+workflows/deploy.yml =====
+name: Deploy Yukio Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+===== END FILE =====
+
+===== FILE: ./.github/workflows/dump.yml =====
+name: Dump Repo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build dump
+        run: |
+          OUTPUT="dump.txt"
+          {
+            echo "=== REPO DUMP ==="
+            echo "Generated: $(date -u)"
+            echo "Commit: $(git rev-parse --short HEAD)"
+            echo ""
+
+            echo "=== STRUCTURE ==="
+            find . -type d \
+              -not -path "./.git*" \
+              -not -path "./node_modules*" \
+              -not -path "./dist*" \
+              -not -path "./.wrangler*" \
+              -not -path "./.astro*" \
+              | sort
+            echo ""
+
+            echo "=== FILES ==="
+            find . -type f \
+              -not -path "./.git/*" \
+              -not -path "./node_modules/*" \
+              -not -path "./dist/*" \
+              -not -path "./.wrangler/*" \
+              -not -path "./.astro/*" \
+              -not -name "dump.txt" \
+              -not -name "package-lock.json" \
+              -not -name "*.log" \
+              -not -name ".DS_Store" \
+              -not -name "*.png" \
+              -not -name "*.jpg" \
+              -not -name "*.jpeg" \
+              -not -name "*.gif" \
+              -not -name "*.ico" \
+              -not -name "*.woff" \
+              -not -name "*.woff2" \
+              -not -name "*.ttf" \
+              -not -name "*.otf" \
+              -not -name "*.webp" \
+              -not -name "*.mp4" \
+              -not -name "*.pdf" \
+              -not -name "*.zip" \
+              -size -100k \
+              | sort
+            echo ""
+
+            echo "=== CONTENTS ==="
+            find . -type f \
+              -not -path "./.git/*" \
+              -not -path "./node_modules/*" \
+              -not -path "./dist/*" \
+              -not -path "./.wrangler/*" \
+              -not -path "./.astro/*" \
+              -not -name "dump.txt" \
+              -not -name "package-lock.json" \
+              -not -name "*.log" \
+              -not -name ".DS_Store" \
+              -not -name "*.png" \
+              -not -name "*.jpg" \
+              -not -name "*.jpeg" \
+              -not -name "*.gif" \
+              -not -name "*.ico" \
+              -not -name "*.woff" \
+              -not -name "*.woff2" \
+              -not -name "*.ttf" \
+              -not -name "*.otf" \
+              -not -name "*.webp" \
+              -not -name "*.mp4" \
+              -not -name "*.pdf" \
+              -not -name "*.zip" \
+              -size -100k \
+              | sort | while read -r file; do
+                echo "" >> "$OUTPUT"
+                echo "===== FILE: $file =====" >> "$OUTPUT"
+                sed -E \
+                  -e 's/[0-9]{8,10}:[A-Za-z0-9_-]{35}/***TELEGRAM_TOKEN***/g' \
+                  -e 's/(BOT_TOKEN|API_TOKEN|CLIENT_SECRET|API_KEY|PASSWORD|CLOUDFLARE_API_TOKEN)[[:space:]]*=[[:space:]]*["'"'"']?[^"'"'"'[:space:]]+/\1=***REDACTED***/g' \
+                  "$file" >> "$OUTPUT" 2>/dev/null || echo "[binary]" >> "$OUTPUT"
+                echo "" >> "$OUTPUT"
+                echo "===== END FILE =====" >> "$OUTPUT"
+              done
+
+            echo ""
+            echo "=== DUMP COMPLETE ==="
+          } > "$OUTPUT"
+
+          echo "Generated: $(wc -l < $OUTPUT) lines, $(du -h $OUTPUT | cut -f1)"
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dump.txt
+          if git diff --staged --quiet; then
+            echo "No changes."
+          else
+            git commit -m "chore: dump repo [skip ci]"
+            git push
+          fi
+===== END FILE =====
+
+===== FILE: ./.github/workflows/generate-lock.yml =====
+name: Generate Package Lock
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Generate lock file
+        run: npm install --package-lock-only
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          if git diff --staged --quiet; then
+            echo "Lock file tidak berubah, skip commit."
+          else
+            git commit -m "chore: generate package-lock.json"
+            git push
+          fi
+===== END FILE =====
+
+===== FILE: ./.gitignore =====
+# Dependencies
+node_modules/
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# Cloudflare
+dist/
+worker-configuration.d.ts
+
+# TypeScript
+*.tsbuildinfo
+
+# Env
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+===== END FILE =====
+
+===== FILE: ./README.md =====
+# yukio-bot
+===== END FILE =====
+
+===== FILE: ./package.json =====
+{
+  "name": "yukio-bot",
+  "version": "1.0.0",
+  "description": "Yukio Bot — Personal assistant Telegram bot",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  }
+}
+===== END FILE =====
+
+===== FILE: ./src/business/autoReply.ts =====
+import type { Bot } from 'grammy';
+import type { Env } from '../types/env';
+import { askAI } from '../services/ai';
+import { isOwner } from '../lib/permissions';
+
+/**
+ * Setup business handler untuk auto-reply chat pribadi.
+ * Bot akan balas pesan yang masuk ke akun personal (business mode).
+ */
+export function setupBusinessHandler(bot: Bot, env: Env): void {
+  // ────────────────────────────────────────────────────
+  // Auto-reply saat ada pesan masuk ke akun personal
+  // ────────────────────────────────────────────────────
+  bot.on('business_message', async (ctx) => {
+    const msg = ctx.businessMessage;
+    if (!msg) return;
+
+    // Skip pesan dari diri sendiri (owner) — cegah loop
+    if (isOwner(msg.from?.id, env)) return;
+
+    // Skip pesan tanpa text (sticker, foto, dll)
+    const userMessage = msg.text?.trim();
+    if (!userMessage) return;
+
+    // Skip command — biarkan user kirim command ke owner manual
+    if (userMessage.startsWith('/')) return;
+
+    // Skip pesan terlalu pendek (emoticon, "ok", dll)
+    if (userMessage.length < 3) return;
+
+    try {
+      // Generate AI reply
+      const aiReply = await askAI(env, userMessage, {
+        system: buildAutoReplyPrompt(),
+        maxTokens: 250,
+        temperature: 0.5,
+      });
+
+      if (!aiReply) {
+        console.warn('[Business] AI returned empty');
+        return;
+      }
+
+      // Kirim balasan sebagai owner (business reply)
+      await ctx.reply(aiReply, {
+        business_connection_id: msg.business_connection_id,
+      });
+
+      // Notif ke admin (kamu)
+      await notifyOwner(bot, env, {
+        senderName: getSenderName(msg.from),
+        senderUsername: msg.from?.username,
+        senderId: msg.from?.id,
+        userMessage,
+        aiReply,
+      });
+    } catch (err) {
+      console.error('[Business] auto-reply error:', err);
+    }
+  });
+
+  // ────────────────────────────────────────────────────
+  // Business connection state change (connect/disconnect)
+  // ────────────────────────────────────────────────────
+  bot.on('business_connection', async (ctx) => {
+    const conn = ctx.businessConnection;
+    if (!conn) return;
+
+    console.log(
+      `[Business] connection ${conn.id} — enabled: ${conn.is_enabled}`
+    );
+  });
+}
+
+/* ==========================================================
+   HELPERS
+   ========================================================== */
+
+function buildAutoReplyPrompt(): string {
+  return `Kamu adalah asisten pribadi dari pemilik akun ini.
+Tugas: balas pesan yang masuk dengan sopan dan singkat.
+
+Aturan:
+- Maksimal 2-3 kalimat
+- Bahasa sama dengan user (Indonesia atau English)
+- Jangan mengaku sebagai pemilik — kamu asisten
+- Kalau pertanyaan spesifik yang hanya pemilik bisa jawab, bilang:
+  "Pemilik akan segera balas ya."
+- Jangan kasih info pribadi tentang pemilik
+- Kalau user minta tolong hal teknis, bilang akan diteruskan`;
+}
+
+function getSenderName(from: {
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+} | undefined): string {
+  if (!from) return 'Unknown';
+
+  if (from.username) return `@${from.username}`;
+
+  const fullName = [from.first_name, from.last_name]
+    .filter(Boolean)
+    .join(' ');
+
+  return fullName || 'Unknown';
+}
+
+async function notifyOwner(
+  bot: Bot,
+  env: Env,
+  data: {
+    senderName: string;
+    senderUsername?: string;
+    senderId?: number;
+    userMessage: string;
+    aiReply: string;
+  }
+): Promise<void> {
+  const senderLink = data.senderId
+    ? `<a href="tg://user?id=${data.senderId}">${escapeHtml(data.senderName)}</a>`
+    : escapeHtml(data.senderName);
+
+  const notification =
+    `📩 <b>Chat Baru</b>\n\n` +
+    `<b>Dari:</b> ${senderLink}\n\n` +
+    `<b>Pesan:</b>\n${escapeHtml(data.userMessage.slice(0, 300))}\n\n` +
+    `<b>Yukio balas:</b>\n${escapeHtml(data.aiReply.slice(0, 300))}`;
+
+  try {
+    await bot.api.sendMessage(env.ADMIN_USER_ID, notification, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (err) {
+    console.error('[Business] notify owner failed:', err);
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+===== END FILE =====
+
+===== FILE: ./src/commands/ai.ts =====
+import type { CommandDefinition } from './registry';
+import { askAI } from '../services/ai';
+
+export const aiCommand: CommandDefinition = {
+  name: 'ai',
+  description: 'Chat dengan AI',
+  usage: '/ai jelaskan anime isekai',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const argPrompt = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const repliedText = ctx.message?.reply_to_message?.text ?? '';
+    const prompt = argPrompt || repliedText;
+
+    if (!prompt) {
+      await ctx.reply(
+        'Kasih prompt-nya.\n\n' +
+          '<b>Contoh:</b>\n' +
+          '<code>/ai jelaskan anime isekai</code>\n\n' +
+          'Atau reply ke pesan yang berisi teks, lalu kirim <code>/ai</code>.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const loading = await ctx.reply('🤔 Berpikir...');
+
+    try {
+      const response = await askAI(env, prompt, {
+        system:
+          'Kamu adalah Yukio, asisten pribadi yang ramah dan membantu. ' +
+          'Jawab dengan singkat, jelas, dan natural dalam bahasa yang sama ' +
+          'dengan user. Hindari basa-basi berlebihan.',
+        maxTokens: 800,
+        temperature: 0.7,
+      });
+
+      if (!response) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          '❌ AI tidak memberikan response. Coba lagi.'
+        );
+        return;
+      }
+
+      const MAX_MSG_LEN = 4000;
+
+      if (response.length <= MAX_MSG_LEN) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          response
+        );
+      } else {
+        const firstPart = response.slice(0, MAX_MSG_LEN);
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          firstPart
+        );
+
+        let remaining = response.slice(MAX_MSG_LEN);
+        while (remaining.length > 0) {
+          const chunk = remaining.slice(0, MAX_MSG_LEN);
+          await ctx.reply(chunk);
+          remaining = remaining.slice(MAX_MSG_LEN);
+        }
+      }
+    } catch (err: any) {
+      console.error('[AI] error:', err);
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Error: ${err?.message ?? 'unknown'}`
+        )
+        .catch(() => {});
+    }
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/anime.ts =====
+import type { CommandDefinition } from './registry';
+import type { AniListMedia } from '../services/anilist';
+import { searchJikan, jikanToAniList } from '../services/jikan';
+import { searchKitsu, kitsuToAniList } from '../services/kitsu';
+import { getCache, setCache } from '../lib/cache';
+import { chatAI } from '../services/ai';
+import type { Env } from '../types/env';
+
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const AI_TIMEOUT_MS = 10_000;
+
+type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
+type AnimeType = 'TV' | 'Movie' | 'OVA' | 'ONA' | 'Special';
+
+const FORMAT_MAP: Record<string, AnimeType> = {
+  TV: 'TV',
+  TV_SHORT: 'TV',
+  MOVIE: 'Movie',
+  SPECIAL: 'Special',
+  OVA: 'OVA',
+  ONA: 'ONA',
+  MUSIC: 'Special',
+};
+
+const STATUS_MAP: Record<string, AnimeStatus> = {
+  FINISHED: 'Completed',
+  RELEASING: 'Ongoing',
+  NOT_YET_RELEASED: 'Ongoing',
+  CANCELLED: 'Hiatus',
+  HIATUS: 'Hiatus',
+};
+
+/* ═══════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════ */
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function pickTitle(media: AniListMedia): string {
+  return (
+    media.title.romaji ||
+    media.title.english ||
+    media.title.native ||
+    'Unknown'
+  );
+}
+
+function yamlString(s: string): string {
+  const cleaned = s.replace(/\n/g, ' ').trim();
+  const needsQuote = /[:#&*!|>'"%@`{}\[\],]/.test(cleaned);
+  if (!needsQuote) return cleaned;
+  return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function isValidHttpUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function stripHtml(s: string): string {
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function isEnglish(text: string): boolean {
+  const lower = text.toLowerCase();
+  const engWords = [
+    ' the ', ' is ', ' and ', ' of ', ' to ', ' a ', ' in ',
+    ' that ', ' with ', ' his ', ' her ',
+  ];
+  const matches = engWords.filter((w) => lower.includes(w)).length;
+  return matches >= 3;
+}
+
+/* ═══════════════════════════════════════════════
+   AI ENRICHMENT
+   ═══════════════════════════════════════════════ */
+
+interface Enriched {
+  studio?: string | null;
+  rating?: number | null;
+  synopsis?: string | null;
+  genre?: string[] | null;
+  releaseDate?: string | null;
+}
+
+function extractJson(text: string): unknown {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced?.[1] ?? text;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+async function enrichWithAI(
+  env: Env,
+  title: string,
+  existing: {
+    studio?: string | null;
+    rating?: number | null;
+    genre?: string[] | null;
+    releaseDate?: string | null;
+  },
+  need: string[]
+): Promise<Enriched | null> {
+  if (need.length === 0) return null;
+
+  const known: string[] = [];
+  if (existing.studio) known.push(`studio: ${existing.studio}`);
+  if (existing.rating) known.push(`rating: ${existing.rating}`);
+  if (existing.genre?.length) known.push(`genre: ${existing.genre.join(', ')}`);
+  if (existing.releaseDate) known.push(`releaseDate: ${existing.releaseDate}`);
+
+  const prompt =
+    `You are a FACTUAL anime database expert. Return STRICT JSON only.\n` +
+    `CRITICAL: If you don't know a fact with HIGH CONFIDENCE, return null for that field. NEVER GUESS or HALLUCINATE.\n\n` +
+    `Anime title: ${title}\n\n` +
+    (known.length > 0
+      ? `Known data (DO NOT change these):\n${known.join('\n')}\n\n`
+      : '') +
+    `Fill in ONLY these missing fields: ${need.join(', ')}\n\n` +
+    `Output JSON format:\n` +
+    `{\n` +
+    `  "studio": "exact animation studio name or null",\n` +
+    `  "rating": 7.5,\n` +
+    `  "genre": ["Action", "Adventure"],\n` +
+    `  "releaseDate": "YYYY-MM-DD",\n` +
+    `  "synopsis": "factual Indonesian synopsis, no spoilers"\n` +
+    `}\n\n` +
+    `STRICT RULES:\n` +
+    `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
+    `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
+    `- studio: only the PRIMARY animation studio (not producer)\n` +
+    `- synopsis: factual summary, NOT creative writing\n` +
+    `- Output valid JSON only, no markdown, no explanation`;
+
+  console.log(
+    `[Anime] AI enrich — need: [${need.join(', ')}], prompt len: ${prompt.length}`
+  );
+
+  try {
+    const raw = await chatAI(
+      env,
+      [{ role: 'user', content: prompt }],
+      { maxTokens: 900, temperature: 0.1, smart: true }
+    );
+
+    console.log(`[Anime] AI raw response len: ${raw?.length ?? 0}`);
+
+    if (!raw || raw.length === 0) {
+      console.warn('[Anime] AI returned empty');
+      return null;
+    }
+
+    const parsed = extractJson(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      console.warn('[Anime] AI parse failed, raw head:', raw.slice(0, 200));
+      return null;
+    }
+
+    console.log('[Anime] AI parsed:', JSON.stringify(parsed).slice(0, 300));
+
+    const obj = parsed as Record<string, unknown>;
+    const out: Enriched = {};
+
+    if (typeof obj.studio === 'string') out.studio = obj.studio;
+    if (typeof obj.rating === 'number') out.rating = obj.rating;
+    if (Array.isArray(obj.genre)) {
+      out.genre = obj.genre.filter((g): g is string => typeof g === 'string');
+    }
+    if (typeof obj.releaseDate === 'string') out.releaseDate = obj.releaseDate;
+    if (typeof obj.synopsis === 'string') out.synopsis = obj.synopsis;
+
+    return out;
+  } catch (err) {
+    console.error('[Anime] AI enrich failed:', err);
+    return null;
+  }
+}
+
+/** Bungkus enrichWithAI dengan timeout keras. */
+async function enrichWithAITimeout(
+  env: Env,
+  title: string,
+  existing: {
+    studio?: string | null;
+    rating?: number | null;
+    genre?: string[] | null;
+    releaseDate?: string | null;
+  },
+  need: string[]
+): Promise<Enriched | null> {
+  if (need.length === 0) return null;
+
+  return Promise.race([
+    enrichWithAI(env, title, existing, need),
+    new Promise<Enriched | null>((resolve) => {
+      setTimeout(() => {
+        console.warn(`[Anime] AI timeout after ${AI_TIMEOUT_MS}ms`);
+        resolve(null);
+      }, AI_TIMEOUT_MS);
+    }),
+  ]);
+}
+
+/* ═══════════════════════════════════════════════
+   BUILD YAML + BODY
+   ═══════════════════════════════════════════════ */
+
+interface BuildResult {
+  yaml: string;
+  body: string;
+  missing: string[];
+  aiUsed: string[];
+}
+
+function buildResult(
+  media: AniListMedia,
+  enriched: Enriched | null
+): BuildResult {
+  const missing: string[] = [];
+  const aiUsed: string[] = [];
+
+  const title = pickTitle(media);
+  if (!title || title === 'Unknown') missing.push('title');
+
+  let cover = media.coverImage.extraLarge || media.coverImage.large || '';
+  if (!cover || !isValidHttpUrl(cover)) {
+    cover = 'https://placehold.co/400x600?text=No+Cover';
+    missing.push('cover');
+  }
+
+  let status: AnimeStatus = 'Ongoing';
+  const mappedStatus = STATUS_MAP[media.status];
+  if (mappedStatus) status = mappedStatus;
+  else missing.push('status');
+
+  let type: AnimeType = 'TV';
+  const mappedType = FORMAT_MAP[media.format];
+  if (mappedType) type = mappedType;
+  else missing.push('type');
+
+  let genres = (media.genres ?? []).filter((g) => g && g.trim());
+  if (genres.length === 0 && enriched?.genre?.length) {
+    genres = enriched.genre;
+    aiUsed.push('genre');
+  }
+  if (genres.length === 0) {
+    genres = ['Unknown'];
+    missing.push('genre');
+  }
+  const genreYaml = `[${genres.map((g) => yamlString(g)).join(', ')}]`;
+
+  let studio = media.studios?.nodes?.[0]?.name ?? '';
+  if (!studio || studio === 'Unknown') {
+    if (enriched?.studio) {
+      studio = enriched.studio;
+      aiUsed.push('studio');
+    } else {
+      studio = 'Unknown';
+      missing.push('studio');
+    }
+  }
+
+  const y = media.startDate?.year ?? media.seasonYear;
+  const mo = media.startDate?.month;
+  const d = media.startDate?.day;
+  let releaseDate: string;
+
+  if (y && mo && d) {
+    releaseDate = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  } else if (
+    enriched?.releaseDate &&
+    /^\d{4}-\d{2}-\d{2}$/.test(enriched.releaseDate)
+  ) {
+    releaseDate = enriched.releaseDate;
+    aiUsed.push('releaseDate');
+  } else if (y) {
+    releaseDate = `${y}-01-01`;
+    missing.push('releaseDate (default 01-01)');
+  } else {
+    releaseDate = new Date().toISOString().split('T')[0] ?? '2020-01-01';
+    missing.push('releaseDate');
+  }
+
+  const addedAt = new Date().toISOString().split('T')[0] ?? '2026-01-01';
+
+  let rating: string;
+  if (typeof media.averageScore === 'number' && media.averageScore > 0) {
+    rating = (media.averageScore / 10).toFixed(1);
+  } else if (typeof enriched?.rating === 'number' && enriched.rating > 0) {
+    rating = enriched.rating.toFixed(1);
+    aiUsed.push('rating');
+  } else {
+    rating = '0.0';
+    missing.push('rating');
+  }
+
+  const lines: string[] = [];
+  lines.push('---');
+  lines.push(`title: ${yamlString(title)}`);
+  lines.push(`cover: ${cover}`);
+  lines.push(`status: ${status}`);
+  lines.push(`type: ${type}`);
+  lines.push(`genre: ${genreYaml}`);
+  lines.push(`studio: ${yamlString(studio)}`);
+  lines.push(`releaseDate: ${releaseDate}`);
+  lines.push(`addedAt: ${addedAt}`);
+  lines.push(`rating: ${rating}`);
+  lines.push('episodes: []');
+  lines.push('---');
+  const yaml = lines.join('\n');
+
+  let synopsisRaw = media.description ?? null;
+  if (synopsisRaw) synopsisRaw = stripHtml(synopsisRaw);
+
+  let synopsis = synopsisRaw;
+  if (!synopsis || synopsis.length < 50) {
+    if (enriched?.synopsis && enriched.synopsis.length > 50) {
+      synopsis = enriched.synopsis;
+      aiUsed.push('synopsis');
+    }
+  }
+
+  if (!synopsis || synopsis.length < 30) {
+    synopsis =
+      '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.\n\n' +
+      `${title} adalah anime yang...`;
+    missing.push('synopsis (body)');
+  }
+
+  return { yaml, body: synopsis, missing, aiUsed };
+}
+
+/* ═══════════════════════════════════════════════
+   INFO CARD
+   ═══════════════════════════════════════════════ */
+
+function buildInfoMessage(media: AniListMedia): string {
+  const title = pickTitle(media);
+  const year = media.startDate?.year ?? media.seasonYear ?? '-';
+  const studio = media.studios?.nodes?.[0]?.name ?? 'Unknown';
+  const genres = (media.genres ?? []).slice(0, 3).join(', ') || '-';
+  const rating = media.averageScore
+    ? (media.averageScore / 10).toFixed(1)
+    : '-';
+  const status = STATUS_MAP[media.status] ?? media.status;
+  const type = FORMAT_MAP[media.format] ?? media.format;
+
+  return (
+    `<b>${escapeHtml(title)}</b>\n\n` +
+    `📅 Tahun: ${year}\n` +
+    `🎬 Tipe: ${type}\n` +
+    `📌 Status: ${status}\n` +
+    `📼 Episode: ${media.episodes ?? '-'}\n` +
+    `🏢 Studio: ${escapeHtml(studio)}\n` +
+    `🏷️ Genre: ${escapeHtml(genres)}\n` +
+    `⭐ Rating: ${rating}`
+  );
+}
+
+/* ═══════════════════════════════════════════════
+   MAL URL
+   ═══════════════════════════════════════════════ */
+
+function isMALUrl(s: string): boolean {
+  return /^https?:\/\/(www\.)?myanimelist\.net\/anime\/\d+/i.test(s.trim());
+}
+
+function extractTitleFromMALUrl(url: string): string | null {
+  const m = url.match(/myanimelist\.net\/anime\/\d+\/([^\/\?#]+)/i);
+  if (!m) return null;
+  const slug = m[1];
+  if (!slug) return null;
+  return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
+}
+
+/* ═══════════════════════════════════════════════
+   FETCH CHAIN (Jikan → Kitsu)
+   ═══════════════════════════════════════════════ */
+
+async function fetchMetadata(query: string): Promise<{
+  media: AniListMedia;
+  source: string;
+} | null> {
+  const errors: string[] = [];
+
+  // 1. Jikan (MAL)
+  const t1 = Date.now();
+  try {
+    const jikan = await searchJikan(query);
+    if (jikan) {
+      console.log(`[Anime] Jikan OK in ${Date.now() - t1}ms`);
+      return { media: jikanToAniList(jikan), source: 'Jikan (MAL)' };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`Jikan: ${msg}`);
+    console.warn(`[Anime] Jikan failed in ${Date.now() - t1}ms:`, msg);
+  }
+
+  // 2. Kitsu
+  const t2 = Date.now();
+  try {
+    const kitsu = await searchKitsu(query);
+    if (kitsu) {
+      console.log(`[Anime] Kitsu OK in ${Date.now() - t2}ms`);
+      return { media: kitsuToAniList(kitsu), source: 'Kitsu' };
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(`Kitsu: ${msg}`);
+    console.warn(`[Anime] Kitsu failed in ${Date.now() - t2}ms:`, msg);
+  }
+
+  console.warn('[Anime] All APIs failed:', errors);
+  return null;
+}
+
+/* ═══════════════════════════════════════════════
+   DETECT MISSING
+   ═══════════════════════════════════════════════ */
+
+function detectMissing(media: AniListMedia, source: string): string[] {
+  const need: string[] = [];
+
+  const studio = media.studios?.nodes?.[0]?.name;
+  if (!studio || studio === 'Unknown') need.push('studio');
+
+  if (
+    typeof media.averageScore !== 'number' ||
+    media.averageScore <= 0
+  ) {
+    need.push('rating');
+  }
+
+  if (!media.genres || media.genres.length === 0) need.push('genre');
+
+  if (!media.startDate?.year && !media.seasonYear) need.push('releaseDate');
+
+  const desc = media.description ?? '';
+  const cleanDesc = stripHtml(desc);
+  if (!cleanDesc || cleanDesc.length < 50) {
+    need.push('synopsis');
+  } else if (isEnglish(cleanDesc) && source !== 'AniList') {
+    need.push('synopsis');
+  }
+
+  return need;
+}
+
+/* ═══════════════════════════════════════════════
+   COMMAND
+   ═══════════════════════════════════════════════ */
+
+export const animeCommand: CommandDefinition = {
+  name: 'anime',
+  description: 'Cari metadata anime → YAML + sinopsis',
+  usage: '/anime jujutsu kaisen',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const T0 = Date.now();
+
+    const argQuery = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const repliedText = ctx.message?.reply_to_message?.text ?? '';
+    const query = argQuery || repliedText;
+
+    if (!query) {
+      await ctx.reply(
+        '<b>🔍 Cari Metadata Anime</b>\n\n' +
+          '<b>Contoh:</b>\n' +
+          '<code>/anime jujutsu kaisen</code>\n\n' +
+          '<b>Atau URL MAL:</b>\n' +
+          '<code>/anime https://myanimelist.net/anime/40748</code>\n\n' +
+          '<i>Output: YAML frontmatter + sinopsis markdown.\n' +
+          'Field kosong akan diisi AI otomatis.</i>',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return;
+    }
+
+    const loading = await ctx.reply('🔍 Mencari...');
+
+    try {
+      let media: AniListMedia | null = null;
+      let sourceLabel = '';
+      let searchQuery = query;
+
+      if (isMALUrl(query)) {
+        const t = extractTitleFromMALUrl(query);
+        if (t) searchQuery = t;
+      }
+
+      const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
+      media = await getCache<AniListMedia>(env.DB, cacheKey);
+
+      if (media) {
+        sourceLabel = '⚡ Dari cache';
+        console.log(`[Anime] cache hit at ${Date.now() - T0}ms`);
+      } else {
+        const result = await fetchMetadata(searchQuery);
+        if (result) {
+          media = result.media;
+          sourceLabel = `📡 Sumber: ${result.source}`;
+          await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
+        }
+        console.log(`[Anime] fetch stage done at ${Date.now() - T0}ms`);
+      }
+
+      if (!media) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Anime "<b>${escapeHtml(searchQuery)}</b>" tidak ditemukan.\n\n` +
+            `<i>Kemungkinan:</i>\n` +
+            `• Judul tidak ada di database\n` +
+            `• Semua API sedang down / rate limit\n\n` +
+            `<i>Coba lagi beberapa menit.</i>`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        buildInfoMessage(media),
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+
+      const sourceName = sourceLabel
+        .replace(/^📡 Sumber: /, '')
+        .replace(/^⚡ Dari cache$/, '');
+      const need = detectMissing(media, sourceName);
+
+      let enriched: Enriched | null = null;
+      if (need.length > 0) {
+        const aiLoading = await ctx.reply(
+          `🤖 AI melengkapi: <code>${need.join(', ')}</code>...`,
+          { parse_mode: 'HTML' }
+        );
+
+        enriched = await enrichWithAITimeout(
+          env,
+          pickTitle(media),
+          {
+            studio: media.studios?.nodes?.[0]?.name,
+            rating: media.averageScore ? media.averageScore / 10 : null,
+            genre: media.genres,
+            releaseDate: media.startDate?.year
+              ? `${media.startDate.year}-01-01`
+              : null,
+          },
+          need
+        );
+
+        await ctx.api
+          .deleteMessage(ctx.chat!.id, aiLoading.message_id)
+          .catch(() => {});
+
+        console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
+      }
+
+      const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
+
+      const warnLines: string[] = [];
+      if (missing.length > 0) {
+        warnLines.push('⚠️ <b>Perlu edit manual:</b>');
+        for (const f of missing) {
+          warnLines.push(`• <code>${escapeHtml(f)}</code>`);
+        }
+        warnLines.push('');
+      }
+      if (aiUsed.length > 0) {
+        warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang, bisa halusinasi):</b>');
+        for (const f of aiUsed) {
+          warnLines.push(`• <code>${escapeHtml(f)}</code>`);
+        }
+      }
+      if (warnLines.length > 0) {
+        await ctx.reply(warnLines.join('\n'), {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
+      }
+
+      await ctx.reply(
+        `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(yaml)}</pre>`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+
+      const bodyMax = 3500;
+      const bodyPreview =
+        body.length > bodyMax
+          ? body.slice(0, bodyMax) + '\n\n… [truncated]'
+          : body;
+
+      await ctx.reply(
+        `📝 <b>Body (Sinopsis)</b>\n\n<pre>${escapeHtml(bodyPreview)}</pre>`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+
+      const cover = media.coverImage.extraLarge || media.coverImage.large;
+      if (cover && isValidHttpUrl(cover)) {
+        try {
+          await ctx.replyWithPhoto(cover);
+        } catch (err) {
+          console.warn('[Anime] Failed to send cover:', err);
+        }
+      }
+
+      if (sourceLabel) {
+        await ctx.reply(sourceLabel);
+      }
+
+      console.log(`[Anime] total: ${Date.now() - T0}ms`);
+    } catch (err: any) {
+      const elapsed = Date.now() - T0;
+      console.error(`[Anime] error after ${elapsed}ms:`, err);
+
+      try {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ <b>Gagal memuat data</b> (${elapsed}ms)\n\n` +
+            `Error: <code>${escapeHtml(err?.message ?? 'unknown')}</code>\n\n` +
+            `<i>Coba lagi beberapa menit.</i>`,
+          { parse_mode: 'HTML' }
+        );
+      } catch {
+        await ctx.reply(
+          `❌ Gagal: ${escapeHtml(err?.message ?? 'unknown')}`
+        ).catch(() => {});
+      }
+    }
+  },
+};
+
+===== END FILE =====
+
+===== FILE: ./src/commands/clearcache.ts =====
+import type { CommandDefinition } from './registry';
+
+export const clearcacheCommand: CommandDefinition = {
+  name: 'clearcache',
+  description: 'Hapus cache anime',
+  usage: '/clearcache\n/clearcache all',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim().toLowerCase() : '';
+
+    // Default: hapus cache anime saja
+    // "all": hapus semua cache (termasuk AI, dll nanti)
+    const deleteAll = arg === 'all';
+    const pattern = deleteAll ? '%' : 'anime:%';
+
+    const loading = await ctx.reply(
+      `🗑️ Menghapus cache${deleteAll ? ' (semua)' : ' anime'}...`
+    );
+
+    try {
+      // Hitung dulu berapa yang akan dihapus
+      const countResult = await env.DB
+        .prepare('SELECT COUNT(*) as count FROM cache WHERE key LIKE ?')
+        .bind(pattern)
+        .first<{ count: number }>();
+
+      const total = countResult?.count ?? 0;
+
+      if (total === 0) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `ℹ️ Tidak ada cache yang perlu dihapus.`
+        );
+        return;
+      }
+
+      // Hapus
+      const deleteResult = await env.DB
+        .prepare('DELETE FROM cache WHERE key LIKE ?')
+        .bind(pattern)
+        .run();
+
+      const deleted = deleteResult.meta?.changes ?? total;
+
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `✅ <b>Cache dihapus</b>\n\n` +
+          `📦 Total: <b>${deleted}</b> entry\n` +
+          `🎯 Filter: <code>${pattern}</code>\n\n` +
+          `<i>Fetch berikutnya akan ambil data fresh dari API.</i>`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err: any) {
+      console.error('[ClearCache] error:', err);
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Error: ${err?.message ?? 'unknown'}`
+        )
+        .catch(() => {});
+    }
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/decode.ts =====
+import type { CommandDefinition } from './registry';
+import type { Context } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+
+const MAX_INPUT_LEN = 8000;
+const MAX_FILE_CHARS = 2 * 1024 * 1024;
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_LAYERS = 5;
+const MAX_CANDIDATES = 800;
+const MAX_PARAM_DEPTH = 3;
+const MSG_BUDGET = 3800;
+
+const BASE64_PARAM_NAMES = new Set([
+  'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
+  'em', 'embed', 'target', 'id', 'file', 'video',
+]);
+
+const VIDEO_EXT_RE = /\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i;
+const VIDEO_HOSTS = [
+  'player.', 'streamtape', 'dood', 'filemoon', 'voe', 'mp4upload',
+  'mixdrop', 'iixdrop', 'abyss', 'abyssplayer',
+  'framezi', 'kturbo',
+  'pixeldrain', 'vikingfile', 'buzzheavier', 'mega.nz', 'doply',
+];
+
+const WRAPPER_HOSTS = ['animesail.xyz', '154999000.xyz'];
+
+const SERVER_ALIASES: Record<string, string> = {
+  abyss: 'abyss', dodo: 'doply', doply: 'doply',
+  pixel: 'pixeldrain', pixeldrain: 'pixeldrain',
+  viking: 'vikingfile', vikingfile: 'vikingfile',
+  mix: 'mixdrop', mixdrop: 'mixdrop',
+  buzi: 'buzzheavier', buzzheavier: 'buzzheavier',
+  mp4: 'mp4upload', mp4upload: 'mp4upload',
+  mega: 'mega', lokal: 'lokal', kamado: 'kamado', pancal: 'pancal',
+};
+
+interface RawEntry {
+  base64: string;
+  label: string | null;
+}
+
+interface ResolvedEntry {
+  url: string;
+  resolution: string | null;
+  server: string | null;
+}
+
+interface FileRef {
+  id: number;
+  label: string;
+  filename: string | null;
+  file_id: string;
+  created_at: number;
+  last_accessed: number;
+}
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS file_refs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            label         TEXT UNIQUE NOT NULL,
+            filename      TEXT,
+            file_id       TEXT NOT NULL,
+            created_at    INTEGER NOT NULL,
+            last_accessed INTEGER NOT NULL
+          )`
+        )
+        .run();
+      await db
+        .prepare('CREATE INDEX IF NOT EXISTS idx_file_refs_accessed ON file_refs(last_accessed DESC)')
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[Decode] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+async function getFileRef(db: D1Database, label: string): Promise<FileRef | null> {
+  await ensureDb(db);
+  const row = await db
+    .prepare('SELECT * FROM file_refs WHERE label = ?')
+    .bind(label)
+    .first<FileRef>();
+  if (!row) return null;
+  db.prepare('UPDATE file_refs SET last_accessed = ? WHERE id = ?')
+    .bind(Date.now(), row.id)
+    .run()
+    .catch(() => {});
+  return row;
+}
+
+async function saveFileRef(
+  db: D1Database,
+  label: string,
+  filename: string | null,
+  fileId: string
+): Promise<{ replaced: boolean }> {
+  await ensureDb(db);
+  const existing = await db
+    .prepare('SELECT id FROM file_refs WHERE label = ?')
+    .bind(label)
+    .first<{ id: number }>();
+
+  const now = Date.now();
+  await db
+    .prepare(
+      `INSERT INTO file_refs (label, filename, file_id, created_at, last_accessed)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(label) DO UPDATE SET
+         filename = excluded.filename,
+         file_id = excluded.file_id,
+         last_accessed = excluded.last_accessed`
+    )
+    .bind(label, filename, fileId, now, now)
+    .run();
+
+  return { replaced: !!existing };
+}
+
+async function listFileRefs(db: D1Database, limit = 30): Promise<FileRef[]> {
+  await ensureDb(db);
+  const res = await db
+    .prepare(
+      'SELECT id, label, filename, file_id, created_at, last_accessed FROM file_refs ORDER BY last_accessed DESC LIMIT ?'
+    )
+    .bind(limit)
+    .all<FileRef>();
+  return res.results ?? [];
+}
+
+async function deleteFileRef(db: D1Database, label: string): Promise<boolean> {
+  await ensureDb(db);
+  const res = await db.prepare('DELETE FROM file_refs WHERE label = ?').bind(label).run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function htmlDecode(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&#0?38;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'");
+}
+
+function normalizeBase64(input: string): string | null {
+  let b64 = input.trim().replace(/\s+/g, '');
+  b64 = b64.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+  const mod = b64.length % 4;
+  if (mod === 1) return null;
+  if (mod === 2) b64 += '==';
+  else if (mod === 3) b64 += '=';
+  return b64;
+}
+
+function decodeBase64(input: string): string | null {
+  const b64 = normalizeBase64(input);
+  if (!b64) return null;
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false, ignoreBOM: false }).decode(bytes);
+  } catch { return null; }
+}
+
+function isLikelyBase64(s: string): boolean {
+  const t = s.trim().replace(/\s+/g, '');
+  if (t.length < 12 || t.length > MAX_INPUT_LEN * 2) return false;
+  return /^[A-Za-z0-9+/\-_]+=*$/.test(t);
+}
+
+function isPrintable(s: string): boolean {
+  if (s.length === 0) return false;
+  let bad = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0xfffd) bad++;
+    else if (c < 32 && c !== 9 && c !== 10 && c !== 13) bad++;
+  }
+  return bad / s.length < 0.05;
+}
+
+function looksLikeHtml(s: string): boolean {
+  if (s.length < 30) return false;
+  return (
+    /<!DOCTYPE/i.test(s) || /<html[\s>]/i.test(s) || /<script[\s>]/i.test(s) ||
+    /<iframe[\s>]/i.test(s) || /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
+  );
+}
+
+function isVideoUrl(url: string): boolean {
+  if (VIDEO_EXT_RE.test(url)) return true;
+  const lower = url.toLowerCase();
+  return VIDEO_HOSTS.some((h) => lower.includes(h));
+}
+
+function isWrapper(url: string): boolean {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    return WRAPPER_HOSTS.some((w) => h === w || h.endsWith('.' + w));
+  } catch { return false; }
+}
+
+function parseResolution(label: string | null): string | null {
+  if (!label) return null;
+  const m = label.match(/\b(\d{3,4})p\b/i);
+  return m && m[1] ? `${m[1]}p` : null;
+}
+
+function parseServerName(label: string | null): string | null {
+  if (!label) return null;
+  const cleaned = label.toLowerCase().replace(/\s+\d{3,4}p\s*$/i, '').trim();
+  if (!cleaned) return null;
+  return SERVER_ALIASES[cleaned] ?? cleaned;
+}
+
+function resolutionRank(r: string | null): number {
+  if (!r || r === 'Lainnya' || r === 'Unknown') return -1;
+  const n = parseInt(r.replace(/p$/i, ''), 10);
+  return isNaN(n) ? -1 : n;
+}
+
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/\.(html?|txt|json)$/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40) || `file-${Date.now()}`;
+}
+
+function extractUrlsFromDecoded(s: string): string[] {
+  const found = new Set<string>();
+  const cleaned = htmlDecode(s);
+  const trimmed = cleaned.trim();
+  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) { found.add(trimmed); return [...found]; }
+
+  for (const m of cleaned.matchAll(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi)) {
+    const u = htmlDecode(m[1] ?? '');
+    if (/^https?:\/\//i.test(u)) found.add(u);
+  }
+  if (found.size === 0) {
+    for (const m of cleaned.matchAll(/src\s*=\s*["'](https?:\/\/[^"']+)["']/gi)) {
+      const u = htmlDecode(m[1] ?? '');
+      if (u) found.add(u);
+    }
+  }
+  if (found.size === 0) {
+    for (const m of cleaned.matchAll(/href\s*=\s*["'](https?:\/\/[^"']+)["']/gi)) {
+      const u = htmlDecode(m[1] ?? '');
+      if (u) found.add(u);
+    }
+  }
+  if (found.size === 0) {
+    for (const m of cleaned.matchAll(/https?:\/\/[^\s"'<>()\\]+/g)) {
+      const u = htmlDecode(m[0]);
+      if (u) found.add(u);
+    }
+  }
+  return [...found];
+}
+
+function expandUrlParams(url: string, depth = 0): string[] {
+  const out = new Set<string>([url]);
+  if (depth > MAX_PARAM_DEPTH) return [...out];
+  let parsed: URL;
+  try { parsed = new URL(url); } catch { return [...out]; }
+
+  for (const [key, value] of parsed.searchParams.entries()) {
+    if (!value || value.length < 12) continue;
+    if (!BASE64_PARAM_NAMES.has(key.toLowerCase())) continue;
+
+    if (/^https?:\/\//i.test(value)) {
+      for (const sub of expandUrlParams(value, depth + 1)) out.add(sub);
+      continue;
+    }
+    if (/^https?%3A/i.test(value)) {
+      try {
+        const dec = decodeURIComponent(value);
+        if (/^https?:\/\//i.test(dec)) {
+          for (const sub of expandUrlParams(dec, depth + 1)) out.add(sub);
+        }
+      } catch { /* ignore */ }
+    }
+    if (isLikelyBase64(value)) {
+      const decoded = decodeBase64(value);
+      if (decoded && isPrintable(decoded)) {
+        const trimmed = decoded.trim();
+        if (/^https?:\/\//i.test(trimmed)) {
+          for (const sub of expandUrlParams(trimmed, depth + 1)) out.add(sub);
+        }
+      }
+    }
+  }
+  return [...out];
+}
+
+interface DecodeResult {
+  output: string;
+  layers: number;
+  urls: string[];
+}
+
+function multiLayerDecode(input: string): DecodeResult | null {
+  if (!isLikelyBase64(input)) return null;
+  let current = input.trim();
+  let layers = 0;
+  for (let i = 0; i < MAX_LAYERS; i++) {
+    const decoded = decodeBase64(current);
+    if (decoded === null || decoded === current) break;
+    if (!isPrintable(decoded)) break;
+    current = decoded;
+    layers++;
+    const urls = extractUrlsFromDecoded(current);
+    if (urls.length > 0) break;
+    if (!isLikelyBase64(current)) break;
+  }
+  if (layers === 0) return null;
+  return { output: current, layers, urls: extractUrlsFromDecoded(current) };
+}
+
+function extractEntries(html: string): RawEntry[] {
+  const entries: RawEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const m of html.matchAll(
+    /<option\b[^>]*?\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["'][^>]*?>([^<]*)<\/option>/gi
+  )) {
+    const b64 = m[1];
+    const label = (m[2] ?? '').trim();
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+    entries.push({ base64: b64, label: label || null });
+  }
+
+  for (const m of html.matchAll(/atob\s*\(\s*["']([A-Za-z0-9+/=\-_]{16,})["']\s*\)/gi)) {
+    const b64 = m[1];
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+    entries.push({ base64: b64, label: null });
+  }
+
+  for (const m of html.matchAll(/[A-Za-z0-9+/\-_]{24,}={0,2}/g)) {
+    if (entries.length >= MAX_CANDIDATES) break;
+    const b64 = m[0];
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+    entries.push({ base64: b64, label: null });
+  }
+
+  return entries;
+}
+
+function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
+  const resolved = new Map<string, { resolution: string | null; server: string | null }>();
+  const unresolved = new Map<string, { resolution: string | null; server: string | null }>();
+
+  function resolve(url: string, resolution: string | null, server: string | null, depth: number, seen: Set<string>): void {
+    if (depth > 4 || seen.has(url)) return;
+    seen.add(url);
+    const children = expandUrlParams(url).filter((u) => u !== url);
+    if (isWrapper(url)) {
+      if (children.length === 0) {
+        if (!resolved.has(url) && !unresolved.has(url)) unresolved.set(url, { resolution, server });
+      } else {
+        for (const c of children) resolve(c, resolution, server, depth + 1, seen);
+      }
+      return;
+    }
+    if (!resolved.has(url)) resolved.set(url, { resolution, server });
+    for (const c of children) resolve(c, resolution, server, depth + 1, seen);
+  }
+
+  for (const e of entries) {
+    const dec = multiLayerDecode(e.base64);
+    if (!dec || dec.urls.length === 0) continue;
+    const resolution = parseResolution(e.label);
+    const server = parseServerName(e.label);
+    for (const url of dec.urls) resolve(url, resolution, server, 0, new Set());
+  }
+
+  const final: ResolvedEntry[] = [];
+  for (const [url, info] of resolved) {
+    if (isVideoUrl(url)) final.push({ url, resolution: info.resolution, server: info.server });
+  }
+  if (final.length === 0) {
+    for (const [url, info] of unresolved) final.push({ url, resolution: info.resolution, server: info.server });
+  }
+  final.sort((a, b) => {
+    const ra = resolutionRank(a.resolution);
+    const rb = resolutionRank(b.resolution);
+    if (ra !== rb) return rb - ra;
+    return a.url.length - b.url.length;
+  });
+  return final;
+}
+
+function buildUrlList(items: ResolvedEntry[], label?: string): string {
+  const lines: string[] = [];
+  lines.push('🎬 <b>URL Video</b>');
+  if (label) lines.push(`🏷️ <code>${escapeHtml(label)}</code>`);
+  lines.push(`📊 Total: <b>${items.length}</b>`);
+  lines.push('');
+
+  const byRes = new Map<string, ResolvedEntry[]>();
+  for (const it of items) {
+    const key = it.resolution ?? 'Lainnya';
+    if (!byRes.has(key)) byRes.set(key, []);
+    byRes.get(key)!.push(it);
+  }
+  const sortedKeys = [...byRes.keys()].sort((a, b) => resolutionRank(b) - resolutionRank(a));
+
+  let n = 1;
+  for (const key of sortedKeys) {
+    lines.push(`━━━ ${escapeHtml(key)} ━━━`);
+    for (const it of byRes.get(key)!) {
+      lines.push(`${n}. <code>${escapeHtml(it.url)}</code>`);
+      n++;
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trim();
+}
+
+function buildYaml(items: ResolvedEntry[]): string {
+  const byQuality = new Map<string, { name: string; url: string }[]>();
+  for (const item of items) {
+    const q = item.resolution ?? 'Unknown';
+    if (!byQuality.has(q)) byQuality.set(q, []);
+    byQuality.get(q)!.push({ name: item.server ?? 'unknown', url: item.url });
+  }
+  const qualities = [...byQuality.keys()].sort((a, b) => resolutionRank(b) - resolutionRank(a));
+
+  const lines: string[] = [];
+  lines.push('episodes:');
+  lines.push('  - number: 1');
+  lines.push('    streams:');
+  for (const q of qualities) {
+    lines.push(`      - quality: "${q}"`);
+    lines.push('        servers:');
+    for (const s of byQuality.get(q)!) {
+      lines.push(`          - name: "${s.name}"`);
+      lines.push(`            url: "${s.url}"`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function splitMessage(text: string, budget = MSG_BUDGET): string[] {
+  if (text.length <= budget) return [text];
+  const parts: string[] = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    const prospective = current ? current + '\n' + line : line;
+    if (prospective.length > budget && current.length > 0) {
+      parts.push(current);
+      current = line;
+    } else {
+      current = prospective;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+async function sendResult(ctx: Context, items: ResolvedEntry[], label?: string): Promise<void> {
+  const urlList = buildUrlList(items, label);
+  for (const part of splitMessage(urlList)) {
+    await ctx.reply(part, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+  }
+  const yaml = buildYaml(items);
+  for (const part of splitMessage(yaml)) {
+    await ctx.reply(`📋 <b>YAML</b>\n\n<pre>${escapeHtml(part)}</pre>`, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  }
+}
+
+async function downloadByFileId(
+  ctx: Context,
+  env: Env,
+  fileId: string,
+  showLoading: boolean
+): Promise<string | null> {
+  let loadingId: number | null = null;
+  if (showLoading) {
+    const m = await ctx.reply('📥 Ambil dari Telegram...');
+    loadingId = m.message_id;
+  }
+
+  try {
+    const file = await ctx.api.getFile(fileId);
+    if (!file.file_path) throw new Error('no file_path');
+
+    const url = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    let text = await res.text();
+    if (text.length > MAX_FILE_CHARS) text = text.slice(0, MAX_FILE_CHARS);
+
+    if (loadingId) {
+      await ctx.api.deleteMessage(ctx.chat!.id, loadingId).catch(() => {});
+    }
+    return text;
+  } catch (err: any) {
+    const msg = err?.message ?? 'unknown';
+    console.error('[Decode] download failed:', msg);
+    if (loadingId) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loadingId,
+          `❌ Gagal ambil file dari Telegram: <code>${escapeHtml(msg)}</code>\n\n` +
+            `<i>File mungkin sudah dihapus. Upload ulang ya.</i>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    } else {
+      await ctx.reply(
+        `❌ Gagal ambil file: <code>${escapeHtml(msg)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+    return null;
+  }
+}
+
+async function downloadDocText(
+  ctx: Context,
+  env: Env
+): Promise<{ text: string; fileId: string; filename: string } | null> {
+  const doc = ctx.message?.document ?? ctx.message?.reply_to_message?.document;
+  if (!doc) return null;
+
+  const size = doc.file_size ?? 0;
+  if (size > MAX_FILE_BYTES) {
+    await ctx.reply(
+      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${MAX_FILE_BYTES / 1024 / 1024} MB).\n\n<i>Potong dulu HTML-nya.</i>`,
+      { parse_mode: 'HTML' }
+    );
+    return null;
+  }
+
+  const name = doc.file_name ?? '';
+  const mime = doc.mime_type ?? '';
+  const ok = /\.(html?|txt|json|js|css)$/i.test(name) || /^text\/|json|javascript/i.test(mime);
+  if (!ok) {
+    await ctx.reply(`❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`, { parse_mode: 'HTML' });
+    return null;
+  }
+
+  const loading = await ctx.reply('📥 Download file...');
+  try {
+    const file = await ctx.api.getFile(doc.file_id);
+    if (!file.file_path) throw new Error('no file_path');
+
+    const url = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    let text = await res.text();
+    if (text.length > MAX_FILE_CHARS) text = text.slice(0, MAX_FILE_CHARS);
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+    return { text, fileId: doc.file_id, filename: name || 'unnamed' };
+  } catch (err: any) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error download: ${escapeHtml(err?.message ?? 'unknown')}`
+      )
+      .catch(() => {});
+    return null;
+  }
+}
+
+function processText(input: string, sourceType: 'base64' | 'html'): ResolvedEntry[] | null {
+  const entries = sourceType === 'html' ? extractEntries(input) : [{ base64: input, label: null }];
+  if (entries.length === 0) return null;
+  const videos = collectResolvedVideos(entries);
+  return videos.length > 0 ? videos : null;
+}
+
+export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
+  const result = await downloadDocText(ctx, env);
+  if (!result) return;
+
+  const { text, fileId, filename } = result;
+  const sourceType: 'base64' | 'html' = looksLikeHtml(text) ? 'html' : 'base64';
+
+  const loading = await ctx.reply('🌐 Proses...');
+  try {
+    const videos = processText(text, sourceType);
+    if (!videos || videos.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '❌ Tidak ada URL video yang bisa diekstrak.'
+      );
+      return;
+    }
+
+    const label = slugify(filename);
+    const { replaced } = await saveFileRef(env.DB, label, filename, fileId);
+
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    await ctx.reply(
+      replaced
+        ? `♻️ Update: <code>${escapeHtml(label)}</code>`
+        : `💾 Tersimpan: <code>${escapeHtml(label)}</code>`,
+      { parse_mode: 'HTML' }
+    );
+
+    await sendResult(ctx, videos, label);
+
+    await ctx.reply(
+      `💡 Akses lagi: <code>/decode ${escapeHtml(label)}</code>`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (err: any) {
+    console.error('[Decode] auto error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
+      )
+      .catch(() => {});
+  }
+}
+
+export const decodeCommand: CommandDefinition = {
+  name: 'decode',
+  description: 'Decode HTML/Base64 atau buka tersimpan',
+  usage: '/decode <base64|html|label>',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const doc = ctx.message?.document ?? ctx.message?.reply_to_message?.document;
+    if (doc) {
+      await handleDocumentAuto(ctx, env);
+      return;
+    }
+
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const replied = ctx.message?.reply_to_message?.text ?? '';
+    const input = arg || replied;
+
+    if (!input) {
+      await ctx.reply(
+        '<b>🔓 Decode</b>\n\n' +
+          '<b>Kirim file</b> <code>.html</code> / <code>.txt</code> → auto proses + simpan\n' +
+          '<b>One-shot:</b> <code>/decode &lt;base64&gt;</code>\n' +
+          '<b>Buka tersimpan:</b> <code>/decode &lt;label&gt;</code>\n' +
+          '<b>List:</b> <code>/list</code>\n' +
+          '<b>Hapus:</b> <code>/delete &lt;label&gt;</code>',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return;
+    }
+
+    if (!looksLikeHtml(input) && !isLikelyBase64(input) && input.length < 60) {
+      const ref = await getFileRef(env.DB, input);
+      if (ref) {
+        const text = await downloadByFileId(ctx, env, ref.file_id, true);
+        if (!text) return;
+
+        const sourceType: 'base64' | 'html' = looksLikeHtml(text) ? 'html' : 'base64';
+        const loading = await ctx.reply('🌐 Proses...');
+        try {
+          const videos = processText(text, sourceType);
+          if (!videos || videos.length === 0) {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              loading.message_id,
+              '❌ Tidak ada URL video yang bisa diekstrak.'
+            );
+            return;
+          }
+          await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+          await sendResult(ctx, videos, ref.label);
+        } catch (err: any) {
+          await ctx.api
+            .editMessageText(
+              ctx.chat!.id,
+              loading.message_id,
+              `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
+            )
+            .catch(() => {});
+        }
+        return;
+      }
+    }
+
+    if (input.length > MAX_INPUT_LEN) {
+      await ctx.reply(`❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    const sourceType: 'base64' | 'html' = looksLikeHtml(input) ? 'html' : 'base64';
+    const loading = await ctx.reply('🔓 Proses...');
+    try {
+      const videos = processText(input, sourceType);
+      if (!videos || videos.length === 0) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          '❌ Tidak ada URL video yang bisa diekstrak.'
+        );
+        return;
+      }
+      await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+      await sendResult(ctx, videos);
+    } catch (err: any) {
+      console.error('[Decode] error:', err);
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
+        )
+        .catch(() => {});
+    }
+  },
+};
+
+export const listCommand: CommandDefinition = {
+  name: 'list',
+  description: 'Lihat file referensi tersimpan',
+  usage: '/list',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const rows = await listFileRefs(env.DB, 30);
+    if (rows.length === 0) {
+      await ctx.reply('📭 Belum ada file tersimpan.\n\n<i>Kirim file .html/.txt ke bot untuk mulai.</i>', {
+        parse_mode: 'HTML',
+      });
+      return;
+    }
+
+    const lines: string[] = [];
+    lines.push(`📚 <b>File Tersimpan (${rows.length})</b>\n`);
+    for (const r of rows) {
+      const days = Math.floor((Date.now() - r.last_accessed) / 86400000);
+      const age = days === 0 ? 'hari ini' : days === 1 ? '1 hari lalu' : `${days} hari lalu`;
+      const fname = r.filename ? ` — <i>${escapeHtml(r.filename)}</i>` : '';
+      lines.push(`• <code>${escapeHtml(r.label)}</code>${fname} — <i>${age}</i>`);
+    }
+    lines.push('');
+    lines.push('<i>Buka ulang: <code>/decode &lt;label&gt;</code></i>');
+
+    await ctx.reply(lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  },
+};
+
+export const deleteCommand: CommandDefinition = {
+  name: 'delete',
+  description: 'Hapus referensi file',
+  usage: '/delete <label>',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    if (!arg) {
+      await ctx.reply('Usage: <code>/delete &lt;label&gt;</code>', { parse_mode: 'HTML' });
+      return;
+    }
+
+    const ok = await deleteFileRef(env.DB, arg);
+    if (ok) {
+      await ctx.reply(
+        `✅ <code>${escapeHtml(arg)}</code> dihapus dari DB.\n\n<i>File HTML di Telegram tetap ada.</i>`,
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      await ctx.reply(`❌ Tidak ada: <code>${escapeHtml(arg)}</code>`, { parse_mode: 'HTML' });
+    }
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/help.ts =====
+import type { CommandDefinition } from './registry';
+import { COMMANDS } from './list';
+import { isAdmin } from '../lib/permissions';
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export const helpCommand: CommandDefinition = {
+  name: 'help',
+  description: 'Daftar command yang tersedia',
+  handler: async (ctx, env) => {
+    const admin = isAdmin(ctx.from?.id, env);
+
+    let msg = '🤖 <b>Yukio Bot</b>\n';
+    msg += '<i>Personal assistant — admin only</i>\n\n';
+    msg += '<b>Commands</b>\n';
+
+    for (const cmd of COMMANDS) {
+      if (cmd.adminOnly && !admin) continue;
+
+      msg += `\n<code>/${escapeHtml(cmd.name)}</code>\n`;
+      msg += `  ${escapeHtml(cmd.description)}\n`;
+
+      if (cmd.usage) {
+        msg += `  <i>Contoh: ${escapeHtml(cmd.usage)}</i>\n`;
+      }
+    }
+
+    msg += '\n';
+    if (!admin) {
+      msg += '<i>Beberapa command memerlukan akses admin.</i>';
+    }
+
+    // Telegram limit 4096 char
+    if (msg.length > 4000) {
+      msg = msg.slice(0, 3950) + '\n\n<i>… [truncated]</i>';
+    }
+
+    await ctx.reply(msg, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/list.ts =====
+import type { CommandDefinition } from './registry';
+import { pingCommand } from './ping';
+import { helpCommand } from './help';
+import { statusCommand } from './status';
+import { animeCommand } from './anime';
+import { aiCommand } from './ai';
+import { clearcacheCommand } from './clearcache';
+import { decodeCommand, listCommand, deleteCommand } from './decode';
+
+export const COMMANDS: CommandDefinition[] = [
+  pingCommand,
+  helpCommand,
+  statusCommand,
+  animeCommand,
+  aiCommand,
+  clearcacheCommand,
+  decodeCommand,
+  listCommand,
+  deleteCommand,
+];
+===== END FILE =====
+
+===== FILE: ./src/commands/ping.ts =====
+import type { CommandDefinition } from './registry';
+
+export const pingCommand: CommandDefinition = {
+  name: 'ping',
+  description: 'Health check — cek bot masih hidup',
+  adminOnly: true,
+  handler: async (ctx) => {
+    const start = Date.now();
+
+    // Kirim pesan loading dulu
+    const msg = await ctx.reply('🏓 Pinging...');
+
+    // Hitung latency
+    const latency = Date.now() - start;
+
+    // Edit pesan dengan hasil
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      msg.message_id,
+      `🏓 <b>Pong!</b>\n\n` +
+        `⏱️ Latency: ${latency}ms\n` +
+        `🕐 Waktu: ${new Date().toISOString()}`,
+      { parse_mode: 'HTML' }
+    );
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/registry.ts =====
+import type { Bot, Context } from 'grammy';
+import type { Env } from '../types/env';
+import { isAdmin } from '../lib/permissions';
+import { COMMANDS } from './list';
+
+export interface CommandDefinition {
+  name: string;
+  description: string;
+  usage?: string;
+  adminOnly?: boolean;
+  handler: (ctx: Context, env: Env) => Promise<void>;
+}
+
+export function registerCommands(bot: Bot, env: Env): void {
+  for (const cmd of COMMANDS) {
+    bot.command(cmd.name, async (ctx) => {
+      if (cmd.adminOnly && !isAdmin(ctx.from?.id, env)) {
+        await ctx.reply('⛔ Command ini hanya untuk admin.');
+        return;
+      }
+
+      try {
+        await cmd.handler(ctx, env);
+      } catch (err) {
+        console.error(`[Command:${cmd.name}] error:`, err);
+        await ctx.reply('❌ Terjadi kesalahan. Coba lagi.').catch(() => {});
+      }
+    });
+  }
+}
+===== END FILE =====
+
+===== FILE: ./src/commands/status.ts =====
+import type { CommandDefinition } from './registry';
+
+export const statusCommand: CommandDefinition = {
+  name: 'status',
+  description: 'Status bot & statistik cache',
+  adminOnly: true,
+  handler: async (ctx, env) => {
+    const loading = await ctx.reply('📊 Mengumpulkan stats...');
+
+    try {
+      const now = Date.now();
+
+      const cacheActive = await env.DB
+        .prepare('SELECT COUNT(*) as count FROM cache WHERE expires_at > ?')
+        .bind(now)
+        .first<{ count: number }>();
+
+      const cacheExpired = await env.DB
+        .prepare('SELECT COUNT(*) as count FROM cache WHERE expires_at <= ?')
+        .bind(now)
+        .first<{ count: number }>();
+
+      const chatsTotal = await env.DB
+        .prepare('SELECT COUNT(*) as count FROM business_chats')
+        .first<{ count: number }>()
+        .catch(() => ({ count: 0 }));
+
+      const chatsToday = await env.DB
+        .prepare(
+          'SELECT COUNT(*) as count FROM business_chats WHERE created_at > ?'
+        )
+        .bind(now - 24 * 60 * 60 * 1000)
+        .first<{ count: number }>()
+        .catch(() => ({ count: 0 }));
+
+      const msg =
+        `📊 <b>Yukio Bot Status</b>\n\n` +
+        `<b>Cache</b>\n` +
+        `  ✅ Aktif: ${cacheActive?.count ?? 0}\n` +
+        `  ⏳ Expired: ${cacheExpired?.count ?? 0}\n\n` +
+        `<b>Business Chats</b>\n` +
+        `  💬 Total: ${chatsTotal?.count ?? 0}\n` +
+        `  📅 24 jam terakhir: ${chatsToday?.count ?? 0}\n\n` +
+        `<b>Runtime</b>\n` +
+        `  🌐 Platform: Cloudflare Workers\n` +
+        `  🕐 Server: ${new Date().toISOString()}`;
+
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        msg,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
+      );
+    } catch (err: any) {
+      console.error('[Status] error:', err);
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Error: ${err?.message ?? 'unknown'}`
+        )
+        .catch(() => {});
+    }
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/index.ts =====
+import { Bot, webhookCallback } from 'grammy';
+import type { Env } from './types/env';
+import { registerCommands } from './commands/registry';
+import { setupBusinessHandler } from './business/autoReply';
+import { cleanupCache } from './lib/cache';
+import { isAdmin } from './lib/permissions';
+import { handleDocumentAuto } from './commands/decode';
+
+function createBot(env: Env): Bot {
+  const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
+
+  bot.command('start', async (ctx) => {
+    await ctx.reply(
+      '🤖 <b>Yukio Bot</b>\n' +
+        '<i>Personal assistant</i>\n\n' +
+        'Bot ini untuk keperluan pribadi.\n' +
+        'Ketik /help untuk lihat command yang tersedia.',
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      }
+    );
+  });
+
+  registerCommands(bot, env);
+
+  setupBusinessHandler(bot, env);
+
+  bot.on('message:document', async (ctx) => {
+    const caption = ctx.message.caption ?? '';
+
+    if (caption.startsWith('/')) return;
+
+    if (ctx.chat?.type !== 'private') return;
+
+    if (!isAdmin(ctx.from?.id, env)) return;
+
+    const name = ctx.message.document.file_name ?? '';
+    if (!/\.(html?|txt)$/i.test(name)) return;
+
+    try {
+      await handleDocumentAuto(ctx, env);
+    } catch (err) {
+      console.error('[AutoDecode] error:', err);
+      await ctx.reply('❌ Auto-decode gagal. Coba /decode.').catch(() => {});
+    }
+  });
+
+  bot.catch((err) => {
+    console.error('[Bot] error:', err.error);
+  });
+
+  return bot;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/health' || url.pathname === '/') {
+      return new Response(
+        JSON.stringify({
+          status: 'ok',
+          bot: 'yukio-bot',
+          timestamp: new Date().toISOString(),
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (url.pathname === '/webhook') {
+      try {
+        const bot = createBot(env);
+        const handler = webhookCallback(bot, 'cloudflare-mod');
+        return await handler(request);
+      } catch (err) {
+        console.error('[Worker] webhook error:', err);
+        return new Response('OK', { status: 200 });
+      }
+    }
+
+    if (url.pathname === '/debug') {
+      const t0 = Date.now();
+      try {
+        const res = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`
+        );
+        const data = await res.json();
+        return new Response(
+          JSON.stringify({
+            ok: res.ok,
+            status: res.status,
+            elapsed: Date.now() - t0,
+            data,
+          }, null, 2),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            elapsed: Date.now() - t0,
+            error: err?.message ?? String(err),
+          }, null, 2),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    return new Response('Not Found', { status: 404 });
+  },
+
+  async scheduled(
+    _event: ScheduledEvent,
+    env: Env,
+    _ctx: ExecutionContext
+  ): Promise<void> {
+    try {
+      const cleaned = await cleanupCache(env.DB);
+      console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
+    } catch (err) {
+      console.error('[Cron] cleanup error:', err);
+    }
+  },
+};
+
+===== END FILE =====
+
+===== FILE: ./src/lib/cache.ts =====
+interface CacheRow {
+  value: string;
+  expires_at: number;
+}
+
+/**
+ * Ambil value dari cache D1 berdasarkan key.
+ * Return null kalau:
+ * - key tidak ada
+ * - sudah expired (sekaligus hapus entry)
+ * - error saat query
+ */
+export async function getCache<T>(
+  db: D1Database,
+  key: string
+): Promise<T | null> {
+  try {
+    const row = await db
+      .prepare('SELECT value, expires_at FROM cache WHERE key = ?')
+      .bind(key)
+      .first<CacheRow>();
+
+    if (!row) return null;
+
+    // Kalau expired — hapus dan return null
+    if (row.expires_at < Date.now()) {
+      await db.prepare('DELETE FROM cache WHERE key = ?').bind(key).run();
+      return null;
+    }
+
+    return JSON.parse(row.value) as T;
+  } catch (err) {
+    console.error('[Cache] read error:', err);
+    return null;
+  }
+}
+
+/**
+ * Simpan value ke cache D1.
+ * Kalau key sudah ada, update (upsert).
+ *
+ * @param ttlMs — Time to live dalam milidetik
+ */
+export async function setCache(
+  db: D1Database,
+  key: string,
+  value: unknown,
+  ttlMs: number
+): Promise<void> {
+  try {
+    const expiresAt = Date.now() + ttlMs;
+
+    await db
+      .prepare(
+        `INSERT INTO cache (key, value, expires_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           expires_at = excluded.expires_at`
+      )
+      .bind(key, JSON.stringify(value), expiresAt)
+      .run();
+  } catch (err) {
+    console.error('[Cache] write error:', err);
+  }
+}
+
+/**
+ * Hapus entry dari cache.
+ */
+export async function deleteCache(db: D1Database, key: string): Promise<void> {
+  try {
+    await db.prepare('DELETE FROM cache WHERE key = ?').bind(key).run();
+  } catch (err) {
+    console.error('[Cache] delete error:', err);
+  }
+}
+
+/**
+ * Hapus semua entry yang sudah expired.
+ * Dipanggil via cron trigger harian.
+ */
+export async function cleanupCache(db: D1Database): Promise<number> {
+  try {
+    const result = await db
+      .prepare('DELETE FROM cache WHERE expires_at < ?')
+      .bind(Date.now())
+      .run();
+
+    return result.meta?.changes ?? 0;
+  } catch (err) {
+    console.error('[Cache] cleanup error:', err);
+    return 0;
+  }
+}
+===== END FILE =====
+
+===== FILE: ./src/lib/http.ts =====
+export async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  opts: { retries?: number; baseDelay?: number; timeout?: number } = {}
+): Promise<Response> {
+  const retries = opts.retries ?? 0;
+  const baseDelay = opts.baseDelay ?? 500;
+  const timeout = opts.timeout ?? 5000;
+
+  let lastErr: unknown;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+
+    try {
+      const res = await fetch(input, { ...init, signal: ctrl.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, baseDelay));
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastErr ?? new Error('fetchWithRetry: unknown error');
+}
+
+===== END FILE =====
+
+===== FILE: ./src/lib/permissions.ts =====
+import type { Env } from '../types/env';
+
+export function isAdmin(userId: number | undefined, env: Env): boolean {
+  if (!userId) return false;
+  return userId.toString() === env.ADMIN_USER_ID;
+}
+
+export function isOwner(userId: number | undefined, env: Env): boolean {
+  if (!userId) return false;
+  return userId.toString() === env.BUSINESS_OWNER_ID;
+}
+===== END FILE =====
+
+===== FILE: ./src/services/ai.ts =====
+import type { Env } from '../types/env';
+
+const MODELS_CHEAP = [
+  '@cf/ibm-granite/granite-4.0-h-micro',
+  '@cf/meta/llama-3.2-1b-instruct',
+  '@cf/qwen/qwen3-30b-a3b-fp8',
+];
+
+const MODELS_SMART = [
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  '@cf/meta/llama-3.1-8b-instruct-fast',
+  '@cf/qwen/qwen3-30b-a3b-fp8',
+];
+
+interface AIMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+function extractResponse(res: unknown): string {
+  if (!res) return '';
+  if (typeof res === 'string') return res;
+
+  const obj = res as Record<string, unknown>;
+  if (typeof obj.response === 'string') return obj.response;
+  if (typeof obj.result === 'string') return obj.result;
+
+  const choices = obj.choices as
+    | { message?: { content?: string } }[]
+    | undefined;
+  if (choices?.[0]?.message?.content) return choices[0].message.content;
+
+  return '';
+}
+
+async function runAI(
+  env: Env,
+  messages: AIMessage[],
+  options: { maxTokens: number; temperature: number },
+  models: string[]
+): Promise<string> {
+  const errors: string[] = [];
+
+  for (const model of models) {
+    try {
+      console.log(`[AI] Trying model: ${model}`);
+
+      const res = await env.AI.run(
+        model as Parameters<Ai['run']>[0],
+        {
+          messages,
+          max_tokens: options.maxTokens,
+          temperature: options.temperature,
+        } as Parameters<Ai['run']>[1]
+      );
+
+      const text = extractResponse(res).trim();
+
+      if (text) {
+        console.log(`[AI] ${model} OK (${text.length} chars)`);
+        return text;
+      }
+
+      console.warn(`[AI] ${model} returned empty`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`${model}: ${msg}`);
+      console.warn(`[AI] ${model} failed:`, msg);
+    }
+  }
+
+  console.error('[AI] All models failed:', errors);
+  return '';
+}
+
+export async function askAI(
+  env: Env,
+  prompt: string,
+  options?: {
+    system?: string;
+    maxTokens?: number;
+    temperature?: number;
+    smart?: boolean;
+  }
+): Promise<string> {
+  const opts = options ?? {};
+  const maxTokens = opts.maxTokens ?? 800;
+  const temperature = opts.temperature ?? 0.7;
+  const models = opts.smart ? MODELS_SMART : MODELS_CHEAP;
+
+  const messages: AIMessage[] = [];
+
+  if (opts.system) {
+    messages.push({ role: 'system', content: opts.system });
+  }
+  messages.push({ role: 'user', content: prompt });
+
+  return runAI(env, messages, { maxTokens, temperature }, models);
+}
+
+export async function chatAI(
+  env: Env,
+  messages: AIMessage[],
+  options?: {
+    maxTokens?: number;
+    temperature?: number;
+    smart?: boolean;
+  }
+): Promise<string> {
+  const opts = options ?? {};
+  const maxTokens = opts.maxTokens ?? 800;
+  const temperature = opts.temperature ?? 0.7;
+  const models = opts.smart ? MODELS_SMART : MODELS_CHEAP;
+
+  return runAI(env, messages, { maxTokens, temperature }, models);
+}
+===== END FILE =====
+
+===== FILE: ./src/services/anilist.ts =====
+import { fetchWithRetry } from '../lib/http';
+
+const ANILIST_URL = 'https://graphql.anilist.co';
+
+const ANILIST_QUERY = `
+  query ($search: String) {
+    Media(search: $search, type: ANIME) {
+      id
+      title { romaji english native }
+      coverImage { extraLarge large }
+      description
+      format
+      status
+      seasonYear
+      episodes
+      genres
+      averageScore
+      studios(isMain: true) { nodes { name } }
+      startDate { year month day }
+    }
+  }
+`;
+
+export interface AniListMedia {
+  id: number;
+  title: {
+    romaji: string;
+    english: string | null;
+    native: string | null;
+  };
+  coverImage: {
+    extraLarge: string;
+    large: string;
+  };
+  description: string | null;
+  format: string;
+  status: string;
+  seasonYear: number | null;
+  episodes: number | null;
+  genres: string[];
+  averageScore: number | null;
+  studios: {
+    nodes: { name: string }[];
+  };
+  startDate: {
+    year: number | null;
+    month: number | null;
+    day: number | null;
+  };
+}
+
+interface AniListResponse {
+  data?: {
+    Media: AniListMedia | null;
+  };
+  errors?: {
+    message: string;
+    status?: number;
+  }[];
+}
+
+export async function searchAniList(
+  title: string
+): Promise<AniListMedia | null> {
+  const res = await fetchWithRetry(ANILIST_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      query: ANILIST_QUERY,
+      variables: { search: title },
+    }),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`AniList HTTP ${res.status}: ${errBody.slice(0, 100)}`);
+  }
+
+  const json = (await res.json()) as AniListResponse;
+
+  if (json.errors?.length) {
+    const msg = json.errors[0]?.message ?? 'Unknown GraphQL error';
+    throw new Error(`AniList GraphQL: ${msg}`);
+  }
+
+  return json.data?.Media ?? null;
+}
+===== END FILE =====
+
+===== FILE: ./src/services/animeapi.ts =====
+import { fetchWithRetry } from '../lib/http';
+
+const ANIMEAPI_URL = 'https://animeapi.my.id';
+
+export interface AnimeApiMapping {
+  title: string;
+  anilist: number | null;
+  myanimelist: number | null;
+  kitsu: number | null;
+  anidb: number | null;
+  ann: number | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Mapping ID anime lintas database.
+ * Tidak ada rate limit — bebas panggil.
+ */
+export async function getAnimeMapping(
+  provider: 'myanimelist' | 'anilist' | 'kitsu',
+  id: string | number
+): Promise<AnimeApiMapping | null> {
+  const url = `${ANIMEAPI_URL}/${provider}/${id}`;
+
+  const res = await fetchWithRetry(url, {
+    headers: { Accept: 'application/json' },
+  });
+
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(`AnimeAPI HTTP ${res.status}`);
+  }
+
+  return (await res.json()) as AnimeApiMapping;
+}
+===== END FILE =====
+
+===== FILE: ./src/services/jikan.ts =====
+import { fetchWithRetry } from '../lib/http';
+import type { AniListMedia } from './anilist';
+
+const JIKAN_URL = 'https://api.jikan.moe/v4/anime';
+
+interface JikanAnime {
+  mal_id: number;
+  title: string;
+  title_english: string | null;
+  title_japanese: string | null;
+  synopsis: string | null;
+  images: {
+    jpg: {
+      large_image_url: string;
+      image_url: string;
+    };
+  };
+  type: string | null;
+  status: string | null;
+  year: number | null;
+  episodes: number | null;
+  genres: { name: string }[];
+  score: number | null;
+  studios: { name: string }[];
+  aired: {
+    from: string | null;
+    prop: {
+      from: {
+        year: number | null;
+        month: number | null;
+        day: number | null;
+      };
+    };
+  };
+}
+
+interface JikanResponse {
+  data: JikanAnime[];
+}
+
+/**
+ * Cari anime di Jikan (MyAnimeList) berdasarkan judul.
+ * Jikan unlimited, jadi retry agresif (3x dengan backoff lebih panjang).
+ */
+export async function searchJikan(title: string): Promise<JikanAnime | null> {
+  const url = `${JIKAN_URL}?q=${encodeURIComponent(title)}&limit=1`;
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 3, baseDelay: 2000 }
+  );
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`Jikan HTTP ${res.status}: ${errBody.slice(0, 100)}`);
+  }
+
+  const json = (await res.json()) as JikanResponse;
+  return json.data?.[0] ?? null;
+}
+
+/**
+ * Convert Jikan response ke format AniListMedia.
+ */
+export function jikanToAniList(jikan: JikanAnime): AniListMedia {
+  let status = 'RELEASING';
+  if (jikan.status?.includes('Finished')) status = 'FINISHED';
+  else if (jikan.status?.includes('Not yet')) status = 'NOT_YET_RELEASED';
+  else if (jikan.status?.includes('On Hiatus')) status = 'HIATUS';
+
+  const format = (jikan.type || 'TV').toUpperCase();
+  const averageScore = jikan.score ? Math.round(jikan.score * 10) : null;
+  const cover =
+    jikan.images.jpg.large_image_url || jikan.images.jpg.image_url;
+
+  return {
+    id: jikan.mal_id,
+    title: {
+      romaji: jikan.title,
+      english: jikan.title_english,
+      native: jikan.title_japanese,
+    },
+    coverImage: {
+      extraLarge: cover,
+      large: cover,
+    },
+    description: jikan.synopsis,
+    format,
+    status,
+    seasonYear: jikan.year,
+    episodes: jikan.episodes,
+    genres: jikan.genres.map((g) => g.name),
+    averageScore,
+    studios: {
+      nodes: jikan.studios.map((s) => ({ name: s.name })),
+    },
+    startDate: {
+      year: jikan.aired.prop.from.year,
+      month: jikan.aired.prop.from.month,
+      day: jikan.aired.prop.from.day,
+    },
+  };
+}
+===== END FILE =====
+
+===== FILE: ./src/services/kitsu.ts =====
+import { fetchWithRetry } from '../lib/http';
+import type { AniListMedia } from './anilist';
+
+const KITSU_URL = 'https://kitsu.io/api/edge/anime';
+
+interface KitsuAnime {
+  id: string;
+  attributes: {
+    canonicalTitle: string;
+    titles: {
+      en?: string;
+      en_jp?: string;
+      ja_jp?: string;
+    };
+    posterImage: {
+      large: string;
+      original: string;
+    };
+    subtype: string;
+    status: string;
+    startDate: string | null;
+    episodeCount: number | null;
+    averageRating: string | null;
+    synopsis: string | null;
+  };
+  relationships?: {
+    categories?: { data: { type: string; id: string }[] };
+    studios?: { data: { type: string; id: string }[] };
+  };
+}
+
+interface KitsuIncluded {
+  id: string;
+  type: string;
+  attributes: {
+    title?: string;
+    name?: string;
+  };
+}
+
+interface KitsuResponse {
+  data: KitsuAnime[];
+  included?: KitsuIncluded[];
+}
+
+interface KitsuSearchResult {
+  anime: KitsuAnime;
+  genres: string[];
+  studios: string[];
+}
+
+/**
+ * Cari anime di Kitsu + ambil studio via endpoint terpisah.
+ */
+export async function searchKitsu(
+  title: string
+): Promise<KitsuSearchResult | null> {
+  const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(
+    title
+  )}&include=categories&page[limit]=1`;
+
+  const res = await fetchWithRetry(url, {
+    headers: {
+      Accept: 'application/vnd.api+json',
+      'Content-Type': 'application/vnd.api+json',
+      'User-Agent': 'yukio-bot/1.0',
+    },
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`Kitsu HTTP ${res.status}: ${errBody.slice(0, 100)}`);
+  }
+
+  const json = (await res.json()) as KitsuResponse;
+  const anime = json.data?.[0];
+  if (!anime) return null;
+
+  const included = json.included ?? [];
+
+  // Extract genre dari included
+  const categoryIds = (anime.relationships?.categories?.data ?? []).map(
+    (r) => r.id
+  );
+  const genres = included
+    .filter((i) => i.type === 'categories' && categoryIds.includes(i.id))
+    .map((i) => i.attributes.title)
+    .filter((t): t is string => !!t)
+    .slice(0, 5);
+
+  // Fetch studio terpisah — akurat, tidak perlu AI
+  const studios = await fetchKitsuStudios(anime.id);
+
+  return { anime, genres, studios };
+}
+
+/**
+ * Fetch studio dari endpoint terpisah Kitsu.
+ * Endpoint: /anime/{id}/studios
+ */
+async function fetchKitsuStudios(animeId: string): Promise<string[]> {
+  try {
+    const url = `${KITSU_URL}/${animeId}/studios`;
+    const res = await fetchWithRetry(url, {
+      headers: {
+        Accept: 'application/vnd.api+json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    });
+
+    if (!res.ok) return [];
+
+    const json = (await res.json()) as {
+      data?: { attributes: { name: string } }[];
+    };
+
+    return (json.data ?? [])
+      .map((s) => s.attributes.name)
+      .filter((s) => s && s.trim())
+      .slice(0, 3);
+  } catch (err) {
+    console.warn('[Kitsu] studios fetch failed:', err);
+    return [];
+  }
+}
+
+export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
+  const { anime, genres, studios } = result;
+  const attr = anime.attributes;
+
+  const format = (attr.subtype || 'TV').toUpperCase();
+
+  let status = 'RELEASING';
+  if (attr.status === 'finished') status = 'FINISHED';
+  else if (attr.status === 'upcoming') status = 'NOT_YET_RELEASED';
+  else if (attr.status === 'tba') status = 'NOT_YET_RELEASED';
+  else if (attr.status === 'current') status = 'RELEASING';
+
+  const averageScore = attr.averageRating
+    ? Math.round(parseFloat(attr.averageRating))
+    : null;
+
+  const cover = attr.posterImage.large || attr.posterImage.original || '';
+  const date = attr.startDate ? new Date(attr.startDate) : null;
+
+  return {
+    id: parseInt(anime.id, 10),
+    title: {
+      romaji: attr.titles.en_jp ?? attr.canonicalTitle,
+      english: attr.titles.en ?? null,
+      native: attr.titles.ja_jp ?? null,
+    },
+    coverImage: {
+      extraLarge: cover,
+      large: cover,
+    },
+    description: attr.synopsis ?? null,
+    format,
+    status,
+    seasonYear: date?.getFullYear() ?? null,
+    episodes: attr.episodeCount,
+    genres,
+    averageScore,
+    studios: {
+      nodes: studios.map((name) => ({ name })),
+    },
+    startDate: {
+      year: date?.getFullYear() ?? null,
+      month: date ? date.getMonth() + 1 : null,
+      day: date?.getDate() ?? null,
+    },
+  };
+}
+===== END FILE =====
+
+===== FILE: ./src/types/env.ts =====
+export interface Env {
+  // ────────────────────────────────────────────────────────
+  // Telegram
+  // ────────────────────────────────────────────────────────
+  TELEGRAM_BOT_TOKEN: string;
+
+  // ────────────────────────────────────────────────────────
+  // Admin & Owner
+  // ────────────────────────────────────────────────────────
+  /** User ID Telegram kamu — untuk akses admin commands */
+  ADMIN_USER_ID: string;
+  
+  /** User ID Telegram akun personal — untuk business mode */
+  BUSINESS_OWNER_ID: string;
+
+  // ────────────────────────────────────────────────────────
+  // Cloudflare Bindings
+  // ────────────────────────────────────────────────────────
+  /** D1 Database — cache & chat log */
+  DB: D1Database;
+  
+  /** Workers AI — untuk fitur AI */
+  AI: Ai;
+}
+===== END FILE =====
+
+===== FILE: ./tsconfig.json =====
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["@cloudflare/workers-types"],
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": true,
+
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "noEmit": true,
+    "allowJs": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", ".wrangler"]
+}
+===== END FILE =====
+
+===== FILE: ./wrangler.toml =====
+name = "yukio-bot"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "yukio-db"
+database_id = "8b0b931d-b4f7-41c0-885b-6e90c11c8bb7"
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["0 3 * * *"]
+
+[vars]
+ADMIN_USER_ID = "1605070949"
+BUSINESS_OWNER_ID = "1605070949"
+===== END FILE =====
