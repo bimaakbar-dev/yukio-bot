@@ -2,6 +2,11 @@ import type { CommandDefinition } from './registry';
 import { searchAniList, type AniListMedia } from '../services/anilist';
 import { searchJikan, jikanToAniList } from '../services/jikan';
 import { getCache, setCache } from '../lib/cache';
+import {
+  scrapeMALById,
+  isMALUrl,
+  extractMALId,
+} from '../services/scraper';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -24,10 +29,7 @@ const STATUS_MAP: Record<string, string> = {
 };
 
 function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function pickTitle(media: AniListMedia): string {
@@ -79,9 +81,7 @@ function buildYaml(media: AniListMedia): string {
   const releaseDate = `${y}-${mo}-${d}`;
   const addedAt = new Date().toISOString().split('T')[0];
   const needsQuote = /[:#&*!|>'"%@`{}[\],]/.test(title);
-  const safeTitle = needsQuote
-    ? `"${title.replace(/"/g, '\\"')}"`
-    : title;
+  const safeTitle = needsQuote ? `"${title.replace(/"/g, '\\"')}"` : title;
 
   return `---
 title: ${safeTitle}
@@ -101,18 +101,26 @@ async function fetchMetadata(query: string): Promise<{
   media: AniListMedia;
   source: 'anilist' | 'jikan';
 } | null> {
+  // 1. AniList
   try {
     const media = await searchAniList(query);
     if (media) return { media, source: 'anilist' };
   } catch (err) {
-    console.warn('[Anime] AniList failed:', err);
+    console.warn(
+      '[Anime] AniList failed:',
+      err instanceof Error ? err.message : String(err)
+    );
   }
 
+  // 2. Jikan
   try {
     const jikan = await searchJikan(query);
     if (jikan) return { media: jikanToAniList(jikan), source: 'jikan' };
   } catch (err) {
-    console.warn('[Anime] Jikan failed:', err);
+    console.warn(
+      '[Anime] Jikan failed:',
+      err instanceof Error ? err.message : String(err)
+    );
   }
 
   return null;
@@ -121,7 +129,7 @@ async function fetchMetadata(query: string): Promise<{
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime',
-  usage: '/anime jujutsu kaisen',
+  usage: '/anime jujutsu kaisen\n/anime https://myanimelist.net/anime/40748',
   adminOnly: true,
 
   handler: async (ctx, env) => {
@@ -134,7 +142,8 @@ export const animeCommand: CommandDefinition = {
         'Kasih judul anime-nya.\n\n' +
           '<b>Contoh:</b>\n' +
           '<code>/anime jujutsu kaisen</code>\n\n' +
-          'Atau reply ke pesan yang berisi judul, lalu kirim <code>/anime</code>.',
+          '<b>Atau URL MyAnimeList:</b>\n' +
+          '<code>/anime https://myanimelist.net/anime/40748</code>',
         { parse_mode: 'HTML' }
       );
       return;
@@ -143,27 +152,64 @@ export const animeCommand: CommandDefinition = {
     const loading = await ctx.reply('🔍 Mencari...');
 
     try {
-      const cacheKey = `anime:${query.toLowerCase().trim()}`;
-      let media = await getCache<AniListMedia>(env.DB, cacheKey);
-      const fromCache = !!media;
+      let media: AniListMedia | null = null;
+      let sourceLabel = '';
+      let fromCache = false;
 
-      if (!media) {
-        const result = await fetchMetadata(query);
-        if (!result) {
+      // ─── Mode 1: MAL URL ───
+      if (isMALUrl(query)) {
+        const malId = extractMALId(query);
+        if (!malId) {
           await ctx.api.editMessageText(
             ctx.chat!.id,
             loading.message_id,
-            `❌ Anime "${escapeHtml(query)}" tidak ditemukan.`,
-            { parse_mode: 'HTML' }
+            '❌ URL MyAnimeList tidak valid.'
           );
           return;
         }
 
-        media = result.media;
-        await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
+        media = await scrapeMALById(malId);
+        sourceLabel = '📥 Scraped dari MyAnimeList';
+
+        if (media) {
+          // Cache juga biar bisa di-search nanti
+          const cacheKey = `anime:${pickTitle(media).toLowerCase().trim()}`;
+          await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
+        }
+      }
+      // ─── Mode 2: Judul (cari via API) ───
+      else {
+        const cacheKey = `anime:${query.toLowerCase().trim()}`;
+        media = await getCache<AniListMedia>(env.DB, cacheKey);
+        fromCache = !!media;
+
+        if (!media) {
+          const result = await fetchMetadata(query);
+          if (result) {
+            media = result.media;
+            sourceLabel = `📡 Sumber: ${result.source}`;
+            await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
+          }
+        } else {
+          sourceLabel = '⚡ Dari cache';
+        }
       }
 
-      // Info card
+      // ─── Tidak ketemu ───
+      if (!media) {
+        await ctx.api.editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ Anime "${escapeHtml(query)}" tidak ditemukan.\n\n` +
+            `<i>Coba:</i>\n` +
+            `• Pakai URL MAL langsung\n` +
+            `• Tunggu beberapa menit (API sedang down)`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      // ─── Info card ───
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -171,14 +217,14 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // YAML frontmatter
+      // ─── YAML ───
       const yaml = buildYaml(media);
       await ctx.reply(
         `<b>YAML Frontmatter</b>\n\n<pre><code class="language-yaml">${escapeHtml(yaml)}</code></pre>`,
         { parse_mode: 'HTML' }
       );
 
-      // Cover image
+      // ─── Cover ───
       const cover = media.coverImage.extraLarge || media.coverImage.large;
       if (cover) {
         try {
@@ -188,9 +234,9 @@ export const animeCommand: CommandDefinition = {
         }
       }
 
-      // Cache notice
-      if (fromCache) {
-        await ctx.reply('⚡ Dari cache');
+      // ─── Source label ───
+      if (sourceLabel) {
+        await ctx.reply(sourceLabel);
       }
     } catch (err: any) {
       console.error('[Anime] error:', err);
