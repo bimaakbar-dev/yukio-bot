@@ -21,7 +21,10 @@ function createBot(env: Env): Bot {
   });
 
   registerCommands(bot, env);
+
   setupBusinessHandler(bot, env);
+
+  bot.catch((err) => {
     console.error('[Bot] error:', err.error);
   });
 
