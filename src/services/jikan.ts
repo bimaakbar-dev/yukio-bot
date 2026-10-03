@@ -40,18 +40,21 @@ interface JikanResponse {
 
 /**
  * Cari anime di Jikan (MyAnimeList) berdasarkan judul.
- * Return null kalau tidak ada hasil.
- * Throw error kalau API error.
+ * Jikan unlimited, jadi retry agresif (3x dengan backoff lebih panjang).
  */
 export async function searchJikan(title: string): Promise<JikanAnime | null> {
   const url = `${JIKAN_URL}?q=${encodeURIComponent(title)}&limit=1`;
 
-  const res = await fetchWithRetry(url, {
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'yukio-bot/1.0',
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
     },
-  });
+    { retries: 3, baseDelay: 2000 }
+  );
 
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
@@ -64,7 +67,6 @@ export async function searchJikan(title: string): Promise<JikanAnime | null> {
 
 /**
  * Convert Jikan response ke format AniListMedia.
- * Biar handler tidak perlu bedakan source.
  */
 export function jikanToAniList(jikan: JikanAnime): AniListMedia {
   let status = 'RELEASING';
