@@ -1,9 +1,10 @@
 import type { Env } from '../types/env';
 
 const MODELS = [
-  '@cf/ibm-granite/granite-4.0-h-micro',    
-  '@cf/meta/llama-3.2-1b-instruct',     
-  '@cf/qwen/qwen3-30b-a3b-fp8',              '@cf/meta/llama-3.1-8b-instruct-fp8-fast,
+  '@cf/ibm-granite/granite-4.0-h-micro',
+  '@cf/meta/llama-3.2-1b-instruct',
+  '@cf/qwen/qwen3-30b-a3b-fp8',
+  '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
 ];
 
 interface AIMessage {
@@ -11,10 +12,6 @@ interface AIMessage {
   content: string;
 }
 
-/**
- * Ekstrak string dari response Workers AI.
- * Format response bisa berbeda antar model.
- */
 function extractResponse(res: unknown): string {
   if (!res) return '';
   if (typeof res === 'string') return res;
@@ -31,9 +28,6 @@ function extractResponse(res: unknown): string {
   return '';
 }
 
-/**
- * Coba beberapa model sampai berhasil.
- */
 async function runAI(
   env: Env,
   messages: AIMessage[],
@@ -73,10 +67,6 @@ async function runAI(
   return '';
 }
 
-/**
- * Chat dengan AI — one-shot prompt.
- * Return string kosong kalau error (fail-safe).
- */
 export async function askAI(
   env: Env,
   prompt: string,
@@ -100,9 +90,6 @@ export async function askAI(
   return runAI(env, messages, { maxTokens, temperature });
 }
 
-/**
- * Chat dengan history percakapan (multi-turn).
- */
 export async function chatAI(
   env: Env,
   messages: AIMessage[],
