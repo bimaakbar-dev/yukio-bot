@@ -2,6 +2,7 @@ import type { Env } from '../types/env';
 import { verifyDiscordSignature } from './verify';
 import { handlePing } from './commands/ping';
 import { handleAnime, handleAnimeButton } from './commands/anime';
+import { handleDecode } from './commands/decode';
 
 export interface DiscordInteraction {
   id: string;
@@ -12,6 +13,15 @@ export interface DiscordInteraction {
     name?: string;
     options?: { name: string; value: string | number }[];
     custom_id?: string;
+    resolved?: {
+      attachments?: Record<string, {
+        id: string;
+        url: string;
+        filename: string;
+        size: number;
+        content_type?: string;
+      }>;
+    };
   };
   member?: { user: { id: string; username: string } };
   user?: { id: string; username: string };
@@ -86,6 +96,8 @@ export async function handleDiscordRequest(
         return handlePing(interaction, env);
       case 'anime':
         return handleAnime(interaction, env, ctx);
+      case 'decode':
+  return handleDecode(interaction, env, ctx);
       default:
         return json({
           type: 4,
