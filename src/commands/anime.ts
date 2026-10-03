@@ -1,12 +1,8 @@
 import type { CommandDefinition } from './registry';
 import { searchAniList, type AniListMedia } from '../services/anilist';
 import { searchJikan, jikanToAniList } from '../services/jikan';
+import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { getCache, setCache } from '../lib/cache';
-import {
-  scrapeMALById,
-  isMALUrl,
-  extractMALId,
-} from '../services/scraper';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -97,14 +93,41 @@ episodes: []
 ---`;
 }
 
+/* ==========================================================
+   DETEKSI & EXTRACT MAL URL
+   ========================================================== */
+
+function isMALUrl(s: string): boolean {
+  return /^https?:\/\/(www\.)?myanimelist\.net\/anime\/\d+/i.test(s.trim());
+}
+
+function extractMALId(url: string): string | null {
+  const m = url.match(/myanimelist\.net\/anime\/(\d+)/i);
+  return m?.[1] ?? null;
+}
+
+function extractTitleFromMALUrl(url: string): string | null {
+  // URL: https://myanimelist.net/anime/62811/Kimi_no_Koto_ga_...
+  const m = url.match(/myanimelist\.net\/anime\/\d+\/([^\/\?#]+)/i);
+  if (!m) return null;
+
+  // Decode URL-encoded + replace underscore dengan spasi
+  const slug = decodeURIComponent(m[1]).replace(/_/g, ' ').trim();
+  return slug || null;
+}
+
+/* ==========================================================
+   FETCH METADATA — CHAIN
+   ========================================================== */
+
 async function fetchMetadata(query: string): Promise<{
   media: AniListMedia;
-  source: 'anilist' | 'jikan';
+  source: string;
 } | null> {
   // 1. AniList
   try {
     const media = await searchAniList(query);
-    if (media) return { media, source: 'anilist' };
+    if (media) return { media, source: 'AniList' };
   } catch (err) {
     console.warn(
       '[Anime] AniList failed:',
@@ -115,7 +138,9 @@ async function fetchMetadata(query: string): Promise<{
   // 2. Jikan
   try {
     const jikan = await searchJikan(query);
-    if (jikan) return { media: jikanToAniList(jikan), source: 'jikan' };
+    if (jikan) {
+      return { media: jikanToAniList(jikan), source: 'Jikan (MAL)' };
+    }
   } catch (err) {
     console.warn(
       '[Anime] Jikan failed:',
@@ -123,8 +148,25 @@ async function fetchMetadata(query: string): Promise<{
     );
   }
 
+  // 3. Kitsu
+  try {
+    const kitsu = await searchKitsu(query);
+    if (kitsu) {
+      return { media: kitsuToAniList(kitsu), source: 'Kitsu' };
+    }
+  } catch (err) {
+    console.warn(
+      '[Anime] Kitsu failed:',
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+
   return null;
 }
+
+/* ==========================================================
+   COMMAND
+   ========================================================== */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
@@ -144,7 +186,7 @@ export const animeCommand: CommandDefinition = {
           '<code>/anime jujutsu kaisen</code>\n\n' +
           '<b>Atau URL MyAnimeList:</b>\n' +
           '<code>/anime https://myanimelist.net/anime/40748</code>',
-        { parse_mode: 'HTML' }
+        { parseMode: 'HTML' } as any
       );
       return;
     }
@@ -154,12 +196,16 @@ export const animeCommand: CommandDefinition = {
     try {
       let media: AniListMedia | null = null;
       let sourceLabel = '';
-      let fromCache = false;
+      let searchQuery = query;
 
-      // ─── Mode 1: MAL URL ───
+      // ─── Mode MAL URL: extract judul dari slug ───
       if (isMALUrl(query)) {
         const malId = extractMALId(query);
-        if (!malId) {
+        const titleFromSlug = extractTitleFromMALUrl(query);
+
+        if (titleFromSlug) {
+          searchQuery = titleFromSlug;
+        } else if (!malId) {
           await ctx.api.editMessageText(
             ctx.chat!.id,
             loading.message_id,
@@ -167,31 +213,21 @@ export const animeCommand: CommandDefinition = {
           );
           return;
         }
-
-        media = await scrapeMALById(malId);
-        sourceLabel = '📥 Scraped dari MyAnimeList';
-
-        if (media) {
-          // Cache juga biar bisa di-search nanti
-          const cacheKey = `anime:${pickTitle(media).toLowerCase().trim()}`;
-          await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
-        }
       }
-      // ─── Mode 2: Judul (cari via API) ───
-      else {
-        const cacheKey = `anime:${query.toLowerCase().trim()}`;
-        media = await getCache<AniListMedia>(env.DB, cacheKey);
-        fromCache = !!media;
 
-        if (!media) {
-          const result = await fetchMetadata(query);
-          if (result) {
-            media = result.media;
-            sourceLabel = `📡 Sumber: ${result.source}`;
-            await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
-          }
-        } else {
-          sourceLabel = '⚡ Dari cache';
+      // ─── Cari via cache ───
+      const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
+      media = await getCache<AniListMedia>(env.DB, cacheKey);
+
+      if (media) {
+        sourceLabel = '⚡ Dari cache';
+      } else {
+        // ─── Fetch dari API chain ───
+        const result = await fetchMetadata(searchQuery);
+        if (result) {
+          media = result.media;
+          sourceLabel = `📡 Sumber: ${result.source}`;
+          await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
         }
       }
 
@@ -200,10 +236,11 @@ export const animeCommand: CommandDefinition = {
         await ctx.api.editMessageText(
           ctx.chat!.id,
           loading.message_id,
-          `❌ Anime "${escapeHtml(query)}" tidak ditemukan.\n\n` +
-            `<i>Coba:</i>\n` +
-            `• Pakai URL MAL langsung\n` +
-            `• Tunggu beberapa menit (API sedang down)`,
+          `❌ Anime "<b>${escapeHtml(searchQuery)}</b>" tidak ditemukan.\n\n` +
+            `<i>Kemungkinan:</i>\n` +
+            `• Judul tidak ada di database\n` +
+            `• Semua API sedang down (AniList/Jikan/Kitsu)\n\n` +
+            `<i>Coba lagi nanti.</i>`,
           { parse_mode: 'HTML' }
         );
         return;
