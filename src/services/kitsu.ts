@@ -1,5 +1,5 @@
 import { fetchWithRetry } from '../lib/http';
-import type { AniListMedia } from './anilist';
+import type { AniListMedia } from '../types/anime';
 
 const KITSU_URL = 'https://kitsu.io/api/edge/anime';
 
@@ -74,12 +74,13 @@ export async function searchKitsu(
   const included = Array.isArray(json.included) ? json.included : [];
 
   const categoryIds = (anime.relationships?.categories?.data ?? []).map(
-    (r) => r.id
+    (r): string => r.id
   );
-  const genres = included
-    .filter((i) => i.type === 'categories' && categoryIds.includes(i.id))
-    .map((i) => i.attributes?.title)
-    .filter((t): t is string => typeof t === 'string' && t.length > 0)
+
+  const genres: string[] = included
+    .filter((i): boolean => i.type === 'categories' && categoryIds.includes(i.id))
+    .map((i): string => i.attributes?.title ?? '')
+    .filter((t: string): boolean => t.length > 0)
     .slice(0, 5);
 
   return { anime, genres };
