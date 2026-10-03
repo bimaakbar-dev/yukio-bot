@@ -6,29 +6,29 @@ const JIKAN_URL = 'https://api.jikan.moe/v4/anime';
 interface JikanAnime {
   mal_id: number;
   title: string;
-  title_english: string | null;
-  title_japanese: string | null;
-  synopsis: string | null;
-  images: {
-    jpg: {
-      large_image_url: string;
-      image_url: string;
+  title_english?: string | null;
+  title_japanese?: string | null;
+  synopsis?: string | null;
+  images?: {
+    jpg?: {
+      large_image_url?: string;
+      image_url?: string;
     };
   };
-  type: string | null;
-  status: string | null;
-  year: number | null;
-  episodes: number | null;
-  genres: { name: string }[];
-  score: number | null;
-  studios: { name: string }[];
-  aired: {
-    from: string | null;
-    prop: {
-      from: {
-        year: number | null;
-        month: number | null;
-        day: number | null;
+  type?: string | null;
+  status?: string | null;
+  year?: number | null;
+  episodes?: number | null;
+  genres?: { name: string }[];
+  score?: number | null;
+  studios?: { name: string }[];
+  aired?: {
+    from?: string | null;
+    prop?: {
+      from?: {
+        year?: number | null;
+        month?: number | null;
+        day?: number | null;
       };
     };
   };
@@ -45,11 +45,11 @@ export async function searchJikan(title: string): Promise<JikanAnime | null> {
     url,
     {
       headers: {
-        'Accept': 'application/json',
+        Accept: 'application/json',
         'User-Agent': 'yukio-bot/1.0',
       },
     },
-    { retries: 0, baseDelay: 4000 }
+    { retries: 0, timeout: 4000 }
   );
 
   if (!res.ok) {
@@ -69,34 +69,50 @@ export function jikanToAniList(jikan: JikanAnime): AniListMedia {
 
   const format = (jikan.type || 'TV').toUpperCase();
   const averageScore = jikan.score ? Math.round(jikan.score * 10) : null;
+
   const cover =
-    jikan.images.jpg.large_image_url || jikan.images.jpg.image_url;
+    jikan.images?.jpg?.large_image_url ||
+    jikan.images?.jpg?.image_url ||
+    '';
+
+  const genres = Array.isArray(jikan.genres)
+    ? jikan.genres
+        .map((g) => g?.name)
+        .filter((n): n is string => typeof n === 'string' && n.length > 0)
+    : [];
+
+  const studios = Array.isArray(jikan.studios)
+    ? jikan.studios
+        .map((s) => s?.name)
+        .filter((n): n is string => typeof n === 'string' && n.length > 0)
+        .map((name) => ({ name }))
+    : [];
+
+  const from = jikan.aired?.prop?.from;
 
   return {
     id: jikan.mal_id,
     title: {
-      romaji: jikan.title,
-      english: jikan.title_english,
-      native: jikan.title_japanese,
+      romaji: jikan.title ?? 'Unknown',
+      english: jikan.title_english ?? null,
+      native: jikan.title_japanese ?? null,
     },
     coverImage: {
       extraLarge: cover,
       large: cover,
     },
-    description: jikan.synopsis,
+    description: jikan.synopsis ?? null,
     format,
     status,
-    seasonYear: jikan.year,
-    episodes: jikan.episodes,
-    genres: jikan.genres.map((g) => g.name),
+    seasonYear: jikan.year ?? null,
+    episodes: jikan.episodes ?? null,
+    genres,
     averageScore,
-    studios: {
-      nodes: jikan.studios.map((s) => ({ name: s.name })),
-    },
+    studios: { nodes: studios },
     startDate: {
-      year: jikan.aired.prop.from.year,
-      month: jikan.aired.prop.from.month,
-      day: jikan.aired.prop.from.day,
+      year: from?.year ?? null,
+      month: from?.month ?? null,
+      day: from?.day ?? null,
     },
   };
 }
