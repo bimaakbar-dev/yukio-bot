@@ -8,8 +8,7 @@ export const aiCommand: CommandDefinition = {
   adminOnly: true,
 
   handler: async (ctx, env) => {
-    // Ambil prompt dari arg atau dari pesan yang di-reply
-    const argPrompt = ctx.match?.trim() ?? '';
+    const argPrompt = typeof ctx.match === 'string' ? ctx.match.trim() : '';
     const repliedText = ctx.message?.reply_to_message?.text ?? '';
     const prompt = argPrompt || repliedText;
 
@@ -45,7 +44,6 @@ export const aiCommand: CommandDefinition = {
         return;
       }
 
-      // Split kalau response > 4000 char (limit Telegram 4096)
       const MAX_MSG_LEN = 4000;
 
       if (response.length <= MAX_MSG_LEN) {
@@ -55,7 +53,6 @@ export const aiCommand: CommandDefinition = {
           response
         );
       } else {
-        // Edit loading dengan bagian pertama
         const firstPart = response.slice(0, MAX_MSG_LEN);
         await ctx.api.editMessageText(
           ctx.chat!.id,
@@ -63,7 +60,6 @@ export const aiCommand: CommandDefinition = {
           firstPart
         );
 
-        // Kirim sisanya sebagai pesan baru
         let remaining = response.slice(MAX_MSG_LEN);
         while (remaining.length > 0) {
           const chunk = remaining.slice(0, MAX_MSG_LEN);
