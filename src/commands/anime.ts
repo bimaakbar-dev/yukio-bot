@@ -1,5 +1,5 @@
 import type { CommandDefinition } from './registry';
-import type { Context, Bot } from 'grammy';
+import type { Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../services/anilist';
 import { searchAniList } from '../services/anilist';
@@ -12,7 +12,7 @@ import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const AI_TIMEOUT_MS = 3000;
+const AI_TIMEOUT_MS = 5000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
@@ -216,6 +216,17 @@ function stripHtml(s: string): string {
     .trim();
 }
 
+/** Pilih value pertama yang "ada" (bukan null/undefined/empty string/empty array). */
+function pick<T>(...values: (T | null | undefined)[]): T | null {
+  for (const v of values) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === 'string' && v.trim() === '') continue;
+    if (Array.isArray(v) && v.length === 0) continue;
+    return v;
+  }
+  return null;
+}
+
 /* ═══════════════════════════════════════════════
    AI ENRICHMENT
    ═══════════════════════════════════════════════ */
@@ -297,13 +308,13 @@ async function enrichWithAI(
     console.log(`[Anime] AI raw response len: ${raw?.length ?? 0}`);
 
     if (!raw || raw.length === 0) {
-      console.warn('[Anime] AI returned empty');
+      console.warn('[Anime] AI returned empty — STOP (no retry)');
       return null;
     }
 
     const parsed = extractJson(raw);
     if (!parsed || typeof parsed !== 'object') {
-      console.warn('[Anime] AI parse failed, raw head:', raw.slice(0, 200));
+      console.warn('[Anime] AI parse failed — STOP (no retry)');
       return null;
     }
 
@@ -322,11 +333,15 @@ async function enrichWithAI(
 
     return out;
   } catch (err) {
-    console.error('[Anime] AI enrich failed:', err);
+    console.error('[Anime] AI enrich failed — STOP (no retry):', err);
     return null;
   }
 }
 
+/**
+ * Bungkus enrichWithAI dengan timeout.
+ * Panggil SEKALI saja — kalau gagal, STOP. Tidak retry.
+ */
 async function enrichWithAITimeout(
   env: Env,
   title: string,
@@ -340,18 +355,21 @@ async function enrichWithAITimeout(
 ): Promise<Enriched | null> {
   if (need.length === 0) return null;
 
-  console.log('[Anime] AI enrich starting...');
+  console.log('[Anime] AI enrich starting (single attempt)...');
 
   return Promise.race([
     enrichWithAI(env, title, existing, need),
     new Promise<Enriched | null>((resolve) => {
       setTimeout(() => {
-        console.warn(`[Anime] AI timeout after ${AI_TIMEOUT_MS}ms`);
+        console.warn(`[Anime] AI timeout after ${AI_TIMEOUT_MS}ms — STOP`);
         resolve(null);
       }, AI_TIMEOUT_MS);
     }),
   ]).then((result) => {
-    console.log('[Anime] AI enrich result:', result ? 'got data' : 'null');
+    console.log(
+      '[Anime] AI enrich result:',
+      result ? 'got data' : 'null (fail, no retry)'
+    );
     return result;
   });
 }
@@ -521,73 +539,180 @@ function extractTitleFromMALUrl(url: string): string | null {
 }
 
 /* ═══════════════════════════════════════════════
-   FETCH CHAIN: Kitsu → Jikan → AniList → Shikimori
+   PARALLEL FETCH + MERGE
    ═══════════════════════════════════════════════ */
 
-async function fetchMetadata(query: string): Promise<{
+async function fetchAndMerge(query: string): Promise<{
   media: AniListMedia;
-  source: string;
+  sources: string[];
 } | null> {
-  const errors: string[] = [];
+  const t0 = Date.now();
 
-  // 1. Kitsu — primary, reliable dari Cloudflare Worker
-  const t1 = Date.now();
-  try {
-    const kitsu = await searchKitsu(query);
-    if (kitsu) {
-      console.log(`[Anime] Kitsu OK in ${Date.now() - t1}ms`);
-      return { media: kitsuToAniList(kitsu), source: 'Kitsu' };
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`Kitsu: ${msg}`);
-    console.warn(`[Anime] Kitsu failed in ${Date.now() - t1}ms:`, msg);
-  }
+  const [kitsuR, jikanR, anilistR, shikimoriR] = await Promise.allSettled([
+    searchKitsu(query),
+    searchJikan(query),
+    searchAniList(query),
+    searchShikimori(query),
+  ]);
 
-  // 2. Jikan (MAL)
-  const t2 = Date.now();
-  try {
-    const jikan = await searchJikan(query);
-    if (jikan) {
-      console.log(`[Anime] Jikan OK in ${Date.now() - t2}ms`);
-      return { media: jikanToAniList(jikan), source: 'Jikan (MAL)' };
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`Jikan: ${msg}`);
-    console.warn(`[Anime] Jikan failed in ${Date.now() - t2}ms:`, msg);
-  }
+  const kitsu =
+    kitsuR.status === 'fulfilled' && kitsuR.value
+      ? kitsuToAniList(kitsuR.value)
+      : null;
+  const jikan =
+    jikanR.status === 'fulfilled' && jikanR.value
+      ? jikanToAniList(jikanR.value)
+      : null;
+  const anilist =
+    anilistR.status === 'fulfilled' && anilistR.value ? anilistR.value : null;
+  const shikimori =
+    shikimoriR.status === 'fulfilled' && shikimoriR.value
+      ? shikimoriToAniList(shikimoriR.value)
+      : null;
 
-  // 3. AniList
-  const t3 = Date.now();
-  try {
-    const anilist = await searchAniList(query);
-    if (anilist) {
-      console.log(`[Anime] AniList OK in ${Date.now() - t3}ms`);
-      return { media: anilist, source: 'AniList' };
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`AniList: ${msg}`);
-    console.warn(`[Anime] AniList failed in ${Date.now() - t3}ms:`, msg);
-  }
+  const sources: string[] = [];
+  if (kitsu) sources.push('Kitsu');
+  if (jikan) sources.push('Jikan');
+  if (anilist) sources.push('AniList');
+  if (shikimori) sources.push('Shikimori');
 
-  // 4. Shikimori
-  const t4 = Date.now();
-  try {
-    const shiki = await searchShikimori(query);
-    if (shiki) {
-      console.log(`[Anime] Shikimori OK in ${Date.now() - t4}ms`);
-      return { media: shikimoriToAniList(shiki), source: 'Shikimori' };
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`Shikimori: ${msg}`);
-    console.warn(`[Anime] Shikimori failed in ${Date.now() - t4}ms:`, msg);
-  }
+  console.log(
+    `[Anime] parallel fetch done in ${Date.now() - t0}ms — sources: [${
+      sources.join(', ') || 'none'
+    }]`
+  );
 
-  console.warn('[Anime] All APIs failed:', errors);
-  return null;
+  if (sources.length === 0) return null;
+
+  // ─── Merge: prioritas per field ───
+  const merged: AniListMedia = {
+    id: anilist?.id ?? jikan?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
+
+    title: {
+      romaji:
+        pick(
+          kitsu?.title.romaji,
+          anilist?.title.romaji,
+          jikan?.title.romaji,
+          shikimori?.title.romaji
+        ) ?? 'Unknown',
+      english: pick(
+        kitsu?.title.english,
+        anilist?.title.english,
+        jikan?.title.english,
+        shikimori?.title.english
+      ),
+      native: pick(
+        kitsu?.title.native,
+        anilist?.title.native,
+        jikan?.title.native,
+        shikimori?.title.native
+      ),
+    },
+
+    coverImage: {
+      extraLarge:
+        pick(
+          anilist?.coverImage.extraLarge,
+          kitsu?.coverImage.extraLarge,
+          jikan?.coverImage.extraLarge,
+          shikimori?.coverImage.extraLarge
+        ) ?? '',
+      large:
+        pick(
+          anilist?.coverImage.large,
+          kitsu?.coverImage.large,
+          jikan?.coverImage.large,
+          shikimori?.coverImage.large
+        ) ?? '',
+    },
+
+    // AniList description paling bagus formatnya; Jikan/Kitsu sebagai fallback
+    description: pick(
+      anilist?.description,
+      jikan?.description,
+      kitsu?.description
+    ),
+
+    format: pick(
+      anilist?.format,
+      jikan?.format,
+      kitsu?.format,
+      shikimori?.format
+    ) ?? 'TV',
+
+    status: pick(
+      anilist?.status,
+      jikan?.status,
+      kitsu?.status,
+      shikimori?.status
+    ) ?? 'RELEASING',
+
+    seasonYear: pick(
+      anilist?.seasonYear,
+      jikan?.seasonYear,
+      kitsu?.seasonYear,
+      shikimori?.seasonYear
+    ),
+
+    episodes: pick(
+      anilist?.episodes,
+      jikan?.episodes,
+      kitsu?.episodes,
+      shikimori?.episodes
+    ),
+
+    // AniList genre paling lengkap
+    genres:
+      pick(
+        anilist?.genres,
+        jikan?.genres,
+        kitsu?.genres,
+        shikimori?.genres
+      ) ?? [],
+
+    // AniList score 0-100 (base), Jikan/Kitsu 0-100 (sudah dikonversi)
+    averageScore: pick(
+      anilist?.averageScore,
+      jikan?.averageScore,
+      kitsu?.averageScore,
+      shikimori?.averageScore
+    ),
+
+    // Studio: Jikan (MAL) paling akurat, lalu AniList, lalu Kitsu, lalu Shikimori
+    studios: {
+      nodes:
+        pick(
+          jikan?.studios.nodes,
+          anilist?.studios.nodes,
+          kitsu?.studios.nodes,
+          shikimori?.studios.nodes
+        ) ?? [],
+    },
+
+    startDate: {
+      year: pick(
+        anilist?.startDate.year,
+        jikan?.startDate.year,
+        kitsu?.startDate.year,
+        shikimori?.startDate.year
+      ),
+      month: pick(
+        anilist?.startDate.month,
+        jikan?.startDate.month,
+        kitsu?.startDate.month,
+        shikimori?.startDate.month
+      ),
+      day: pick(
+        anilist?.startDate.day,
+        jikan?.startDate.day,
+        kitsu?.startDate.day,
+        shikimori?.startDate.day
+      ),
+    },
+  };
+
+  return { media: merged, sources };
 }
 
 /* ═══════════════════════════════════════════════
@@ -666,10 +791,10 @@ export const animeCommand: CommandDefinition = {
         sourceLabel = '⚡ Dari cache';
         console.log(`[Anime] cache hit at ${Date.now() - T0}ms`);
       } else {
-        const result = await fetchMetadata(searchQuery);
+        const result = await fetchAndMerge(searchQuery);
         if (result) {
           media = result.media;
-          sourceLabel = `📡 Sumber: ${result.source}`;
+          sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
           await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
         }
         console.log(`[Anime] fetch stage done at ${Date.now() - T0}ms`);
@@ -696,7 +821,8 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      const need = detectMissing(media);
+      let need = detectMissing(media);
+      console.log(`[Anime] missing after merge: [${need.join(', ') || 'none'}]`);
 
       let enriched: Enriched | null = null;
 
@@ -706,6 +832,7 @@ export const animeCommand: CommandDefinition = {
           { parse_mode: 'HTML' }
         );
 
+        // Panggil AI SEKALI — kalau gagal, STOP, tidak retry
         enriched = await enrichWithAITimeout(
           env,
           pickTitle(media),
@@ -725,6 +852,12 @@ export const animeCommand: CommandDefinition = {
           .catch(() => {});
 
         console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
+
+        if (!enriched) {
+          console.warn(
+            '[Anime] AI failed or timeout — lanjut tanpa AI (no retry)'
+          );
+        }
       } else {
         console.log('[Anime] no AI needed — skipping');
       }
