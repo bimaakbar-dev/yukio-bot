@@ -10,7 +10,7 @@ const COMMANDS = [
     description: 'Cari metadata anime',
     options: [
       {
-        name: 'query',
+        name: 'search',
         description: 'Judul anime atau URL MyAnimeList',
         type: 3,
         required: true,
