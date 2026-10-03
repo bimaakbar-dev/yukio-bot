@@ -5,6 +5,7 @@ import { setupBusinessHandler } from './business/autoReply';
 import { cleanupCache } from './lib/cache';
 import { isAdmin } from './lib/permissions';
 import { handleDocumentAuto } from './commands/decode';
+import { setupAnimeCallbacks } from './commands/anime';
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
@@ -23,6 +24,7 @@ function createBot(env: Env): Bot {
 
   registerCommands(bot, env);
   setupBusinessHandler(bot, env);
+  setupAnimeCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
