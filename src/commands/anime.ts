@@ -1,5 +1,5 @@
 import type { CommandDefinition } from './registry';
-import { searchAniList, type AniListMedia } from '../services/anilist';
+import type { AniListMedia } from '../services/anilist';
 import { searchJikan, jikanToAniList } from '../services/jikan';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { getCache, setCache } from '../lib/cache';
@@ -73,6 +73,16 @@ function stripHtml(s: string): string {
     .trim();
 }
 
+function isEnglish(text: string): boolean {
+  const lower = text.toLowerCase();
+  const engWords = [
+    ' the ', ' is ', ' and ', ' of ', ' to ', ' a ', ' in ',
+    ' that ', ' with ', ' his ', ' her ',
+  ];
+  const matches = engWords.filter((w) => lower.includes(w)).length;
+  return matches >= 3;
+}
+
 /* ═══════════════════════════════════════════════
    AI ENRICHMENT
    ═══════════════════════════════════════════════ */
@@ -83,12 +93,9 @@ interface Enriched {
   synopsis?: string | null;
   genre?: string[] | null;
   releaseDate?: string | null;
-  type?: string | null;
-  status?: string | null;
 }
 
 function extractJson(text: string): unknown {
-  // AI kadang bungkus dengan ```json ... ``` atau penjelasan
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = fenced?.[1] ?? text;
   const start = candidate.indexOf('{');
@@ -109,7 +116,6 @@ async function enrichWithAI(
     rating?: number | null;
     genre?: string[] | null;
     releaseDate?: string | null;
-    synopsis?: string | null;
   },
   need: string[]
 ): Promise<Enriched | null> {
@@ -143,16 +149,31 @@ async function enrichWithAI(
     `- If unsure, use null\n` +
     `- Output valid JSON only`;
 
+  console.log(
+    `[Anime] AI enrich — need: [${need.join(', ')}], prompt len: ${prompt.length}`
+  );
+
   try {
     const raw = await chatAI(
       env,
       [{ role: 'user', content: prompt }],
       { maxTokens: 900, temperature: 0.2 }
     );
-    if (!raw) return null;
+
+    console.log(`[Anime] AI raw response len: ${raw?.length ?? 0}`);
+
+    if (!raw || raw.length === 0) {
+      console.warn('[Anime] AI returned empty');
+      return null;
+    }
 
     const parsed = extractJson(raw);
-    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed || typeof parsed !== 'object') {
+      console.warn('[Anime] AI parse failed, raw head:', raw.slice(0, 200));
+      return null;
+    }
+
+    console.log('[Anime] AI parsed:', JSON.stringify(parsed).slice(0, 300));
 
     const obj = parsed as Record<string, unknown>;
     const out: Enriched = {};
@@ -167,7 +188,7 @@ async function enrichWithAI(
 
     return out;
   } catch (err) {
-    console.warn('[Anime] AI enrich failed:', err);
+    console.error('[Anime] AI enrich failed:', err);
     return null;
   }
 }
@@ -193,26 +214,22 @@ function buildResult(
   const title = pickTitle(media);
   if (!title || title === 'Unknown') missing.push('title');
 
-  // Cover
   let cover = media.coverImage.extraLarge || media.coverImage.large || '';
   if (!cover || !isValidHttpUrl(cover)) {
     cover = 'https://placehold.co/400x600?text=No+Cover';
     missing.push('cover');
   }
 
-  // Status
   let status: AnimeStatus = 'Ongoing';
   const mappedStatus = STATUS_MAP[media.status];
   if (mappedStatus) status = mappedStatus;
   else missing.push('status');
 
-  // Type
   let type: AnimeType = 'TV';
   const mappedType = FORMAT_MAP[media.format];
   if (mappedType) type = mappedType;
   else missing.push('type');
 
-  // Genre
   let genres = (media.genres ?? []).filter((g) => g && g.trim());
   if (genres.length === 0 && enriched?.genre?.length) {
     genres = enriched.genre;
@@ -224,7 +241,6 @@ function buildResult(
   }
   const genreYaml = `[${genres.map((g) => yamlString(g)).join(', ')}]`;
 
-  // Studio
   let studio = media.studios?.nodes?.[0]?.name ?? '';
   if (!studio || studio === 'Unknown') {
     if (enriched?.studio) {
@@ -236,7 +252,6 @@ function buildResult(
     }
   }
 
-  // Release date
   const y = media.startDate?.year ?? media.seasonYear;
   const mo = media.startDate?.month;
   const d = media.startDate?.day;
@@ -244,7 +259,10 @@ function buildResult(
 
   if (y && mo && d) {
     releaseDate = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  } else if (enriched?.releaseDate && /^\d{4}-\d{2}-\d{2}$/.test(enriched.releaseDate)) {
+  } else if (
+    enriched?.releaseDate &&
+    /^\d{4}-\d{2}-\d{2}$/.test(enriched.releaseDate)
+  ) {
     releaseDate = enriched.releaseDate;
     aiUsed.push('releaseDate');
   } else if (y) {
@@ -257,7 +275,6 @@ function buildResult(
 
   const addedAt = new Date().toISOString().split('T')[0] ?? '2026-01-01';
 
-  // Rating
   let rating: string;
   if (typeof media.averageScore === 'number' && media.averageScore > 0) {
     rating = (media.averageScore / 10).toFixed(1);
@@ -269,7 +286,6 @@ function buildResult(
     missing.push('rating');
   }
 
-  // YAML
   const lines: string[] = [];
   lines.push('---');
   lines.push(`title: ${yamlString(title)}`);
@@ -285,7 +301,6 @@ function buildResult(
   lines.push('---');
   const yaml = lines.join('\n');
 
-  // Body: synopsis
   let synopsisRaw = media.description ?? null;
   if (synopsisRaw) synopsisRaw = stripHtml(synopsisRaw);
 
@@ -351,7 +366,7 @@ function extractTitleFromMALUrl(url: string): string | null {
 }
 
 /* ═══════════════════════════════════════════════
-   FETCH CHAIN
+   FETCH CHAIN (Jikan → Kitsu, tanpa AniList)
    ═══════════════════════════════════════════════ */
 
 async function fetchMetadata(query: string): Promise<{
@@ -360,17 +375,7 @@ async function fetchMetadata(query: string): Promise<{
 } | null> {
   const errors: string[] = [];
 
-  // 1. AniList
-  try {
-    const media = await searchAniList(query);
-    if (media) return { media, source: 'AniList' };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    errors.push(`AniList: ${msg}`);
-    console.warn('[Anime] AniList failed:', msg);
-  }
-
-  // 2. Jikan
+  // 1. Jikan (MAL) — data paling lengkap, unlimited
   try {
     const jikan = await searchJikan(query);
     if (jikan) {
@@ -382,7 +387,7 @@ async function fetchMetadata(query: string): Promise<{
     console.warn('[Anime] Jikan failed:', msg);
   }
 
-  // 3. Kitsu
+  // 2. Kitsu — reliable fallback
   try {
     const kitsu = await searchKitsu(query);
     if (kitsu) {
@@ -394,17 +399,15 @@ async function fetchMetadata(query: string): Promise<{
     console.warn('[Anime] Kitsu failed:', msg);
   }
 
-  if (errors.length > 0) {
-    console.warn('[Anime] All APIs failed:', errors);
-  }
+  console.warn('[Anime] All APIs failed:', errors);
   return null;
 }
 
 /* ═══════════════════════════════════════════════
-   DETECT MISSING FIELDS UNTUK AI
+   DETECT MISSING UNTUK AI
    ═══════════════════════════════════════════════ */
 
-function detectMissing(media: AniListMedia): string[] {
+function detectMissing(media: AniListMedia, source: string): string[] {
   const need: string[] = [];
 
   const studio = media.studios?.nodes?.[0]?.name;
@@ -422,7 +425,12 @@ function detectMissing(media: AniListMedia): string[] {
   if (!media.startDate?.year && !media.seasonYear) need.push('releaseDate');
 
   const desc = media.description ?? '';
-  if (!desc || stripHtml(desc).length < 50) need.push('synopsis');
+  const cleanDesc = stripHtml(desc);
+  if (!cleanDesc || cleanDesc.length < 50) {
+    need.push('synopsis');
+  } else if (isEnglish(cleanDesc) && source !== 'AniList') {
+    need.push('synopsis');
+  }
 
   return need;
 }
@@ -496,7 +504,7 @@ export const animeCommand: CommandDefinition = {
         return;
       }
 
-      // ─── Info card ───
+      // Info card
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -504,8 +512,11 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // ─── Deteksi field kosong ───
-      const need = detectMissing(media);
+      // Deteksi field kosong
+      const sourceName = sourceLabel
+        .replace(/^📡 Sumber: /, '')
+        .replace(/^⚡ Dari cache$/, '');
+      const need = detectMissing(media, sourceName);
 
       let enriched: Enriched | null = null;
       if (need.length > 0) {
@@ -524,7 +535,6 @@ export const animeCommand: CommandDefinition = {
             releaseDate: media.startDate?.year
               ? `${media.startDate.year}-01-01`
               : null,
-            synopsis: media.description,
           },
           need
         );
@@ -534,10 +544,10 @@ export const animeCommand: CommandDefinition = {
           .catch(() => {});
       }
 
-      // ─── Build result ───
+      // Build result
       const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
 
-      // ─── Warning ───
+      // Warning
       const warnLines: string[] = [];
       if (missing.length > 0) {
         warnLines.push('⚠️ <b>Perlu edit manual:</b>');
@@ -559,23 +569,25 @@ export const animeCommand: CommandDefinition = {
         });
       }
 
-      // ─── YAML ───
+      // YAML
       await ctx.reply(
         `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(yaml)}</pre>`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // ─── Body / Synopsis ───
+      // Body
       const bodyMax = 3500;
       const bodyPreview =
-        body.length > bodyMax ? body.slice(0, bodyMax) + '\n\n… [truncated]' : body;
+        body.length > bodyMax
+          ? body.slice(0, bodyMax) + '\n\n… [truncated]'
+          : body;
 
       await ctx.reply(
         `📝 <b>Body (Sinopsis)</b>\n\n<pre>${escapeHtml(bodyPreview)}</pre>`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      // ─── Cover ───
+      // Cover
       const cover = media.coverImage.extraLarge || media.coverImage.large;
       if (cover && isValidHttpUrl(cover)) {
         try {
