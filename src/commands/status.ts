@@ -8,9 +8,6 @@ export const statusCommand: CommandDefinition = {
     const loading = await ctx.reply('📊 Mengumpulkan stats...');
 
     try {
-      // ────────────────────────────────────────────────────
-      // Cache stats
-      // ────────────────────────────────────────────────────
       const now = Date.now();
 
       const cacheActive = await env.DB
@@ -23,9 +20,6 @@ export const statusCommand: CommandDefinition = {
         .bind(now)
         .first<{ count: number }>();
 
-      // ────────────────────────────────────────────────────
-      // Business chats stats
-      // ────────────────────────────────────────────────────
       const chatsTotal = await env.DB
         .prepare('SELECT COUNT(*) as count FROM business_chats')
         .first<{ count: number }>()
@@ -39,13 +33,6 @@ export const statusCommand: CommandDefinition = {
         .first<{ count: number }>()
         .catch(() => ({ count: 0 }));
 
-      // ────────────────────────────────────────────────────
-      // Format output
-      // ────────────────────────────────────────────────────
-      const uptime = process.uptime?.() ?? 0; // Workers tidak punya uptime persisten
-      const mem = (performance as any).memory?.usedJSHeapSize;
-      const memMB = mem ? (mem / 1024 / 1024).toFixed(2) : 'N/A';
-
       const msg =
         `📊 <b>Yukio Bot Status</b>\n\n` +
         `<b>Cache</b>\n` +
@@ -56,7 +43,6 @@ export const statusCommand: CommandDefinition = {
         `  📅 24 jam terakhir: ${chatsToday?.count ?? 0}\n\n` +
         `<b>Runtime</b>\n` +
         `  🌐 Platform: Cloudflare Workers\n` +
-        `  💾 Memory: ${memMB} MB\n` +
         `  🕐 Server: ${new Date().toISOString()}`;
 
       await ctx.api.editMessageText(
