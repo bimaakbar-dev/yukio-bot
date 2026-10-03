@@ -1,5 +1,5 @@
 import type { CommandDefinition } from './registry';
-import { COMMANDS } from './registry';
+import { COMMANDS } from './list';
 import { isAdmin } from '../lib/permissions';
 
 export const helpCommand: CommandDefinition = {
@@ -8,15 +8,11 @@ export const helpCommand: CommandDefinition = {
   handler: async (ctx, env) => {
     const admin = isAdmin(ctx.from?.id, env);
 
-    // Header
     let msg = '🤖 <b>Yukio Bot</b>\n';
     msg += '<i>Personal assistant — admin only</i>\n\n';
-
-    // List command yang user boleh lihat
     msg += '<b>Commands</b>\n';
 
     for (const cmd of COMMANDS) {
-      // Skip command admin-only kalau user bukan admin
       if (cmd.adminOnly && !admin) continue;
 
       msg += `\n<code>/${cmd.name}</code>\n`;
@@ -27,7 +23,6 @@ export const helpCommand: CommandDefinition = {
       }
     }
 
-    // Footer
     msg += '\n';
     if (!admin) {
       msg += '<i>Beberapa command memerlukan akses admin.</i>';
