@@ -2866,7 +2866,8 @@ import { helpCommand } from './help';
 import { statusCommand } from './status';
 import { animeCommand } from './anime';
 import { aiCommand } from './ai';
-import { clearcacheCommand } from './clearcache';   // ← TAMBAH
+import { clearcacheCommand } from './clearcache';
+import { decodeCommand } from './decode'; 
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -2874,7 +2875,8 @@ export const COMMANDS: CommandDefinition[] = [
   statusCommand,
   animeCommand,
   aiCommand,
-  clearcacheCommand,   // ← TAMBAH
+  clearcacheCommand,
+  decodeCommand,
 ];
 ===== END FILE =====
 
@@ -3704,4 +3706,4 @@ ADMIN_USER_ID = "1605070949"
 BUSINESS_OWNER_ID = "1605070949"
 ===== END FILE =====
 
-=== SNAPSHOT SELESAI: Sat Oct  3 09:41:08 UTC 2026 ===
+=== SNAPSHOT SELESAI: Sat Oct  3 09:41:43 UTC 2026 ===
