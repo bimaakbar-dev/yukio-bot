@@ -23,6 +23,10 @@ const STATUS_MAP: Record<string, AnimeStatus> = {
   CANCELLED: 'Hiatus', HIATUS: 'Hiatus',
 };
 
+/* ═══════════════════════════════════════════════
+   DB
+   ═══════════════════════════════════════════════ */
+
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
 
@@ -61,12 +65,8 @@ async function saveSession(
   db: D1Database,
   userId: number,
   data: {
-    yaml: string;
-    body: string;
-    missing: string[];
-    aiUsed: string[];
-    cover: string | null;
-    sourceLabel: string | null;
+    yaml: string; body: string; missing: string[]; aiUsed: string[];
+    cover: string | null; sourceLabel: string | null;
   }
 ): Promise<string> {
   await ensureDb(db);
@@ -87,25 +87,15 @@ async function saveSession(
 }
 
 interface SessionRow {
-  session_id: string;
-  user_id: number;
-  yaml: string;
-  body: string;
-  missing: string;
-  ai_used: string;
-  cover: string | null;
-  source_label: string | null;
-  expires_at: number;
+  session_id: string; user_id: number; yaml: string; body: string;
+  missing: string; ai_used: string; cover: string | null;
+  source_label: string | null; expires_at: number;
 }
 
-async function getSession(
-  db: D1Database,
-  sessionId: string
-): Promise<SessionRow | null> {
+async function getSession(db: D1Database, sessionId: string): Promise<SessionRow | null> {
   await ensureDb(db);
-  const row = await db.prepare(
-    'SELECT * FROM temp_anime WHERE session_id = ?'
-  ).bind(sessionId).first<SessionRow>();
+  const row = await db.prepare('SELECT * FROM temp_anime WHERE session_id = ?')
+    .bind(sessionId).first<SessionRow>();
 
   if (!row) return null;
   if (row.expires_at < Date.now()) {
@@ -124,6 +114,10 @@ async function deleteSession(db: D1Database, sessionId: string) {
     console.error('[Discord/Anime] delete error:', err);
   }
 }
+
+/* ═══════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════ */
 
 function pickTitle(media: AniListMedia): string {
   return media.title.romaji || media.title.english || media.title.native || 'Unknown';
@@ -180,6 +174,10 @@ function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, max - 20) + '\n… [truncated]';
 }
+
+/* ═══════════════════════════════════════════════
+   AI ENRICHMENT
+   ═══════════════════════════════════════════════ */
 
 interface Enriched {
   studio?: string | null;
@@ -252,6 +250,10 @@ async function enrichWithAITimeout(
   }
 }
 
+/* ═══════════════════════════════════════════════
+   FETCH + MERGE
+   ═══════════════════════════════════════════════ */
+
 async function fetchAndMerge(query: string): Promise<{
   media: AniListMedia;
   sources: string[];
@@ -262,12 +264,9 @@ async function fetchAndMerge(query: string): Promise<{
     searchShikimori(query),
   ]);
 
-  const jikan = jikanR.status === 'fulfilled' && jikanR.value
-    ? jikanToAniList(jikanR.value) : null;
-  const kitsu = kitsuR.status === 'fulfilled' && kitsuR.value
-    ? kitsuToAniList(kitsuR.value) : null;
-  const shikimori = shikimoriR.status === 'fulfilled' && shikimoriR.value
-    ? shikimoriToAniList(shikimoriR.value) : null;
+  const jikan = jikanR.status === 'fulfilled' && jikanR.value ? jikanToAniList(jikanR.value) : null;
+  const kitsu = kitsuR.status === 'fulfilled' && kitsuR.value ? kitsuToAniList(kitsuR.value) : null;
+  const shikimori = shikimoriR.status === 'fulfilled' && shikimoriR.value ? shikimoriToAniList(shikimoriR.value) : null;
 
   const sources: string[] = [];
   if (jikan) sources.push('Jikan');
@@ -307,11 +306,12 @@ async function fetchAndMerge(query: string): Promise<{
   return { media: merged, sources };
 }
 
+/* ═══════════════════════════════════════════════
+   BUILD YAML + BODY
+   ═══════════════════════════════════════════════ */
+
 interface BuildResult {
-  yaml: string;
-  body: string;
-  missing: string[];
-  aiUsed: string[];
+  yaml: string; body: string; missing: string[]; aiUsed: string[];
 }
 
 function buildResult(media: AniListMedia, enriched: Enriched | null): BuildResult {
@@ -408,19 +408,26 @@ function buildResult(media: AniListMedia, enriched: Enriched | null): BuildResul
   return { yaml, body: synopsis, missing, aiUsed };
 }
 
+/* ═══════════════════════════════════════════════
+   DISCORD API
+   ═══════════════════════════════════════════════ */
+
 const DISCORD_API = 'https://discord.com/api/v10';
 
 async function editOriginal(
-  env: Env,
+  appId: string,
   interactionToken: string,
   body: Record<string, unknown>
 ): Promise<void> {
-  const url = `${DISCORD_API}/webhooks/${env.DISCORD_APP_ID}/${interactionToken}/messages/@original`;
+  const url = `${DISCORD_API}/webhooks/${appId}/${interactionToken}/messages/@original`;
+  console.log(`[Discord] editOriginal → appId=${appId}`);
+
   const res = await fetch(url, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+
   if (!res.ok) {
     const err = await res.text().catch(() => '');
     console.error('[Discord] editOriginal failed:', res.status, err.slice(0, 200));
@@ -428,21 +435,27 @@ async function editOriginal(
 }
 
 async function sendFollowup(
-  env: Env,
+  appId: string,
   interactionToken: string,
   body: Record<string, unknown>
 ): Promise<void> {
-  const url = `${DISCORD_API}/webhooks/${env.DISCORD_APP_ID}/${interactionToken}`;
+  const url = `${DISCORD_API}/webhooks/${appId}/${interactionToken}`;
+
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+
   if (!res.ok) {
     const err = await res.text().catch(() => '');
     console.error('[Discord] followup failed:', res.status, err.slice(0, 200));
   }
 }
+
+/* ═══════════════════════════════════════════════
+   /anime HANDLER
+   ═══════════════════════════════════════════════ */
 
 export function handleAnime(
   interaction: DiscordInteraction,
@@ -455,22 +468,21 @@ export function handleAnime(
   });
 }
 
-async function processAnime(
-  interaction: DiscordInteraction,
-  env: Env
-): Promise<void> {
+async function processAnime(interaction: DiscordInteraction, env: Env): Promise<void> {
   const token = interaction.token;
+  const appId = interaction.application_id ?? env.DISCORD_APP_ID;
   const userId = interaction.member?.user.id ?? interaction.user?.id;
+
   if (!userId) {
-    await editOriginal(env, token, { content: '❌ Tidak dapat identify user.' });
+    await editOriginal(appId, token, { content: '❌ Tidak dapat identify user.' });
     return;
   }
 
   const query =
-    (interaction.data?.options?.find((o) => o.name === 'search')?.value as string) ?? '';
+    (interaction.data?.options?.find((o) => o.name === 'query')?.value as string) ?? '';
 
   if (!query) {
-    await editOriginal(env, token, { content: '❌ Query kosong.' });
+    await editOriginal(appId, token, { content: '❌ Query kosong.' });
     return;
   }
 
@@ -478,7 +490,7 @@ async function processAnime(
     const result = await fetchAndMerge(query);
 
     if (!result) {
-      await editOriginal(env, token, {
+      await editOriginal(appId, token, {
         content: `❌ Anime **${query}** tidak ditemukan.`,
       });
       return;
@@ -537,21 +549,19 @@ async function processAnime(
       `⭐ Rating: ${rating}\n\n` +
       `✅ **Data siap!** Klik tombol untuk convert ke YAML.`;
 
-    await editOriginal(env, token, {
+    await editOriginal(appId, token, {
       content: infoMsg,
       components: [
         {
           type: 1,
           components: [
             {
-              type: 2,
-              style: 1,
+              type: 2, style: 1,
               label: '📋 Convert ke YAML',
               custom_id: `an:y:${sessionId}`,
             },
             {
-              type: 2,
-              style: 4,
+              type: 2, style: 4,
               label: '❌ Batal',
               custom_id: `an:x:${sessionId}`,
             },
@@ -561,61 +571,78 @@ async function processAnime(
     });
   } catch (err: any) {
     console.error('[Discord/Anime] error:', err);
-    await editOriginal(env, token, {
+    await editOriginal(appId, token, {
       content: `❌ Gagal: ${(err?.message ?? 'unknown').slice(0, 200)}`,
     });
   }
 }
 
-export async function handleAnimeButton(
+/* ═══════════════════════════════════════════════
+   BUTTON HANDLER
+   ═══════════════════════════════════════════════ */
+
+export function handleAnimeButton(
+  interaction: DiscordInteraction,
+  env: Env,
+  ctx: ExecutionContext,
+  customId: string
+): Response {
+  // Wajib deferred dulu, karena tombol butuh acknowledge <3 detik
+  ctx.waitUntil(processButton(interaction, env, customId));
+  return new Response(JSON.stringify({ type: 6 }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+  // type 6 = DEFERRED_UPDATE_MESSAGE
+}
+
+async function processButton(
   interaction: DiscordInteraction,
   env: Env,
   customId: string
-): Promise<Response> {
+): Promise<void> {
   const parts = customId.split(':');
   const action = parts[1];
   const sessionId = parts[2];
 
+  const appId = interaction.application_id ?? env.DISCORD_APP_ID;
+  const token = interaction.token;
+  const userId = interaction.member?.user.id ?? interaction.user?.id;
+
   if (!sessionId || !action) {
-    return json({
-      type: 4,
-      data: { content: '❌ Tombol tidak valid.', flags: 64 },
-    });
+    await editOriginal(appId, token, { content: '❌ Tombol tidak valid.' });
+    return;
   }
 
-  const userId = interaction.member?.user.id ?? interaction.user?.id;
   const session = await getSession(env.DB, sessionId);
-
   if (!session) {
-    return json({
-      type: 4,
-      data: { content: '⏱️ Session kadaluarsa. Ulangi `/anime`.', flags: 64 },
+    await editOriginal(appId, token, {
+      content: '⏱️ Session kadaluarsa. Ulangi `/anime`.',
     });
+    return;
   }
 
   if (!userId || parseInt(userId, 10) !== session.user_id) {
-    return json({
-      type: 4,
-      data: { content: '⛔ Bukan sesi Anda.', flags: 64 },
-    });
+    await editOriginal(appId, token, { content: '⛔ Bukan sesi Anda.' });
+    return;
   }
 
+  // Batal
   if (action === 'x') {
     await deleteSession(env.DB, sessionId);
-    return json({
-      type: 7, // UPDATE_MESSAGE
-      data: {
-        content: '❌ **Dibatalkan.**',
-        components: [],
-      },
+    await editOriginal(appId, token, {
+      content: '❌ **Dibatalkan.**',
+      components: [],
     });
+    return;
   }
 
+  // Convert
   if (action === 'y') {
-    await editOriginal(env, interaction.token, {
+    // Update message jadi status
+    await editOriginal(appId, token, {
       content: '📋 **Generating YAML...**',
       components: [],
-    }).catch(() => {});
+    });
 
     const missing: string[] = JSON.parse(session.missing);
     const aiUsed: string[] = JSON.parse(session.ai_used);
@@ -631,26 +658,24 @@ export async function handleAnimeButton(
         warns.push('🤖 **Diisi AI (VERIFIKASI ulang):**');
         warns.push(...aiUsed.map((f) => `• \`${f}\``));
       }
-      await sendFollowup(env, interaction.token, {
+      await sendFollowup(appId, token, {
         content: warns.join('\n').slice(0, 1900),
       });
     }
 
-    await sendFollowup(env, interaction.token, {
+    await sendFollowup(appId, token, {
       content:
         `📋 **YAML Frontmatter**\n\n` +
         `\`\`\`yaml\n${truncate(session.yaml, 1900)}\n\`\`\``,
     });
 
-    await sendFollowup(env, interaction.token, {
+    await sendFollowup(appId, token, {
       content:
         `📝 **Body (Sinopsis)**\n\n` +
         `\`\`\`\n${truncate(session.body, 1900)}\n\`\`\``,
     });
 
-    const embed: Record<string, unknown> = {
-      color: 0x8b5cf6,
-    };
+    const embed: Record<string, unknown> = { color: 0x8b5cf6 };
     if (session.cover && isValidHttpUrl(session.cover)) {
       embed.image = { url: session.cover };
     }
@@ -658,28 +683,14 @@ export async function handleAnimeButton(
       embed.footer = { text: session.source_label };
     }
 
-    await sendFollowup(env, interaction.token, {
-      embeds: [embed],
+    await sendFollowup(appId, token, { embeds: [embed] });
+
+    // Update original message
+    await editOriginal(appId, token, {
+      content: '✅ **Selesai!**',
+      components: [],
     });
 
     await deleteSession(env.DB, sessionId);
-    return json({
-      type: 7,
-      data: {
-        content: '✅ **Selesai!**',
-        components: [],
-      },
-    });
   }
-
-  return json({
-    type: 4,
-    data: { content: '❌ Action tidak dikenal.', flags: 64 },
-  });
-}
-
-function json(data: unknown): Response {
-  return new Response(JSON.stringify(data), {
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
