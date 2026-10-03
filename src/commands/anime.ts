@@ -1,13 +1,17 @@
-import type { CommandDefinition } from './registry';
+limport type { CommandDefinition } from './registry';
+import type { Context, Bot } from 'grammy';
+import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../services/anilist';
 import { searchJikan, jikanToAniList } from '../services/jikan';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { getCache, setCache } from '../lib/cache';
 import { chatAI } from '../services/ai';
 import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const AI_TIMEOUT_MS = 5000;
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 menit
 
 type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
 type AnimeType = 'TV' | 'Movie' | 'OVA' | 'ONA' | 'Special';
@@ -29,6 +33,142 @@ const STATUS_MAP: Record<string, AnimeStatus> = {
   CANCELLED: 'Hiatus',
   HIATUS: 'Hiatus',
 };
+
+/* ═══════════════════════════════════════════════
+   DB: TEMP SESSIONS
+   ═══════════════════════════════════════════════ */
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS temp_anime (
+            session_id   TEXT PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            yaml         TEXT NOT NULL,
+            body         TEXT NOT NULL,
+            missing      TEXT NOT NULL,
+            ai_used      TEXT NOT NULL,
+            cover        TEXT,
+            source_label TEXT,
+            created_at   INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL
+          )`
+        )
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[Anime] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+async function saveSession(
+  db: D1Database,
+  userId: number,
+  data: {
+    yaml: string;
+    body: string;
+    missing: string[];
+    aiUsed: string[];
+    cover: string | null;
+    sourceLabel: string | null;
+  }
+): Promise<string> {
+  await ensureDb(db);
+
+  const sessionId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO temp_anime
+         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      userId,
+      data.yaml,
+      data.body,
+      JSON.stringify(data.missing),
+      JSON.stringify(data.aiUsed),
+      data.cover,
+      data.sourceLabel,
+      now,
+      now + SESSION_TTL_MS
+    )
+    .run();
+
+  return sessionId;
+}
+
+interface SessionRow {
+  session_id: string;
+  user_id: number;
+  yaml: string;
+  body: string;
+  missing: string;
+  ai_used: string;
+  cover: string | null;
+  source_label: string | null;
+  created_at: number;
+  expires_at: number;
+}
+
+async function getSession(
+  db: D1Database,
+  sessionId: string
+): Promise<SessionRow | null> {
+  await ensureDb(db);
+
+  const row = await db
+    .prepare('SELECT * FROM temp_anime WHERE session_id = ?')
+    .bind(sessionId)
+    .first<SessionRow>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM temp_anime WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return row;
+}
+
+async function deleteSession(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await db
+      .prepare('DELETE FROM temp_anime WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.error('[Anime] delete error:', err);
+  }
+}
+
+/* ═══════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════ */
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -83,6 +223,10 @@ function isEnglish(text: string): boolean {
   const matches = engWords.filter((w) => lower.includes(w)).length;
   return matches >= 3;
 }
+
+/* ═══════════════════════════════════════════════
+   AI ENRICHMENT
+   ═══════════════════════════════════════════════ */
 
 interface Enriched {
   studio?: string | null;
@@ -144,7 +288,7 @@ async function enrichWithAI(
     `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
     `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
     `- studio: only the PRIMARY animation studio (not producer)\n` +
-    `- synopsis: factual summary, NOT creative writing\n` +
+    `- synopsis: factual summary in Indonesian, NOT creative writing\n` +
     `- Output valid JSON only, no markdown, no explanation`;
 
   console.log(
@@ -220,6 +364,10 @@ async function enrichWithAITimeout(
   });
 }
 
+/* ═══════════════════════════════════════════════
+   BUILD YAML + BODY
+   ═══════════════════════════════════════════════ */
+
 interface BuildResult {
   yaml: string;
   body: string;
@@ -229,7 +377,8 @@ interface BuildResult {
 
 function buildResult(
   media: AniListMedia,
-  enriched: Enriched | null
+  enriched: Enriched | null,
+  sourceName: string
 ): BuildResult {
   const missing: string[] = [];
   const aiUsed: string[] = [];
@@ -328,11 +477,17 @@ function buildResult(
   if (synopsisRaw) synopsisRaw = stripHtml(synopsisRaw);
 
   let synopsis = synopsisRaw;
-  if (!synopsis || synopsis.length < 50) {
-    if (enriched?.synopsis && enriched.synopsis.length > 50) {
-      synopsis = enriched.synopsis;
-      aiUsed.push('synopsis');
-    }
+  const isTooShort = !synopsis || synopsis.length < 50;
+  const isEnglishText = synopsis ? isEnglish(synopsis) : false;
+  const needsTranslation = isEnglishText && sourceName !== 'AniList';
+
+  if (
+    (isTooShort || needsTranslation) &&
+    enriched?.synopsis &&
+    enriched.synopsis.length > 50
+  ) {
+    synopsis = enriched.synopsis;
+    aiUsed.push('synopsis');
   }
 
   if (!synopsis || synopsis.length < 30) {
@@ -344,6 +499,10 @@ function buildResult(
 
   return { yaml, body: synopsis, missing, aiUsed };
 }
+
+/* ═══════════════════════════════════════════════
+   INFO CARD
+   ═══════════════════════════════════════════════ */
 
 function buildInfoMessage(media: AniListMedia): string {
   const title = pickTitle(media);
@@ -368,6 +527,10 @@ function buildInfoMessage(media: AniListMedia): string {
   );
 }
 
+/* ═══════════════════════════════════════════════
+   MAL URL
+   ═══════════════════════════════════════════════ */
+
 function isMALUrl(s: string): boolean {
   return /^https?:\/\/(www\.)?myanimelist\.net\/anime\/\d+/i.test(s.trim());
 }
@@ -379,6 +542,10 @@ function extractTitleFromMALUrl(url: string): string | null {
   if (!slug) return null;
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
+
+/* ═══════════════════════════════════════════════
+   FETCH CHAIN
+   ═══════════════════════════════════════════════ */
 
 async function fetchMetadata(query: string): Promise<{
   media: AniListMedia;
@@ -444,6 +611,10 @@ function detectMissing(media: AniListMedia, source: string): string[] {
   return need;
 }
 
+/* ═══════════════════════════════════════════════
+   COMMAND
+   ═══════════════════════════════════════════════ */
+
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime → YAML + sinopsis',
@@ -464,8 +635,7 @@ export const animeCommand: CommandDefinition = {
           '<code>/anime jujutsu kaisen</code>\n\n' +
           '<b>Atau URL MAL:</b>\n' +
           '<code>/anime https://myanimelist.net/anime/40748</code>\n\n' +
-          '<i>Output: YAML frontmatter + sinopsis markdown.\n' +
-          'Field kosong akan diisi AI otomatis.</i>',
+          '<i>Setelah data siap, klik tombol untuk convert ke YAML.</i>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
@@ -556,57 +726,38 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
-      const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
+      const { yaml, body, missing, aiUsed } = buildResult(
+        media,
+        enriched,
+        sourceName
+      );
 
-      const warnLines: string[] = [];
-      if (missing.length > 0) {
-        warnLines.push('⚠️ <b>Perlu edit manual:</b>');
-        for (const f of missing) {
-          warnLines.push(`• <code>${escapeHtml(f)}</code>`);
-        }
-        warnLines.push('');
-      }
-      if (aiUsed.length > 0) {
-        warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang, bisa halusinasi):</b>');
-        for (const f of aiUsed) {
-          warnLines.push(`• <code>${escapeHtml(f)}</code>`);
-        }
-      }
-      if (warnLines.length > 0) {
-        await ctx.reply(warnLines.join('\n'), {
+      // Simpan ke DB, tunggu user klik tombol
+      const sessionId = await saveSession(env.DB, ctx.from!.id, {
+        yaml,
+        body,
+        missing,
+        aiUsed,
+        cover:
+          media.coverImage.extraLarge ||
+          media.coverImage.large ||
+          null,
+        sourceLabel: sourceLabel || null,
+      });
+
+      const keyboard = new InlineKeyboard()
+        .text('📋 Convert ke YAML', `an:y:${sessionId}`)
+        .text('❌ Batal', `an:x:${sessionId}`);
+
+      await ctx.reply(
+        '✅ <b>Data siap!</b>\n\n' +
+          'Klik tombol di bawah untuk convert ke <b>YAML</b> + sinopsis.',
+        {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
-        });
-      }
-
-      await ctx.reply(
-        `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(yaml)}</pre>`,
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      );
-
-      const bodyMax = 3500;
-      const bodyPreview =
-        body.length > bodyMax
-          ? body.slice(0, bodyMax) + '\n\n… [truncated]'
-          : body;
-
-      await ctx.reply(
-        `📝 <b>Body (Sinopsis)</b>\n\n<pre>${escapeHtml(bodyPreview)}</pre>`,
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      );
-
-      const cover = media.coverImage.extraLarge || media.coverImage.large;
-      if (cover && isValidHttpUrl(cover)) {
-        try {
-          await ctx.replyWithPhoto(cover);
-        } catch (err) {
-          console.warn('[Anime] Failed to send cover:', err);
+          reply_markup: keyboard,
         }
-      }
-
-      if (sourceLabel) {
-        await ctx.reply(sourceLabel);
-      }
+      );
 
       console.log(`[Anime] total: ${Date.now() - T0}ms`);
     } catch (err: any) {
@@ -630,3 +781,122 @@ export const animeCommand: CommandDefinition = {
     }
   },
 };
+
+/* ═══════════════════════════════════════════════
+   CALLBACK HANDLERS
+   ═══════════════════════════════════════════════ */
+
+export function setupAnimeCallbacks(bot: Bot, env: Env): void {
+  // Convert ke YAML
+  bot.callbackQuery(/^an:y:([a-f0-9]+)$/, async (ctx) => {
+    const [, sessionId] = ctx.match as RegExpMatchArray;
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
+      return;
+    }
+
+    const session = await getSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Session kadaluarsa. Ulangi /anime.',
+        show_alert: true,
+      });
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      return;
+    }
+
+    if (ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '📋 Convert...' });
+
+    // Hapus tombol
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: undefined })
+      .catch(() => {});
+
+    const missing: string[] = JSON.parse(session.missing);
+    const aiUsed: string[] = JSON.parse(session.ai_used);
+
+    // Warning
+    const warnLines: string[] = [];
+    if (missing.length > 0) {
+      warnLines.push('⚠️ <b>Perlu edit manual:</b>');
+      for (const f of missing) warnLines.push(`• <code>${escapeHtml(f)}</code>`);
+      warnLines.push('');
+    }
+    if (aiUsed.length > 0) {
+      warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang):</b>');
+      for (const f of aiUsed) warnLines.push(`• <code>${escapeHtml(f)}</code>`);
+    }
+    if (warnLines.length > 0) {
+      await ctx.reply(warnLines.join('\n'), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+    }
+
+    // YAML
+    await ctx.reply(
+      `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(session.yaml)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+
+    // Body
+    const bodyMax = 3500;
+    const bodyPreview =
+      session.body.length > bodyMax
+        ? session.body.slice(0, bodyMax) + '\n\n… [truncated]'
+        : session.body;
+
+    await ctx.reply(
+      `📝 <b>Body (Sinopsis)</b>\n\n<pre>${escapeHtml(bodyPreview)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+
+    // Cover
+    if (session.cover && isValidHttpUrl(session.cover)) {
+      try {
+        await ctx.replyWithPhoto(session.cover);
+      } catch (err) {
+        console.warn('[Anime] Failed to send cover:', err);
+      }
+    }
+
+    // Source
+    if (session.source_label) {
+      await ctx.reply(session.source_label);
+    }
+
+    // Hapus session
+    await deleteSession(env.DB, sessionId);
+  });
+
+  // Batal
+  bot.callbackQuery(/^an:x:([a-f0-9]+)$/, async (ctx) => {
+    const [, sessionId] = ctx.match as RegExpMatchArray;
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
+      return;
+    }
+
+    const session = await getSession(env.DB, sessionId);
+    if (session && ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    if (sessionId) await deleteSession(env.DB, sessionId);
+
+    await ctx
+      .editMessageText('❌ <b>Dibatalkan.</b>', {
+        parse_mode: 'HTML',
+        reply_markup: undefined,
+      })
+      .catch(() => {});
+
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+  });
+}
