@@ -38,6 +38,11 @@ interface JikanResponse {
   data: JikanAnime[];
 }
 
+/**
+ * Cari anime di Jikan (MyAnimeList).
+ * Rate limit: unlimited daily, 3 req/detik, 60 req/menit.
+ * Timeout 8s + retry 1x — Jikan kadang 504 saat server MAL sibuk.
+ */
 export async function searchJikan(title: string): Promise<JikanAnime | null> {
   const url = `${JIKAN_URL}?q=${encodeURIComponent(title)}&limit=1`;
 
@@ -49,7 +54,7 @@ export async function searchJikan(title: string): Promise<JikanAnime | null> {
         'User-Agent': 'yukio-bot/1.0',
       },
     },
-    { retries: 0, timeout: 4000 }
+    { retries: 1, baseDelay: 1000, timeout: 8000 }
   );
 
   if (!res.ok) {
