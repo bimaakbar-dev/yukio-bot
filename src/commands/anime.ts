@@ -12,7 +12,7 @@ import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const AI_TIMEOUT_MS = 5000;
+const AI_TIMEOUT_MS = 3000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
@@ -851,11 +851,21 @@ export const animeCommand: CommandDefinition = {
         console.log(`[Anime] cache hit at ${Date.now() - T0}ms`);
       } else {
         const result = await fetchAndMerge(searchQuery);
-        if (result) {
-          media = result.media;
-          sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
-          await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
-        }
+		if (result) {
+  		media = result.media;
+  		sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
+
+  		const hasStudio =
+    		media.studios?.nodes?.[0]?.name &&
+    		media.studios.nodes[0].name !== 'Unknown';
+
+  		if (hasStudio) {
+    		await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
+    		console.log('[Anime] cached (studio present)');
+  		} else {
+    		console.log('[Anime] NOT cached (studio missing) — biar retry fresh');
+  		}
+		}
         console.log(`[Anime] fetch stage done at ${Date.now() - T0}ms`);
       }
 
@@ -885,40 +895,52 @@ export const animeCommand: CommandDefinition = {
 
       let enriched: Enriched | null = null;
 
-      if (need.length > 0) {
-        const aiLoading = await ctx.reply(
-          `🤖 AI melengkapi: <code>${need.join(', ')}</code>...`,
-          { parse_mode: 'HTML' }
-        );
+	  if (need.length > 0) {
+  	  const aiLoading = await ctx.reply(
+    	`🤖 AI melengkapi: <code>${need.join(', ')}</code>...`,
+    	{ parse_mode: 'HTML' }
+  	  );
 
-        enriched = await enrichWithAITimeout(
-          env,
-          pickTitle(media),
-          {
-            studio: media.studios?.nodes?.[0]?.name,
-            rating: media.averageScore ? media.averageScore / 10 : null,
-            genre: media.genres,
-            releaseDate: media.startDate?.year
-              ? `${media.startDate.year}-01-01`
-              : null,
-          },
-          need
-        );
+  	  enriched = await enrichWithAITimeout(
+        env,
+        pickTitle(media),
+        {
+      studio: media.studios?.nodes?.[0]?.name,
+      rating: media.averageScore ? media.averageScore / 10 : null,
+      genre: media.genres,
+      releaseDate: media.startDate?.year
+        ? `${media.startDate.year}-01-01`
+        : null,
+    },
+    need
+  );
 
-        await ctx.api
-          .deleteMessage(ctx.chat!.id, aiLoading.message_id)
-          .catch(() => {});
+  console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
 
-        console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
-
-        if (!enriched) {
-          console.warn(
-            '[Anime] AI failed or timeout — lanjut tanpa AI (no retry)'
-          );
-        }
-      } else {
-        console.log('[Anime] no AI needed — skipping');
-      }
+  if (enriched) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        aiLoading.message_id,
+        `✅ AI selesai: <code>${need.join(', ')}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  } else {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        aiLoading.message_id,
+        `⚠️ AI tidak bisa melengkapi: <code>${need.join(', ')}</code>\n` +
+          `<i>Field ini perlu diisi manual.</i>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+    	console.warn('[Anime] AI failed or timeout — no retry');
+  		}
+		} else {
+  		console.log('[Anime] no AI needed — skipping');
+		}
 
       const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
 
