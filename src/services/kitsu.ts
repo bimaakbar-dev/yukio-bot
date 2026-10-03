@@ -5,40 +5,40 @@ const KITSU_URL = 'https://kitsu.io/api/edge/anime';
 
 interface KitsuAnime {
   id: string;
-  attributes: {
-    canonicalTitle: string;
-    titles: {
+  attributes?: {
+    canonicalTitle?: string;
+    titles?: {
       en?: string;
       en_jp?: string;
       ja_jp?: string;
     };
-    posterImage: {
-      large: string;
-      original: string;
+    posterImage?: {
+      large?: string;
+      original?: string;
     };
-    subtype: string;
-    status: string;
-    startDate: string | null;
-    episodeCount: number | null;
-    averageRating: string | null;
-    synopsis: string | null;
+    subtype?: string;
+    status?: string;
+    startDate?: string | null;
+    episodeCount?: number | null;
+    averageRating?: string | null;
+    synopsis?: string | null;
   };
   relationships?: {
-    categories?: { data: { type: string; id: string }[] };
+    categories?: { data?: { type: string; id: string }[] };
   };
 }
 
 interface KitsuIncluded {
   id: string;
   type: string;
-  attributes: {
+  attributes?: {
     title?: string;
     name?: string;
   };
 }
 
 interface KitsuResponse {
-  data: KitsuAnime[];
+  data?: KitsuAnime[];
   included?: KitsuIncluded[];
 }
 
@@ -71,15 +71,15 @@ export async function searchKitsu(
   const anime = json.data?.[0];
   if (!anime) return null;
 
-  const included = json.included ?? [];
+  const included = Array.isArray(json.included) ? json.included : [];
 
   const categoryIds = (anime.relationships?.categories?.data ?? []).map(
     (r) => r.id
   );
   const genres = included
     .filter((i) => i.type === 'categories' && categoryIds.includes(i.id))
-    .map((i) => i.attributes.title)
-    .filter((t): t is string => !!t)
+    .map((i) => i.attributes?.title)
+    .filter((t): t is string => typeof t === 'string' && t.length > 0)
     .slice(0, 5);
 
   return { anime, genres };
@@ -87,7 +87,7 @@ export async function searchKitsu(
 
 export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
   const { anime, genres } = result;
-  const attr = anime.attributes;
+  const attr = anime.attributes ?? {};
 
   const format = (attr.subtype || 'TV').toUpperCase();
 
@@ -101,15 +101,15 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     ? Math.round(parseFloat(attr.averageRating))
     : null;
 
-  const cover = attr.posterImage.large || attr.posterImage.original || '';
+  const cover = attr.posterImage?.large || attr.posterImage?.original || '';
   const date = attr.startDate ? new Date(attr.startDate) : null;
 
   return {
     id: parseInt(anime.id, 10),
     title: {
-      romaji: attr.titles.en_jp ?? attr.canonicalTitle,
-      english: attr.titles.en ?? null,
-      native: attr.titles.ja_jp ?? null,
+      romaji: attr.titles?.en_jp ?? attr.canonicalTitle ?? 'Unknown',
+      english: attr.titles?.en ?? null,
+      native: attr.titles?.ja_jp ?? null,
     },
     coverImage: {
       extraLarge: cover,
@@ -119,14 +119,14 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     format,
     status,
     seasonYear: date?.getFullYear() ?? null,
-    episodes: attr.episodeCount,
-    genres,
+    episodes: attr.episodeCount ?? null,
+    genres: Array.isArray(genres) ? genres : [],
     averageScore,
     studios: { nodes: [] },
     startDate: {
       year: date?.getFullYear() ?? null,
       month: date ? date.getMonth() + 1 : null,
-      day: date?.getDate() ?? null,
+      day: date ? date.getDate() : null,
     },
   };
 }
