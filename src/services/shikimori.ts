@@ -1,5 +1,5 @@
 import { fetchWithRetry } from '../lib/http';
-import type { AniListMedia } from './anilist';
+import type { AniListMedia } from '../types/anime';
 
 const SHIKIMORI_URL = 'https://shikimori.one/api/animes';
 
@@ -36,7 +36,6 @@ interface ShikimoriAnime {
 export async function searchShikimori(
   title: string
 ): Promise<ShikimoriAnime | null> {
-  // 1. Search — dapat id + data basic
   const searchUrl = `${SHIKIMORI_URL}?search=${encodeURIComponent(
     title
   )}&limit=1`;
@@ -61,7 +60,7 @@ export async function searchShikimori(
   const basic = list[0];
   if (!basic?.id) return null;
 
-  // 2. Fetch detail — dapat studios lengkap
+  // Fetch detail — studio hanya ada di endpoint ini
   try {
     const detailUrl = `${SHIKIMORI_URL}/${basic.id}`;
     const detailRes = await fetchWithRetry(detailUrl, {
@@ -74,9 +73,7 @@ export async function searchShikimori(
     if (detailRes.ok) {
       const detail = (await detailRes.json()) as ShikimoriAnime;
       console.log(
-        `[Shikimori] detail fetched — studios: ${
-          detail.studios?.length ?? 0
-        }`
+        `[Shikimori] detail fetched — studios: ${detail.studios?.length ?? 0}`
       );
       return detail;
     }
@@ -84,7 +81,6 @@ export async function searchShikimori(
     console.warn('[Shikimori] detail fetch failed, using basic:', err);
   }
 
-  // Fallback: pakai data basic
   return basic;
 }
 
@@ -121,16 +117,16 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
 
   const date = s.aired_on ? new Date(s.aired_on) : null;
 
-  const genres = Array.isArray(s.genres)
+  const genres: string[] = Array.isArray(s.genres)
     ? s.genres
-        .map((g) => g?.name)
-        .filter((n): n is string => typeof n === 'string' && n.length > 0)
+        .map((g): string => g?.name ?? '')
+        .filter((n: string): boolean => n.length > 0)
     : [];
 
-  const studios = Array.isArray(s.studios)
+  const studios: { name: string }[] = Array.isArray(s.studios)
     ? s.studios
-        .filter((st) => st && st.real && st.name)
-        .map((st) => ({ name: st.name }))
+        .filter((st): boolean => !!(st && st.real && st.name))
+        .map((st): { name: string } => ({ name: st.name }))
         .slice(0, 3)
     : [];
 
