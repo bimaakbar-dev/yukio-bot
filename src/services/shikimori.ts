@@ -33,11 +33,6 @@ interface ShikimoriAnime {
   }[];
 }
 
-/**
- * Cari anime di Shikimori.
- * Rate limit: 5 req/detik, 90 req/menit — longgar.
- * Docs: https://shikimori.one/api/doc/1.0/animes/index
- */
 export async function searchShikimori(
   title: string
 ): Promise<ShikimoriAnime | null> {
@@ -59,17 +54,12 @@ export async function searchShikimori(
   return json[0] ?? null;
 }
 
-/**
- * Convert Shikimori response ke format AniListMedia.
- */
 export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
-  // ─── Status mapping ───
   let status = 'RELEASING';
   if (s.status === 'released') status = 'FINISHED';
   else if (s.status === 'anons') status = 'NOT_YET_RELEASED';
   else if (s.status === 'ongoing') status = 'RELEASING';
 
-  // ─── Kind mapping ───
   const kindMap: Record<string, string> = {
     tv: 'TV',
     movie: 'MOVIE',
@@ -80,10 +70,8 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
   };
   const format = kindMap[s.kind] ?? 'TV';
 
-  // ─── Rating: 0-10 → 0-100 ───
   const averageScore = s.score ? Math.round(parseFloat(s.score) * 10) : null;
 
-  // ─── Cover URL: relative → absolute ───
   const original = s.image.original.startsWith('http')
     ? s.image.original
     : `https://shikimori.one${s.image.original}`;
@@ -91,7 +79,6 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
     ? s.image.preview
     : `https://shikimori.one${s.image.preview}`;
 
-  // ─── Date ───
   const date = s.aired_on ? new Date(s.aired_on) : null;
 
   return {
@@ -105,7 +92,7 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
       extraLarge: original,
       large: preview,
     },
-    description: null, // Shikimori tidak kasih synopsis di list endpoint
+    description: null,
     format,
     status,
     seasonYear: date?.getFullYear() ?? null,
