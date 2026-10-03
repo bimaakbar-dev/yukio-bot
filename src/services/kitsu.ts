@@ -25,7 +25,6 @@ interface KitsuAnime {
   };
   relationships?: {
     categories?: { data: { type: string; id: string }[] };
-    productions?: { data: { type: string; id: string }[] };
   };
 }
 
@@ -35,7 +34,6 @@ interface KitsuIncluded {
   attributes: {
     title?: string;
     name?: string;
-    role?: string;
   };
 }
 
@@ -47,16 +45,14 @@ interface KitsuResponse {
 interface KitsuSearchResult {
   anime: KitsuAnime;
   genres: string[];
-  studios: string[];
 }
 
 export async function searchKitsu(
   title: string
 ): Promise<KitsuSearchResult | null> {
-  // Include productions — di sinilah studio tersimpan
   const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(
     title
-  )}&include=categories,productions&page[limit]=1`;
+  )}&include=categories&page[limit]=1`;
 
   const res = await fetchWithRetry(url, {
     headers: {
@@ -77,7 +73,6 @@ export async function searchKitsu(
 
   const included = json.included ?? [];
 
-  // ─── Genre ───
   const categoryIds = (anime.relationships?.categories?.data ?? []).map(
     (r) => r.id
   );
@@ -87,25 +82,11 @@ export async function searchKitsu(
     .filter((t): t is string => !!t)
     .slice(0, 5);
 
-  // ─── Studio dari productions (role === "studio") ───
-  const productionIds = (anime.relationships?.productions?.data ?? []).map(
-    (r) => r.id
-  );
-  const studios = included
-    .filter(
-      (i) =>
-        i.type === 'productions' &&
-        productionIds.includes(i.id) &&
-        i.attributes.role === 'studio'
-    )
-    .map((i) => i.attributes.name)
-    .filter((s): s is string => !!s);
-
-  return { anime, genres, studios: studios.slice(0, 3) };
+  return { anime, genres };
 }
 
 export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
-  const { anime, genres, studios } = result;
+  const { anime, genres } = result;
   const attr = anime.attributes;
 
   const format = (attr.subtype || 'TV').toUpperCase();
@@ -141,9 +122,7 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     episodes: attr.episodeCount,
     genres,
     averageScore,
-    studios: {
-      nodes: studios.map((name) => ({ name })),
-    },
+    studios: { nodes: [] },
     startDate: {
       year: date?.getFullYear() ?? null,
       month: date ? date.getMonth() + 1 : null,
