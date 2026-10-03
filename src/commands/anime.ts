@@ -1,4 +1,4 @@
-limport type { CommandDefinition } from './registry';
+import type { CommandDefinition } from './registry';
 import type { Context, Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../services/anilist';
