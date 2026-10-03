@@ -2,23 +2,26 @@ import { fetchWithRetry } from '../lib/http';
 
 const ANIMEAPI_URL = 'https://animeapi.my.id';
 
-interface AnimeApiMapping {
+export interface AnimeApiMapping {
   title: string;
   anilist: number | null;
   myanimelist: number | null;
   kitsu: number | null;
-  // ... 20+ platform lain
+  anidb: number | null;
+  ann: number | null;
+  [key: string]: unknown;
 }
 
 /**
  * Mapping ID anime lintas database.
- * Tidak ada rate limit — bebas panggil[reference:5].
+ * Tidak ada rate limit — bebas panggil.
  */
 export async function getAnimeMapping(
   provider: 'myanimelist' | 'anilist' | 'kitsu',
   id: string | number
 ): Promise<AnimeApiMapping | null> {
   const url = `${ANIMEAPI_URL}/${provider}/${id}`;
+
   const res = await fetchWithRetry(url, {
     headers: { Accept: 'application/json' },
   });
