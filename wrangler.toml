@@ -30,3 +30,7 @@ enabled = true
 # ──────────────────────────────────────────────────────────
 [triggers]
 crons = ["0 3 * * *"]
+
+[vars]
+ADMIN_USER_ID = "1605070949"
+BUSINESS_OWNER_ID = "1605070949"
