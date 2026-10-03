@@ -1,0 +1,32 @@
+name = "yukio-bot"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ──────────────────────────────────────────────────────────
+# Workers AI — untuk fitur AI (chat, auto-reply)
+# ──────────────────────────────────────────────────────────
+[ai]
+binding = "AI"
+
+# ──────────────────────────────────────────────────────────
+# D1 Database — untuk cache & chat log
+# ──────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB"
+database_name = "yukio-db"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
+
+# ──────────────────────────────────────────────────────────
+# Observability — log otomatis di Cloudflare Dashboard
+# ──────────────────────────────────────────────────────────
+[observability]
+enabled = true
+
+# ──────────────────────────────────────────────────────────
+# Triggers — cron untuk cleanup cache
+# Format: menit jam hari bulan hari-minggu
+# "0 3 * * *" = setiap hari jam 3 pagi UTC
+# ──────────────────────────────────────────────────────────
+[triggers]
+crons = ["0 3 * * *"]
