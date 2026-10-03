@@ -28,8 +28,6 @@ export async function handleDiscordRequest(
   const timestamp = request.headers.get('x-signature-timestamp');
   const body = await request.text();
 
-  console.log('[Discord] request received');
-
   if (!signature || !timestamp) {
     return new Response('Missing signature', { status: 401 });
   }
@@ -42,7 +40,6 @@ export async function handleDiscordRequest(
   );
 
   if (!valid) {
-    console.warn('[Discord] signature INVALID');
     return new Response('Invalid signature', { status: 401 });
   }
 
@@ -53,37 +50,22 @@ export async function handleDiscordRequest(
     return new Response('Invalid JSON', { status: 400 });
   }
 
+  const customId = interaction.data?.custom_id ?? '';
+  const cmdName = interaction.data?.name ?? '';
+
   console.log(
-    `[Discord] type=${interaction.type} app_id=${interaction.application_id}`
+    `[Discord] type=${interaction.type} cmd=${cmdName} cid=${customId} app=${interaction.application_id}`
   );
 
   // PING
   if (interaction.type === 1) {
+    console.log('[Discord] PING → PONG');
     return json({ type: 1 });
   }
 
-  // Slash command (type 2)
-  if (interaction.type === 2) {
-    const name = interaction.data?.name;
-    console.log(`[Discord] command: /${name}`);
-
-    switch (name) {
-      case 'ping':
-        return handlePing(interaction, env);
-      case 'anime':
-        return handleAnime(interaction, env, ctx);
-      default:
-        return json({
-          type: 4,
-          data: { content: `❌ Command \`/${name}\` belum diimplementasi.` },
-        });
-    }
-  }
-
-  // Button click (type 3 MESSAGE_COMPONENT)
+  // Button (type 3) — CEK DULU sebelum slash command
   if (interaction.type === 3) {
-    const customId = interaction.data?.custom_id ?? '';
-    console.log(`[Discord] button: ${customId}`);
+    console.log(`[Discord] BUTTON: ${customId}`);
 
     if (customId.startsWith('an:')) {
       return handleAnimeButton(interaction, env, ctx, customId);
@@ -91,8 +73,25 @@ export async function handleDiscordRequest(
 
     return json({
       type: 4,
-      data: { content: '❌ Tombol tidak dikenal.', flags: 64 },
+      data: { content: `❌ Tombol tidak dikenal: ${customId}`, flags: 64 },
     });
+  }
+
+  // Slash command (type 2)
+  if (interaction.type === 2) {
+    console.log(`[Discord] COMMAND: /${cmdName}`);
+
+    switch (cmdName) {
+      case 'ping':
+        return handlePing(interaction, env);
+      case 'anime':
+        return handleAnime(interaction, env, ctx);
+      default:
+        return json({
+          type: 4,
+          data: { content: `❌ Command \`/${cmdName}\` belum diimplementasi.` },
+        });
+    }
   }
 
   return json({ type: 1 });
