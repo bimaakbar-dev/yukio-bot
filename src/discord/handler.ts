@@ -1,6 +1,7 @@
 import type { Env } from '../types/env';
 import { verifyDiscordSignature } from './verify';
 import { handlePing } from './commands/ping';
+import { handleAnime, handleAnimeButton } from './commands/anime';
 
 export interface DiscordInteraction {
   id: string;
@@ -19,14 +20,14 @@ export interface DiscordInteraction {
 
 export async function handleDiscordRequest(
   request: Request,
-  env: Env
+  env: Env,
+  ctx: ExecutionContext
 ): Promise<Response> {
   const signature = request.headers.get('x-signature-ed25519');
   const timestamp = request.headers.get('x-signature-timestamp');
   const body = await request.text();
 
   console.log('[Discord] request received');
-  console.log('[Discord] has sig:', !!signature, 'has ts:', !!timestamp);
 
   if (!signature || !timestamp) {
     return new Response('Missing signature', { status: 401 });
@@ -40,11 +41,9 @@ export async function handleDiscordRequest(
   );
 
   if (!valid) {
-    console.warn('[Discord] signature INVALID — return 401');
+    console.warn('[Discord] signature INVALID');
     return new Response('Invalid signature', { status: 401 });
   }
-
-  console.log('[Discord] signature valid');
 
   let interaction: DiscordInteraction;
   try {
@@ -55,13 +54,12 @@ export async function handleDiscordRequest(
 
   console.log('[Discord] type:', interaction.type);
 
-  // PING — verifikasi endpoint Discord
+  // PING
   if (interaction.type === 1) {
-    console.log('[Discord] PING → PONG');
     return json({ type: 1 });
   }
 
-  // Slash command
+  // Slash command (type 2)
   if (interaction.type === 2) {
     const name = interaction.data?.name;
     console.log(`[Discord] command: /${name}`);
@@ -69,14 +67,29 @@ export async function handleDiscordRequest(
     switch (name) {
       case 'ping':
         return handlePing(interaction, env);
+      case 'anime':
+        return handleAnime(interaction, env, ctx);
       default:
         return json({
           type: 4,
-          data: {
-            content: `❌ Command \`/${name}\` belum diimplementasi.`,
-          },
+          data: { content: `❌ Command \`/${name}\` belum diimplementasi.` },
         });
     }
+  }
+
+  // Button click (type 3 MESSAGE_COMPONENT)
+  if (interaction.type === 3) {
+    const customId = interaction.data?.custom_id ?? '';
+    console.log(`[Discord] button: ${customId}`);
+
+    if (customId.startsWith('an:')) {
+      return handleAnimeButton(interaction, env, customId);
+    }
+
+    return json({
+      type: 4,
+      data: { content: '❌ Tombol tidak dikenal.', flags: 64 },
+    });
   }
 
   return json({ type: 1 });
