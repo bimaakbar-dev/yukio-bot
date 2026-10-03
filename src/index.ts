@@ -6,6 +6,9 @@ import { cleanupCache } from './lib/cache';
 import { isAdmin } from './lib/permissions';
 import { handleDocumentAuto } from './commands/decode';
 
+let cachedBot: Bot | null = null;
+let initPromise: Promise<void> | null = null;
+
 function createBot(env: Env): Bot {
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
 
@@ -13,26 +16,18 @@ function createBot(env: Env): Bot {
     await ctx.reply(
       '🤖 <b>Yukio Bot</b>\n' +
         '<i>Personal assistant</i>\n\n' +
-        'Bot ini untuk keperluan pribadi.\n' +
-        'Ketik /help untuk lihat command yang tersedia.',
-      {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      }
+        'Ketik /help untuk lihat command.',
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
   });
 
   registerCommands(bot, env);
-
   setupBusinessHandler(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
-
     if (caption.startsWith('/')) return;
-
     if (ctx.chat?.type !== 'private') return;
-
     if (!isAdmin(ctx.from?.id, env)) return;
 
     const name = ctx.message.document.file_name ?? '';
@@ -53,6 +48,31 @@ function createBot(env: Env): Bot {
   return bot;
 }
 
+async function getBot(env: Env): Promise<Bot> {
+  if (!cachedBot) {
+    console.log('[Bot] creating new instance');
+    cachedBot = createBot(env);
+  }
+
+  if (!initPromise) {
+    const t0 = Date.now();
+    initPromise = cachedBot
+      .init()
+      .then(() => {
+        console.log(`[Bot] init OK in ${Date.now() - t0}ms`);
+      })
+      .catch((err) => {
+        console.error(`[Bot] init FAILED in ${Date.now() - t0}ms:`, err);
+        initPromise = null;
+        cachedBot = null;
+        throw err;
+      });
+  }
+
+  await initPromise;
+  return cachedBot;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -68,17 +88,6 @@ export default {
       );
     }
 
-    if (url.pathname === '/webhook') {
-      try {
-        const bot = createBot(env);
-        const handler = webhookCallback(bot, 'cloudflare-mod');
-        return await handler(request);
-      } catch (err) {
-        console.error('[Worker] webhook error:', err);
-        return new Response('OK', { status: 200 });
-      }
-    }
-
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
@@ -87,12 +96,11 @@ export default {
         );
         const data = await res.json();
         return new Response(
-          JSON.stringify({
-            ok: res.ok,
-            status: res.status,
-            elapsed: Date.now() - t0,
-            data,
-          }, null, 2),
+          JSON.stringify(
+            { ok: res.ok, status: res.status, elapsed: Date.now() - t0, data },
+            null,
+            2
+          ),
           { headers: { 'Content-Type': 'application/json' } }
         );
       } catch (err: any) {
@@ -101,9 +109,29 @@ export default {
             ok: false,
             elapsed: Date.now() - t0,
             error: err?.message ?? String(err),
-          }, null, 2),
+          }),
           { status: 500, headers: { 'Content-Type': 'application/json' } }
         );
+      }
+    }
+
+    if (url.pathname === '/webhook') {
+      const t0 = Date.now();
+      try {
+        const bot = await getBot(env);
+        const handler = webhookCallback(bot, 'cloudflare-mod', {
+          timeoutMilliseconds: 8000,
+          onTimeout: 'return',
+        });
+        const res = await handler(request);
+        console.log(`[Worker] webhook done in ${Date.now() - t0}ms`);
+        return res;
+      } catch (err: any) {
+        console.error(
+          `[Worker] webhook error after ${Date.now() - t0}ms:`,
+          err?.message ?? err
+        );
+        return new Response('OK', { status: 200 });
       }
     }
 
