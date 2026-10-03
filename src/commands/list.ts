@@ -5,7 +5,8 @@ import { helpCommand } from './help';
 import { statusCommand } from './status';
 import { animeCommand } from './anime';
 import { aiCommand } from './ai';
-import { clearcacheCommand } from './clearcache';   // ← TAMBAH
+import { clearcacheCommand } from './clearcache';
+import { decodeCommand } from './decode'; 
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -13,5 +14,6 @@ export const COMMANDS: CommandDefinition[] = [
   statusCommand,
   animeCommand,
   aiCommand,
-  clearcacheCommand,   // ← TAMBAH
+  clearcacheCommand,
+  decodeCommand,
 ];
