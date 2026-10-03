@@ -4,10 +4,12 @@ const COMMANDS = [
   {
     name: 'ping',
     description: 'Health check — cek bot masih hidup',
+    dm_permission: true,
   },
   {
     name: 'anime',
     description: 'Cari metadata anime',
+    dm_permission: true,
     options: [
       {
         name: 'search',
@@ -19,25 +21,20 @@ const COMMANDS = [
   },
   {
     name: 'decode',
-    description: 'Decode Base64 atau HTML jadi URL',
+    description: 'Decode file HTML atau Base64 jadi URL',
+    dm_permission: true,
     options: [
+      {
+        name: 'file',
+        description: 'File .html / .txt (max 8 MB)',
+        type: 11,
+        required: false,
+      },
       {
         name: 'input',
-        description: 'Base64 atau HTML',
+        description: 'Atau paste Base64/HTML langsung',
         type: 3,
-        required: true,
-      },
-    ],
-  },
-  {
-    name: 'ai',
-    description: 'Chat dengan AI',
-    options: [
-      {
-        name: 'prompt',
-        description: 'Prompt untuk AI',
-        type: 3,
-        required: true,
+        required: false,
       },
     ],
   },
@@ -45,8 +42,6 @@ const COMMANDS = [
 
 export async function registerDiscordCommands(env: Env): Promise<Response> {
   const url = `https://discord.com/api/v10/applications/${env.DISCORD_APP_ID}/commands`;
-
-  console.log('[Discord] registering commands...');
 
   const res = await fetch(url, {
     method: 'PUT',
@@ -58,8 +53,6 @@ export async function registerDiscordCommands(env: Env): Promise<Response> {
   });
 
   const data = await res.json().catch(() => ({ error: 'invalid json' }));
-
-  console.log(`[Discord] register status: ${res.status}`);
 
   return new Response(
     JSON.stringify({ ok: res.ok, status: res.status, data }, null, 2),
