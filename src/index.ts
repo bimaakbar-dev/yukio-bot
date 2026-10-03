@@ -7,10 +7,21 @@ import { cleanupCache } from './lib/cache';
 function createBot(env: Env): Bot {
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
 
+  bot.command('start', async (ctx) => {
+    await ctx.reply(
+      '🤖 <b>Yukio Bot</b>\n' +
+        '<i>Personal assistant</i>\n\n' +
+        'Bot ini untuk keperluan pribadi.\n' +
+        'Ketik /help untuk lihat command yang tersedia.',
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      }
+    );
+  });
+
   registerCommands(bot, env);
   setupBusinessHandler(bot, env);
-
-  bot.catch((err) => {
     console.error('[Bot] error:', err.error);
   });
 
@@ -21,7 +32,6 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Health check — GET /health atau GET /
     if (url.pathname === '/health' || url.pathname === '/') {
       return new Response(
         JSON.stringify({
@@ -33,7 +43,6 @@ export default {
       );
     }
 
-    // Webhook Telegram — POST /webhook
     if (url.pathname === '/webhook') {
       try {
         const bot = createBot(env);
@@ -45,7 +54,6 @@ export default {
       }
     }
 
-    // Path lain — 404
     return new Response('Not Found', { status: 404 });
   },
 
