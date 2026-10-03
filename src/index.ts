@@ -21,7 +21,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Health check — tidak sentuh bot
+    // Health check — GET /health atau GET /
     if (url.pathname === '/health' || url.pathname === '/') {
       return new Response(
         JSON.stringify({
@@ -33,15 +33,20 @@ export default {
       );
     }
 
-    // Webhook Telegram
-    try {
-      const bot = createBot(env);
-      const handler = webhookCallback(bot, 'cloudflare-mod');
-      return await handler(request);
-    } catch (err) {
-      console.error('[Worker] fetch error:', err);
-      return new Response('Internal Server Error', { status: 500 });
+    // Webhook Telegram — POST /webhook
+    if (url.pathname === '/webhook') {
+      try {
+        const bot = createBot(env);
+        const handler = webhookCallback(bot, 'cloudflare-mod');
+        return await handler(request);
+      } catch (err) {
+        console.error('[Worker] webhook error:', err);
+        return new Response('Internal Server Error', { status: 500 });
+      }
     }
+
+    // Path lain — 404
+    return new Response('Not Found', { status: 404 });
   },
 
   async scheduled(
