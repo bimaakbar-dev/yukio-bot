@@ -3,31 +3,17 @@ main = "src/index.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# ──────────────────────────────────────────────────────────
-# Workers AI — untuk fitur AI (chat, auto-reply)
-# ──────────────────────────────────────────────────────────
 [ai]
 binding = "AI"
 
-# ──────────────────────────────────────────────────────────
-# D1 Database — untuk cache & chat log
-# ──────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB"
 database_name = "yukio-db"
 database_id = "8b0b931d-b4f7-41c0-885b-6e90c11c8bb7"
 
-# ──────────────────────────────────────────────────────────
-# Observability — log otomatis di Cloudflare Dashboard
-# ──────────────────────────────────────────────────────────
 [observability]
 enabled = true
 
-# ──────────────────────────────────────────────────────────
-# Triggers — cron untuk cleanup cache
-# Format: menit jam hari bulan hari-minggu
-# "0 3 * * *" = setiap hari jam 3 pagi UTC
-# ──────────────────────────────────────────────────────────
 [triggers]
 crons = ["0 3 * * *"]
 
