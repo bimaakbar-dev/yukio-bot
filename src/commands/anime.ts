@@ -2,7 +2,7 @@ import type { CommandDefinition } from './registry';
 import type { Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../services/anilist';
-import { searchAniList } from '../services/anilist';
+import { searchJikan, jikanToAniList } from '../services/jikan';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
 import { getCache, setCache } from '../lib/cache';
@@ -573,7 +573,7 @@ function extractTitleFromMALUrl(url: string): string | null {
 
 /* ═══════════════════════════════════════════════
    PARALLEL FETCH + MERGE
-   Chain: Kitsu + Shikimori + AniList (tanpa Jikan)
+   Chain: Jikan + Kitsu + Shikimori (tanpa AniList)
    ═══════════════════════════════════════════════ */
 
 async function fetchAndMerge(query: string): Promise<{
@@ -582,10 +582,10 @@ async function fetchAndMerge(query: string): Promise<{
 } | null> {
   const t0 = Date.now();
 
-  const [kitsuR, shikimoriR, anilistR] = await Promise.allSettled([
+  const [jikanR, kitsuR, shikimoriR] = await Promise.allSettled([
+    searchJikan(query),
     searchKitsu(query),
     searchShikimori(query),
-    searchAniList(query),
   ]);
 
   const logStatus = (
@@ -603,24 +603,24 @@ async function fetchAndMerge(query: string): Promise<{
     return false;
   };
 
+  const hasJikan = logStatus('Jikan', jikanR);
   const hasKitsu = logStatus('Kitsu', kitsuR);
   const hasShikimori = logStatus('Shikimori', shikimoriR);
-  const hasAniList = logStatus('AniList', anilistR);
 
+  const jikan = hasJikan
+    ? jikanToAniList((jikanR as PromiseFulfilledResult<any>).value)
+    : null;
   const kitsu = hasKitsu
     ? kitsuToAniList((kitsuR as PromiseFulfilledResult<any>).value)
     : null;
   const shikimori = hasShikimori
     ? shikimoriToAniList((shikimoriR as PromiseFulfilledResult<any>).value)
     : null;
-  const anilist = hasAniList
-    ? (anilistR as PromiseFulfilledResult<AniListMedia>).value
-    : null;
 
   const sources: string[] = [];
+  if (jikan) sources.push('Jikan (MAL)');
   if (kitsu) sources.push('Kitsu');
   if (shikimori) sources.push('Shikimori');
-  if (anilist) sources.push('AniList');
 
   console.log(
     `[Anime] parallel fetch done in ${Date.now() - t0}ms — sources: [${
@@ -631,30 +631,30 @@ async function fetchAndMerge(query: string): Promise<{
   if (sources.length === 0) return null;
 
   const studioLog = [
+    `Jikan=${jikan?.studios?.nodes?.[0]?.name ?? '-'}`,
     `Kitsu=${kitsu?.studios?.nodes?.[0]?.name ?? '-'}`,
     `Shikimori=${shikimori?.studios?.nodes?.[0]?.name ?? '-'}`,
-    `AniList=${anilist?.studios?.nodes?.[0]?.name ?? '-'}`,
   ].join(' | ');
   console.log(`[Anime] studio per source: ${studioLog}`);
 
   const merged: AniListMedia = {
-    id: anilist?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
+    id: jikan?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
 
     title: {
       romaji:
         pick(
+          jikan?.title.romaji,
           kitsu?.title.romaji,
-          shikimori?.title.romaji,
-          anilist?.title.romaji
+          shikimori?.title.romaji
         ) ?? 'Unknown',
       english: pick(
+        jikan?.title.english,
         kitsu?.title.english,
-        anilist?.title.english,
         shikimori?.title.english
       ),
       native: pick(
+        jikan?.title.native,
         kitsu?.title.native,
-        anilist?.title.native,
         shikimori?.title.native
       ),
     },
@@ -662,80 +662,63 @@ async function fetchAndMerge(query: string): Promise<{
     coverImage: {
       extraLarge:
         pick(
-          anilist?.coverImage.extraLarge,
           kitsu?.coverImage.extraLarge,
+          jikan?.coverImage.extraLarge,
           shikimori?.coverImage.extraLarge
         ) ?? '',
       large:
         pick(
-          anilist?.coverImage.large,
           kitsu?.coverImage.large,
+          jikan?.coverImage.large,
           shikimori?.coverImage.large
         ) ?? '',
     },
 
-    description: pick(anilist?.description, kitsu?.description),
+    description: pick(jikan?.description, kitsu?.description),
 
-    format: pick(
-      anilist?.format,
-      kitsu?.format,
-      shikimori?.format
-    ) ?? 'TV',
+    format: pick(jikan?.format, kitsu?.format, shikimori?.format) ?? 'TV',
 
-    status: pick(
-      anilist?.status,
-      kitsu?.status,
-      shikimori?.status
-    ) ?? 'RELEASING',
+    status: pick(jikan?.status, kitsu?.status, shikimori?.status) ?? 'RELEASING',
 
     seasonYear: pick(
-      anilist?.seasonYear,
+      jikan?.seasonYear,
       kitsu?.seasonYear,
       shikimori?.seasonYear
     ),
 
-    episodes: pick(
-      anilist?.episodes,
-      kitsu?.episodes,
-      shikimori?.episodes
-    ),
+    episodes: pick(jikan?.episodes, kitsu?.episodes, shikimori?.episodes),
 
-    genres:
-      pick(
-        anilist?.genres,
-        shikimori?.genres,
-        kitsu?.genres
-      ) ?? [],
+    genres: pick(jikan?.genres, shikimori?.genres, kitsu?.genres) ?? [],
 
     averageScore: pick(
-      anilist?.averageScore,
+      jikan?.averageScore,
       shikimori?.averageScore,
       kitsu?.averageScore
     ),
 
-    // Studio: Shikimori paling akurat, lalu AniList, lalu Kitsu
+    // Studio: Jikan paling akurat, lalu Shikimori, lalu Kitsu
     studios: {
       nodes:
         pick(
+          jikan?.studios.nodes,
           shikimori?.studios.nodes,
-          anilist?.studios.nodes,
           kitsu?.studios.nodes
         ) ?? [],
     },
 
     startDate: {
       year: pick(
-        anilist?.startDate.year,
+        jikan?.startDate.year,
         kitsu?.startDate.year,
         shikimori?.startDate.year
       ),
       month: pick(
-        anilist?.startDate.month,
+        jikan?.startDate.month,
         kitsu?.startDate.month,
         shikimori?.startDate.month
       ),
       day: pick(
-        anilist?.startDate.day,
+        jikan?.startDate.day,
         kitsu?.startDate.day,
         shikimori?.startDate.day
       ),
@@ -826,7 +809,6 @@ export const animeCommand: CommandDefinition = {
           media = result.media;
           sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
 
-          // Cache hanya kalau studio ada
           const hasStudio =
             media.studios?.nodes?.[0]?.name &&
             media.studios.nodes[0].name !== 'Unknown';
