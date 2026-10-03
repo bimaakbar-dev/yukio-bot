@@ -122,7 +122,7 @@ export default {
       try {
         const bot = await getBot(env);
         const handler = webhookCallback(bot, 'cloudflare-mod', {
-          timeoutMilliseconds: 8000,
+          timeoutMilliseconds: 15000,
           onTimeout: 'return',
         });
         const res = await handler(request);
