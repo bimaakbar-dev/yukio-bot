@@ -1,37 +1,28 @@
-/**
- * Fetch dengan retry otomatis untuk 429/503.
- * Hormati header Retry-After kalau ada.
- */
 export async function fetchWithRetry(
   input: RequestInfo | URL,
   init?: RequestInit,
-  opts: { retries?: number; baseDelay?: number } = {}
+  opts: { retries?: number; baseDelay?: number; timeout?: number } = {}
 ): Promise<Response> {
-  const retries = opts.retries ?? 2;
-  const baseDelay = opts.baseDelay ?? 1500;
+  const retries = opts.retries ?? 0;
+  const baseDelay = opts.baseDelay ?? 500;
+  const timeout = opts.timeout ?? 5000;
+
   let lastErr: unknown;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+
     try {
-      const res = await fetch(input, init);
-
-      if ((res.status === 429 || res.status === 503) && attempt < retries) {
-        const ra = parseInt(res.headers.get('retry-after') ?? '0', 10);
-        const delay =
-          ra > 0
-            ? ra * 1000
-            : baseDelay * Math.pow(2, attempt);
-        await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
-        continue;
-      }
-
+      const res = await fetch(input, { ...init, signal: ctrl.signal });
+      clearTimeout(timer);
       return res;
     } catch (err) {
+      clearTimeout(timer);
       lastErr = err;
+
       if (attempt < retries) {
-        await new Promise((r) =>
-          setTimeout(r, baseDelay * Math.pow(2, attempt))
-        );
+        await new Promise(r => setTimeout(r, baseDelay));
         continue;
       }
       throw err;
