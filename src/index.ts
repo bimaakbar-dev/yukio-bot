@@ -6,6 +6,8 @@ import { cleanupCache } from './lib/cache';
 import { isAdmin } from './lib/permissions';
 import { handleDocumentAuto } from './commands/decode';
 import { setupAnimeCallbacks } from './commands/anime';
+import { handleDiscordRequest } from './discord/handler';
+import { registerDiscordCommands } from './discord/register';
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
@@ -79,6 +81,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // Health check
     if (url.pathname === '/health' || url.pathname === '/') {
       return new Response(
         JSON.stringify({
@@ -90,6 +93,7 @@ export default {
       );
     }
 
+    // Debug Telegram
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
@@ -117,6 +121,17 @@ export default {
       }
     }
 
+    // Discord — register slash commands (buka di browser sekali)
+    if (url.pathname === '/discord/register') {
+      return registerDiscordCommands(env);
+    }
+
+    // Discord — interaction endpoint
+    if (url.pathname === '/discord') {
+      return handleDiscordRequest(request, env);
+    }
+
+    // Telegram — webhook
     if (url.pathname === '/webhook') {
       const t0 = Date.now();
       try {
