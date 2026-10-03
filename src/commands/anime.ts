@@ -7,7 +7,7 @@ import { chatAI } from '../services/ai';
 import type { Env } from '../types/env';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const AI_TIMEOUT_MS = 10_000;
+const AI_TIMEOUT_MS = 5000;
 
 type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
 type AnimeType = 'TV' | 'Movie' | 'OVA' | 'ONA' | 'Special';
@@ -29,10 +29,6 @@ const STATUS_MAP: Record<string, AnimeStatus> = {
   CANCELLED: 'Hiatus',
   HIATUS: 'Hiatus',
 };
-
-/* ═══════════════════════════════════════════════
-   HELPERS
-   ═══════════════════════════════════════════════ */
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -87,10 +83,6 @@ function isEnglish(text: string): boolean {
   const matches = engWords.filter((w) => lower.includes(w)).length;
   return matches >= 3;
 }
-
-/* ═══════════════════════════════════════════════
-   AI ENRICHMENT
-   ═══════════════════════════════════════════════ */
 
 interface Enriched {
   studio?: string | null;
@@ -199,7 +191,6 @@ async function enrichWithAI(
   }
 }
 
-/** Bungkus enrichWithAI dengan timeout keras. */
 async function enrichWithAITimeout(
   env: Env,
   title: string,
@@ -213,6 +204,8 @@ async function enrichWithAITimeout(
 ): Promise<Enriched | null> {
   if (need.length === 0) return null;
 
+  console.log('[Anime] AI enrich starting...');
+
   return Promise.race([
     enrichWithAI(env, title, existing, need),
     new Promise<Enriched | null>((resolve) => {
@@ -221,12 +214,11 @@ async function enrichWithAITimeout(
         resolve(null);
       }, AI_TIMEOUT_MS);
     }),
-  ]);
+  ]).then((result) => {
+    console.log('[Anime] AI enrich result:', result ? 'got data' : 'null');
+    return result;
+  });
 }
-
-/* ═══════════════════════════════════════════════
-   BUILD YAML + BODY
-   ═══════════════════════════════════════════════ */
 
 interface BuildResult {
   yaml: string;
@@ -353,10 +345,6 @@ function buildResult(
   return { yaml, body: synopsis, missing, aiUsed };
 }
 
-/* ═══════════════════════════════════════════════
-   INFO CARD
-   ═══════════════════════════════════════════════ */
-
 function buildInfoMessage(media: AniListMedia): string {
   const title = pickTitle(media);
   const year = media.startDate?.year ?? media.seasonYear ?? '-';
@@ -380,10 +368,6 @@ function buildInfoMessage(media: AniListMedia): string {
   );
 }
 
-/* ═══════════════════════════════════════════════
-   MAL URL
-   ═══════════════════════════════════════════════ */
-
 function isMALUrl(s: string): boolean {
   return /^https?:\/\/(www\.)?myanimelist\.net\/anime\/\d+/i.test(s.trim());
 }
@@ -396,17 +380,12 @@ function extractTitleFromMALUrl(url: string): string | null {
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
 
-/* ═══════════════════════════════════════════════
-   FETCH CHAIN (Jikan → Kitsu)
-   ═══════════════════════════════════════════════ */
-
 async function fetchMetadata(query: string): Promise<{
   media: AniListMedia;
   source: string;
 } | null> {
   const errors: string[] = [];
 
-  // 1. Jikan (MAL)
   const t1 = Date.now();
   try {
     const jikan = await searchJikan(query);
@@ -420,7 +399,6 @@ async function fetchMetadata(query: string): Promise<{
     console.warn(`[Anime] Jikan failed in ${Date.now() - t1}ms:`, msg);
   }
 
-  // 2. Kitsu
   const t2 = Date.now();
   try {
     const kitsu = await searchKitsu(query);
@@ -437,10 +415,6 @@ async function fetchMetadata(query: string): Promise<{
   console.warn('[Anime] All APIs failed:', errors);
   return null;
 }
-
-/* ═══════════════════════════════════════════════
-   DETECT MISSING
-   ═══════════════════════════════════════════════ */
 
 function detectMissing(media: AniListMedia, source: string): string[] {
   const need: string[] = [];
@@ -469,10 +443,6 @@ function detectMissing(media: AniListMedia, source: string): string[] {
 
   return need;
 }
-
-/* ═══════════════════════════════════════════════
-   COMMAND
-   ═══════════════════════════════════════════════ */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
@@ -556,6 +526,7 @@ export const animeCommand: CommandDefinition = {
       const need = detectMissing(media, sourceName);
 
       let enriched: Enriched | null = null;
+
       if (need.length > 0) {
         const aiLoading = await ctx.reply(
           `🤖 AI melengkapi: <code>${need.join(', ')}</code>...`,
@@ -581,6 +552,8 @@ export const animeCommand: CommandDefinition = {
           .catch(() => {});
 
         console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
+      } else {
+        console.log('[Anime] no AI needed — skipping');
       }
 
       const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
