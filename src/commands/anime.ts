@@ -1,7 +1,7 @@
 import type { CommandDefinition } from './registry';
 import type { Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
-import type { AniListMedia } from '../services/anilist';
+import type { AniListMedia } from '../types/anime';
 import { searchJikan, jikanToAniList } from '../services/jikan';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
@@ -678,7 +678,8 @@ async function fetchAndMerge(query: string): Promise<{
 
     format: pick(jikan?.format, kitsu?.format, shikimori?.format) ?? 'TV',
 
-    status: pick(jikan?.status, kitsu?.status, shikimori?.status) ?? 'RELEASING',
+    status:
+      pick(jikan?.status, kitsu?.status, shikimori?.status) ?? 'RELEASING',
 
     seasonYear: pick(
       jikan?.seasonYear,
@@ -696,7 +697,6 @@ async function fetchAndMerge(query: string): Promise<{
       kitsu?.averageScore
     ),
 
-    // Studio: Jikan paling akurat, lalu Shikimori, lalu Kitsu
     studios: {
       nodes:
         pick(
