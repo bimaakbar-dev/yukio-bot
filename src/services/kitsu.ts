@@ -23,7 +23,6 @@ interface KitsuAnime {
   };
   relationships?: {
     categories?: { data: { type: string; id: string }[] };
-    studios?: { data: { type: string; id: string }[] };
   };
 }
 
@@ -31,8 +30,8 @@ interface KitsuIncluded {
   id: string;
   type: string;
   attributes: {
-    title?: string;   // untuk categories
-    name?: string;    // untuk studios
+    title?: string;
+    name?: string;
   };
 }
 
@@ -44,12 +43,15 @@ interface KitsuResponse {
 interface KitsuSearchResult {
   anime: KitsuAnime;
   genres: string[];
-  studio: string | null;
 }
 
-export async function searchKitsu(title: string): Promise<KitsuSearchResult | null> {
-  // include=categories,studios → fetch genre & studio sekaligus
-  const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(title)}&include=categories,studios&page[limit]=1`;
+export async function searchKitsu(
+  title: string
+): Promise<KitsuSearchResult | null> {
+  // Hanya include=categories — studios tidak valid relationship
+  const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(
+    title
+  )}&include=categories&page[limit]=1`;
 
   const res = await fetch(url, {
     headers: {
@@ -75,27 +77,16 @@ export async function searchKitsu(title: string): Promise<KitsuSearchResult | nu
     (r) => r.id
   );
   const genres = included
-    .filter(
-      (i) => i.type === 'categories' && categoryIds.includes(i.id)
-    )
+    .filter((i) => i.type === 'categories' && categoryIds.includes(i.id))
     .map((i) => i.attributes.title)
     .filter((t): t is string => !!t)
     .slice(0, 5);
 
-  // Extract studio dari included
-  const studioIds = (anime.relationships?.studios?.data ?? []).map(
-    (r) => r.id
-  );
-  const studioMatch = included.find(
-    (i) => i.type === 'studios' && studioIds.includes(i.id)
-  );
-  const studio = studioMatch?.attributes.name ?? null;
-
-  return { anime, genres, studio };
+  return { anime, genres };
 }
 
 export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
-  const { anime, genres, studio } = result;
+  const { anime, genres } = result;
   const attr = anime.attributes;
 
   const format = (attr.subtype || 'TV').toUpperCase();
@@ -130,9 +121,7 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     episodes: attr.episodeCount,
     genres,
     averageScore,
-    studios: {
-      nodes: studio ? [{ name: studio }] : [],
-    },
+    studios: { nodes: [] }, // Kitsu tidak punya studio relationship yang mudah
     startDate: {
       year: date?.getFullYear() ?? null,
       month: date ? date.getMonth() + 1 : null,
