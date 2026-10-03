@@ -1,10 +1,15 @@
 import type { Env } from '../types/env';
 
-const MODELS = [
+const MODELS_CHEAP = [
   '@cf/ibm-granite/granite-4.0-h-micro',
   '@cf/meta/llama-3.2-1b-instruct',
   '@cf/qwen/qwen3-30b-a3b-fp8',
-  '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
+];
+
+const MODELS_SMART = [
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+  '@cf/meta/llama-3.1-8b-instruct-fast',
+  '@cf/qwen/qwen3-30b-a3b-fp8',
 ];
 
 interface AIMessage {
@@ -31,11 +36,12 @@ function extractResponse(res: unknown): string {
 async function runAI(
   env: Env,
   messages: AIMessage[],
-  options: { maxTokens: number; temperature: number }
+  options: { maxTokens: number; temperature: number },
+  models: string[]
 ): Promise<string> {
   const errors: string[] = [];
 
-  for (const model of MODELS) {
+  for (const model of models) {
     try {
       console.log(`[AI] Trying model: ${model}`);
 
@@ -74,11 +80,13 @@ export async function askAI(
     system?: string;
     maxTokens?: number;
     temperature?: number;
+    smart?: boolean;
   }
 ): Promise<string> {
   const opts = options ?? {};
   const maxTokens = opts.maxTokens ?? 800;
   const temperature = opts.temperature ?? 0.7;
+  const models = opts.smart ? MODELS_SMART : MODELS_CHEAP;
 
   const messages: AIMessage[] = [];
 
@@ -87,7 +95,7 @@ export async function askAI(
   }
   messages.push({ role: 'user', content: prompt });
 
-  return runAI(env, messages, { maxTokens, temperature });
+  return runAI(env, messages, { maxTokens, temperature }, models);
 }
 
 export async function chatAI(
@@ -96,11 +104,13 @@ export async function chatAI(
   options?: {
     maxTokens?: number;
     temperature?: number;
+    smart?: boolean;
   }
 ): Promise<string> {
   const opts = options ?? {};
   const maxTokens = opts.maxTokens ?? 800;
   const temperature = opts.temperature ?? 0.7;
+  const models = opts.smart ? MODELS_SMART : MODELS_CHEAP;
 
-  return runAI(env, messages, { maxTokens, temperature });
+  return runAI(env, messages, { maxTokens, temperature }, models);
 }
