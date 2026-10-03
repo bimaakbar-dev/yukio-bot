@@ -16,11 +16,6 @@ interface AIMessage {
   content: string;
 }
 
-interface AIOptions {
-  maxTokens?: number;
-  temperature?: number;
-}
-
 /**
  * Ekstrak string dari response Workers AI.
  * Format response bisa berbeda antar model.
