@@ -1,3 +1,4 @@
+import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from './anilist';
 
 const KITSU_URL = 'https://kitsu.io/api/edge/anime';
@@ -20,6 +21,7 @@ interface KitsuAnime {
     startDate: string | null;
     episodeCount: number | null;
     averageRating: string | null;
+    synopsis: string | null;
   };
   relationships?: {
     categories?: { data: { type: string; id: string }[] };
@@ -48,12 +50,11 @@ interface KitsuSearchResult {
 export async function searchKitsu(
   title: string
 ): Promise<KitsuSearchResult | null> {
-  // Hanya include=categories — studios tidak valid relationship
   const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(
     title
   )}&include=categories&page[limit]=1`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     headers: {
       Accept: 'application/vnd.api+json',
       'Content-Type': 'application/vnd.api+json',
@@ -72,7 +73,6 @@ export async function searchKitsu(
 
   const included = json.included ?? [];
 
-  // Extract genre dari included
   const categoryIds = (anime.relationships?.categories?.data ?? []).map(
     (r) => r.id
   );
@@ -115,13 +115,14 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
       extraLarge: cover,
       large: cover,
     },
+    description: attr.synopsis ?? null,
     format,
     status,
     seasonYear: date?.getFullYear() ?? null,
     episodes: attr.episodeCount,
     genres,
     averageScore,
-    studios: { nodes: [] }, // Kitsu tidak punya studio relationship yang mudah
+    studios: { nodes: [] },
     startDate: {
       year: date?.getFullYear() ?? null,
       month: date ? date.getMonth() + 1 : null,
