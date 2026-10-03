@@ -7,6 +7,7 @@ import { chatAI } from '../services/ai';
 import type { Env } from '../types/env';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const AI_TIMEOUT_MS = 10_000;
 
 type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
 type AnimeType = 'TV' | 'Movie' | 'OVA' | 'ONA' | 'Special';
@@ -28,6 +29,10 @@ const STATUS_MAP: Record<string, AnimeStatus> = {
   CANCELLED: 'Hiatus',
   HIATUS: 'Hiatus',
 };
+
+/* ═══════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════ */
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -192,6 +197,31 @@ async function enrichWithAI(
     console.error('[Anime] AI enrich failed:', err);
     return null;
   }
+}
+
+/** Bungkus enrichWithAI dengan timeout keras. */
+async function enrichWithAITimeout(
+  env: Env,
+  title: string,
+  existing: {
+    studio?: string | null;
+    rating?: number | null;
+    genre?: string[] | null;
+    releaseDate?: string | null;
+  },
+  need: string[]
+): Promise<Enriched | null> {
+  if (need.length === 0) return null;
+
+  return Promise.race([
+    enrichWithAI(env, title, existing, need),
+    new Promise<Enriched | null>((resolve) => {
+      setTimeout(() => {
+        console.warn(`[Anime] AI timeout after ${AI_TIMEOUT_MS}ms`);
+        resolve(null);
+      }, AI_TIMEOUT_MS);
+    }),
+  ]);
 }
 
 /* ═══════════════════════════════════════════════
@@ -376,28 +406,32 @@ async function fetchMetadata(query: string): Promise<{
 } | null> {
   const errors: string[] = [];
 
-  // 1. Jikan (MAL) — data paling lengkap, unlimited
+  // 1. Jikan (MAL)
+  const t1 = Date.now();
   try {
     const jikan = await searchJikan(query);
     if (jikan) {
+      console.log(`[Anime] Jikan OK in ${Date.now() - t1}ms`);
       return { media: jikanToAniList(jikan), source: 'Jikan (MAL)' };
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`Jikan: ${msg}`);
-    console.warn('[Anime] Jikan failed:', msg);
+    console.warn(`[Anime] Jikan failed in ${Date.now() - t1}ms:`, msg);
   }
 
-  // 2. Kitsu — reliable, studio di-fetch terpisah
+  // 2. Kitsu
+  const t2 = Date.now();
   try {
     const kitsu = await searchKitsu(query);
     if (kitsu) {
+      console.log(`[Anime] Kitsu OK in ${Date.now() - t2}ms`);
       return { media: kitsuToAniList(kitsu), source: 'Kitsu' };
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     errors.push(`Kitsu: ${msg}`);
-    console.warn('[Anime] Kitsu failed:', msg);
+    console.warn(`[Anime] Kitsu failed in ${Date.now() - t2}ms:`, msg);
   }
 
   console.warn('[Anime] All APIs failed:', errors);
@@ -447,6 +481,8 @@ export const animeCommand: CommandDefinition = {
   adminOnly: true,
 
   handler: async (ctx, env) => {
+    const T0 = Date.now();
+
     const argQuery = typeof ctx.match === 'string' ? ctx.match.trim() : '';
     const repliedText = ctx.message?.reply_to_message?.text ?? '';
     const query = argQuery || repliedText;
@@ -482,6 +518,7 @@ export const animeCommand: CommandDefinition = {
 
       if (media) {
         sourceLabel = '⚡ Dari cache';
+        console.log(`[Anime] cache hit at ${Date.now() - T0}ms`);
       } else {
         const result = await fetchMetadata(searchQuery);
         if (result) {
@@ -489,6 +526,7 @@ export const animeCommand: CommandDefinition = {
           sourceLabel = `📡 Sumber: ${result.source}`;
           await setCache(env.DB, cacheKey, media, CACHE_TTL_MS);
         }
+        console.log(`[Anime] fetch stage done at ${Date.now() - T0}ms`);
       }
 
       if (!media) {
@@ -524,7 +562,7 @@ export const animeCommand: CommandDefinition = {
           { parse_mode: 'HTML' }
         );
 
-        enriched = await enrichWithAI(
+        enriched = await enrichWithAITimeout(
           env,
           pickTitle(media),
           {
@@ -541,6 +579,8 @@ export const animeCommand: CommandDefinition = {
         await ctx.api
           .deleteMessage(ctx.chat!.id, aiLoading.message_id)
           .catch(() => {});
+
+        console.log(`[Anime] AI stage done at ${Date.now() - T0}ms`);
       }
 
       const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
@@ -594,16 +634,26 @@ export const animeCommand: CommandDefinition = {
       if (sourceLabel) {
         await ctx.reply(sourceLabel);
       }
+
+      console.log(`[Anime] total: ${Date.now() - T0}ms`);
     } catch (err: any) {
-      console.error('[Anime] error:', err);
-      await ctx.api
-        .editMessageText(
+      const elapsed = Date.now() - T0;
+      console.error(`[Anime] error after ${elapsed}ms:`, err);
+
+      try {
+        await ctx.api.editMessageText(
           ctx.chat!.id,
           loading.message_id,
-          `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`,
+          `❌ <b>Gagal memuat data</b> (${elapsed}ms)\n\n` +
+            `Error: <code>${escapeHtml(err?.message ?? 'unknown')}</code>\n\n` +
+            `<i>Coba lagi beberapa menit.</i>`,
           { parse_mode: 'HTML' }
-        )
-        .catch(() => {});
+        );
+      } catch {
+        await ctx.reply(
+          `❌ Gagal: ${escapeHtml(err?.message ?? 'unknown')}`
+        ).catch(() => {});
+      }
     }
   },
 };
