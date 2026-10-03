@@ -1,20 +1,187 @@
 import type { CommandDefinition } from './registry';
-import type { Context } from 'grammy';
+import type { Context, Bot } from 'grammy';
 import type { Env } from '../types/env';
 import { InlineKeyboard } from 'grammy';
+import type { D1Database } from '@cloudflare/workers-types';
+
+/* ═══════════════════════════════════════════════
+   CONSTANTS
+   ═══════════════════════════════════════════════ */
 
 const MAX_INPUT_LEN = 8000;
 const MAX_FILE_CHARS = 300_000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_LAYERS = 5;
-const MAX_URLS_SHOWN = 15;
 const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 2;
+const PAGE_CHAR_BUDGET = 3500;
+const SESSION_TTL_MS = 60 * 60 * 1000;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
   'em', 'embed', 'target', 'id', 'file', 'video',
 ]);
+
+const VIDEO_EXT_RE = /\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i;
+const VIDEO_HOSTS = [
+  'player.', 'streamtape', 'dood', 'filemoon', 'voe', 'mp4upload',
+  'mixdrop', 'abyss', 'framezi', 'kturb', 'pixeldrain', 'vikingfile',
+  'buzzheavier', 'mega.nz', 'doply',
+];
+
+/* ═══════════════════════════════════════════════
+   DB: AUTO-CREATE TABLE (idempotent, dijalankan sekali per isolate)
+   ═══════════════════════════════════════════════ */
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS temp_decode (
+            session_id  TEXT PRIMARY KEY,
+            chat_id     INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            pages       TEXT NOT NULL,
+            total       INTEGER NOT NULL,
+            page_count  INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL
+          )`
+        )
+        .run();
+
+      await db
+        .prepare(
+          'CREATE INDEX IF NOT EXISTS idx_temp_expires ON temp_decode(expires_at)'
+        )
+        .run();
+
+      await db
+        .prepare(
+          'CREATE INDEX IF NOT EXISTS idx_temp_chat ON temp_decode(chat_id)'
+        )
+        .run();
+
+      dbReady = true;
+    } catch (err) {
+      console.error('[Decode] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+/* ═══════════════════════════════════════════════
+   SESSION HELPERS (inline)
+   ═══════════════════════════════════════════════ */
+
+interface TempSession {
+  session_id: string;
+  user_id: number;
+  pages: string[][];
+  total: number;
+  page_count: number;
+}
+
+async function createSession(
+  db: D1Database,
+  chatId: number,
+  userId: number,
+  pages: string[][]
+): Promise<string> {
+  await ensureDb(db);
+
+  const sessionId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  const now = Date.now();
+  const total = pages.reduce((s, p) => s + p.length, 0);
+
+  await db
+    .prepare(
+      `INSERT INTO temp_decode
+         (session_id, chat_id, user_id, pages, total, page_count, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      chatId,
+      userId,
+      JSON.stringify(pages),
+      total,
+      pages.length,
+      now,
+      now + SESSION_TTL_MS
+    )
+    .run();
+
+  return sessionId;
+}
+
+async function getSession(
+  db: D1Database,
+  sessionId: string
+): Promise<TempSession | null> {
+  await ensureDb(db);
+
+  const row = await db
+    .prepare(
+      'SELECT session_id, user_id, pages, total, page_count, expires_at FROM temp_decode WHERE session_id = ?'
+    )
+    .bind(sessionId)
+    .first<{
+      session_id: string;
+      user_id: number;
+      pages: string;
+      total: number;
+      page_count: number;
+      expires_at: number;
+    }>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM temp_decode WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return {
+    session_id: row.session_id,
+    user_id: row.user_id,
+    pages: JSON.parse(row.pages),
+    total: row.total,
+    page_count: row.page_count,
+  };
+}
+
+async function deleteSession(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await db
+      .prepare('DELETE FROM temp_decode WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.error('[Decode] delete error:', err);
+  }
+}
+
+/* ═══════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════ */
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -84,9 +251,15 @@ function looksLikeHtml(s: string): boolean {
   );
 }
 
-/* ─────────────────────────────────────────────
-   EXTRACT URL DARI HASIL DECODE
-   ───────────────────────────────────────────── */
+function isVideoUrl(url: string): boolean {
+  if (VIDEO_EXT_RE.test(url)) return true;
+  const lower = url.toLowerCase();
+  return VIDEO_HOSTS.some((h) => lower.includes(h));
+}
+
+/* ═══════════════════════════════════════════════
+   URL EXTRACTION
+   ═══════════════════════════════════════════════ */
 
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
@@ -133,10 +306,6 @@ function extractUrlsFromDecoded(s: string): string[] {
   return [...found];
 }
 
-/* ─────────────────────────────────────────────
-   EXPAND QUERY PARAMS (bsrc, url, dll)
-   ───────────────────────────────────────────── */
-
 function expandUrlParams(url: string, depth = 0): string[] {
   const out = new Set<string>([url]);
   if (depth > MAX_PARAM_DEPTH) return [...out];
@@ -150,10 +319,8 @@ function expandUrlParams(url: string, depth = 0): string[] {
 
   for (const [key, value] of parsed.searchParams.entries()) {
     if (!value || value.length < 12) continue;
-    const keyLower = key.toLowerCase();
-    if (!BASE64_PARAM_NAMES.has(keyLower)) continue;
+    if (!BASE64_PARAM_NAMES.has(key.toLowerCase())) continue;
 
-    // Case A: value berupa Base64
     if (isLikelyBase64(value)) {
       const decoded = decodeBase64(value);
       if (decoded && isPrintable(decoded)) {
@@ -164,7 +331,6 @@ function expandUrlParams(url: string, depth = 0): string[] {
       }
     }
 
-    // Case B: value berupa URL-encoded URL (http%3A%2F%2F...)
     if (/^https?%3A/i.test(value)) {
       try {
         const dec = decodeURIComponent(value);
@@ -179,34 +345,6 @@ function expandUrlParams(url: string, depth = 0): string[] {
 
   return [...out];
 }
-
-/* ─────────────────────────────────────────────
-   KLASIFIKASI URL
-   ───────────────────────────────────────────── */
-
-const VIDEO_HOST_HINTS = [
-  'player.', 'streamtape', 'dood', 'filemoon', 'voe', 'mp4upload',
-  'mixdrop', 'abyss', 'framezi', 'kturb', 'pixeldrain', 'vikingfile',
-  'buzzheavier', 'mega.nz',
-];
-
-function isVideoUrl(url: string): boolean {
-  if (/\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i.test(url)) return true;
-  const lower = url.toLowerCase();
-  return VIDEO_HOST_HINTS.some((h) => lower.includes(h));
-}
-
-function extractHost(url: string): string {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return '';
-  }
-}
-
-/* ─────────────────────────────────────────────
-   MULTI-LAYER DECODE
-   ───────────────────────────────────────────── */
 
 interface DecodeResult {
   output: string;
@@ -234,10 +372,6 @@ function multiLayerDecode(input: string): DecodeResult | null {
   if (layers === 0) return null;
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
-
-/* ─────────────────────────────────────────────
-   EXTRACT KANDIDAT BASE64 DARI HTML
-   ───────────────────────────────────────────── */
 
 function extractBase64Candidates(html: string): string[] {
   const found = new Map<string, number>();
@@ -267,213 +401,180 @@ function extractBase64Candidates(html: string): string[] {
     .map(([c]) => c);
 }
 
-/* ─────────────────────────────────────────────
-   PROSES KANDIDAT → URL FINAL
-   ───────────────────────────────────────────── */
-
-interface FinalUrl {
-  url: string;
-  layers: number;
-  is_video: boolean;
-  host: string;
-  fromParam: boolean;
-}
-
-function addUrl(
-  map: Map<string, FinalUrl>,
-  url: string,
-  layers: number,
-  fromParam: boolean
-): void {
-  if (url.length > 2000) return;
-  const existing = map.get(url);
-  const is_video = isVideoUrl(url);
-  const host = extractHost(url);
-
-  if (!existing) {
-    map.set(url, { url, layers, is_video, host, fromParam });
-  } else if (existing.fromParam && !fromParam) {
-    existing.fromParam = false;
-  }
-}
-
-function processCandidates(candidates: string[]): FinalUrl[] {
-  const map = new Map<string, FinalUrl>();
+function collectVideoUrls(candidates: string[]): string[] {
+  const videos = new Set<string>();
 
   for (const raw of candidates) {
     const res = multiLayerDecode(raw);
     if (!res || res.urls.length === 0) continue;
 
     for (const url of res.urls) {
-      addUrl(map, url, res.layers, false);
+      if (isVideoUrl(url)) videos.add(url);
       for (const expanded of expandUrlParams(url)) {
-        if (expanded === url) continue;
-        addUrl(map, expanded, res.layers, true);
+        if (expanded !== url && isVideoUrl(expanded)) videos.add(expanded);
       }
     }
   }
 
-  return [...map.values()].sort((a, b) => {
-    if (a.is_video !== b.is_video) return a.is_video ? -1 : 1;
-    if (a.fromParam !== b.fromParam) return a.fromParam ? 1 : -1;
-    return a.url.length - b.url.length;
-  });
+  return [...videos];
 }
 
-/* ─────────────────────────────────────────────
-   RENDER
-   ───────────────────────────────────────────── */
+function paginate(urls: string[], budget = PAGE_CHAR_BUDGET): string[][] {
+  const pages: string[][] = [];
+  let cur: string[] = [];
+  let curLen = 0;
 
-function renderOutput(urls: FinalUrl[]): {
-  text: string;
-  keyboard: InlineKeyboard | undefined;
-} {
-  const videos = urls.filter((u) => u.is_video && !u.fromParam);
-  const others = urls.filter((u) => !u.is_video && !u.fromParam);
-  const fromParams = urls.filter((u) => u.fromParam);
+  urls.forEach((url, i) => {
+    const lineLen = `${i + 1}. <code>${url}</code>\n`.length;
+    if (curLen + lineLen > budget && cur.length > 0) {
+      pages.push(cur);
+      cur = [];
+      curLen = 0;
+    }
+    cur.push(url);
+    curLen += lineLen;
+  });
+  if (cur.length > 0) pages.push(cur);
+  return pages.length > 0 ? pages : [[]];
+}
+
+/* ═══════════════════════════════════════════════
+   RENDER HALAMAN
+   ═══════════════════════════════════════════════ */
+
+function renderPage(opts: {
+  sessionId: string;
+  pageIdx: number;
+  pageCount: number;
+  urls: string[];
+  total: number;
+  offset: number;
+}): { text: string; keyboard: InlineKeyboard } {
+  const { sessionId, pageIdx, pageCount, urls, total, offset } = opts;
 
   const lines: string[] = [];
-  lines.push('✅ <b>Decode berhasil</b>');
+  lines.push('🎬 <b>URL Video</b>');
   lines.push('');
   lines.push(
-    `🔗 URL: <b>${urls.length}</b>  ·  🎬 Video: <b>${videos.length}</b>`
+    `Total: <b>${total}</b>  ·  Halaman <b>${pageIdx + 1}/${pageCount}</b>`
   );
   lines.push('');
 
-  if (videos.length > 0) {
-    lines.push('<b>🎬 Video / Embed:</b>');
-    videos.slice(0, MAX_URLS_SHOWN).forEach((u, i) => {
-      const suffix = u.layers > 1 ? ` <i>(${u.layers}x)</i>` : '';
-      lines.push(`${i + 1}. <code>${escapeHtml(u.url)}</code>${suffix}`);
-    });
-    if (videos.length > MAX_URLS_SHOWN) {
-      lines.push(`<i>… +${videos.length - MAX_URLS_SHOWN} lagi</i>`);
-    }
-    lines.push('');
-  }
+  urls.forEach((u, i) => {
+    lines.push(`${offset + i + 1}. <code>${escapeHtml(u)}</code>`);
+  });
 
-  if (others.length > 0) {
-    const show = videos.length > 0 ? 5 : MAX_URLS_SHOWN;
-    lines.push(
-      videos.length > 0 ? '<b>🔗 URL lain:</b>' : '<b>🔗 URL:</b>'
-    );
-    others.slice(0, show).forEach((u, i) => {
-      lines.push(`${i + 1}. <code>${escapeHtml(u.url)}</code>`);
-    });
-    if (others.length > show) {
-      lines.push(`<i>… +${others.length - show} URL lain</i>`);
-    }
-    lines.push('');
-  }
+  const kb = new InlineKeyboard();
 
-  if (fromParams.length > 0) {
-    lines.push('<b>🔍 Dari dalam URL (param):</b>');
-    fromParams.slice(0, MAX_URLS_SHOWN).forEach((u, i) => {
-      lines.push(`${i + 1}. <code>${escapeHtml(u.url)}</code>`);
-    });
-    if (fromParams.length > MAX_URLS_SHOWN) {
-      lines.push(`<i>… +${fromParams.length - MAX_URLS_SHOWN} lagi</i>`);
-    }
+  if (pageIdx > 0) {
+    kb.text('⬅ Prev', `dc:p:${sessionId}:${pageIdx - 1}`);
+  } else {
+    kb.text('·', 'dc:noop');
   }
+  kb.text(`${pageIdx + 1}/${pageCount}`, 'dc:noop');
+  if (pageIdx < pageCount - 1) {
+    kb.text('Next ➡', `dc:p:${sessionId}:${pageIdx + 1}`);
+  } else {
+    kb.text('·', 'dc:noop');
+  }
+  kb.row();
 
-  const keyboard = new InlineKeyboard();
-  const top = [...videos, ...others, ...fromParams].slice(0, 6);
-  top.forEach((u, i) => {
-    if (u.url.length < 1900) {
-      const icon = u.is_video ? '🎬' : u.fromParam ? '🔍' : '🔗';
-      keyboard.url(`${icon} ${i + 1}`, u.url);
-      if ((i + 1) % 3 === 0) keyboard.row();
+  kb.text('✅ Selesai & Hapus', `dc:x:${sessionId}`).row();
+
+  urls.slice(0, 3).forEach((u, i) => {
+    if (u.length < 1900) {
+      kb.url(`🎬 Buka ${offset + i + 1}`, u);
+      if ((i + 1) % 3 === 0) kb.row();
     }
   });
 
-  return {
-    text: lines.join('\n'),
-    keyboard: keyboard.inline_keyboard.length > 0 ? keyboard : undefined,
-  };
+  return { text: lines.join('\n'), keyboard: kb };
 }
 
-/* ─────────────────────────────────────────────
-   CORE PROCESS
-   ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════
+   PROSES INPUT
+   ═══════════════════════════════════════════════ */
 
-export async function processHtmlInput(
+async function processInput(
   ctx: Context,
-  html: string
+  env: Env,
+  input: string,
+  sourceType: 'base64' | 'html'
 ): Promise<void> {
-  const candidates = extractBase64Candidates(html);
+  const loading = await ctx.reply(
+    sourceType === 'html' ? '🌐 Proses HTML...' : '🔓 Proses Base64...'
+  );
 
-  if (candidates.length === 0) {
-    await ctx.reply('🌐 <b>HTML terdeteksi</b>\n\n❌ Tidak ada Base64.', {
+  try {
+    const candidates =
+      sourceType === 'html' ? extractBase64Candidates(input) : [input];
+
+    if (candidates.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '❌ Tidak ada Base64 yang ditemukan.'
+      );
+      return;
+    }
+
+    const videos = collectVideoUrls(candidates);
+
+    if (videos.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Tidak ada URL video.\n\n` +
+          `<i>Dari ${candidates.length} kandidat Base64, ` +
+          `tidak ada yang decode ke URL video.</i>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const pages = paginate(videos);
+    const sessionId = await createSession(
+      env.DB,
+      ctx.chat!.id,
+      ctx.from!.id,
+      pages
+    );
+
+    await ctx.api
+      .deleteMessage(ctx.chat!.id, loading.message_id)
+      .catch(() => {});
+
+    const { text, keyboard } = renderPage({
+      sessionId,
+      pageIdx: 0,
+      pageCount: pages.length,
+      urls: pages[0] ?? [],
+      total: videos.length,
+      offset: 0,
+    });
+
+    await ctx.reply(text, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
+      reply_markup: keyboard,
     });
-    return;
+  } catch (err: any) {
+    console.error('[Decode] process error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`
+      )
+      .catch(() => {});
   }
-
-  const urls = processCandidates(candidates);
-
-  if (urls.length === 0) {
-    await ctx.reply(
-      `🌐 <b>HTML terdeteksi</b>\n\n` +
-        `📦 Kandidat: ${candidates.length}\n` +
-        `❌ Tidak ada URL valid.`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-    return;
-  }
-
-  const { text, keyboard } = renderOutput(urls);
-  const header = `🌐 <b>HTML terdeteksi</b>\n📦 Kandidat: ${candidates.length}\n\n`;
-
-  await ctx.reply(header + text, {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: keyboard,
-  });
 }
 
-export async function processBase64Input(
-  ctx: Context,
-  input: string
-): Promise<void> {
-  const result = multiLayerDecode(input);
-
-  if (!result || result.urls.length === 0) {
-    const preview =
-      input.length > 80 ? input.slice(0, 40) + '…' + input.slice(-20) : input;
-    await ctx.reply(
-      '❌ <b>Gagal decode / tidak ada URL</b>\n\n' +
-        `<code>${escapeHtml(preview)}</code>`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-    return;
-  }
-
-  const urls: FinalUrl[] = [];
-  const map = new Map<string, FinalUrl>();
-  for (const u of result.urls) {
-    addUrl(map, u, result.layers, false);
-    for (const exp of expandUrlParams(u)) {
-      if (exp === u) continue;
-      addUrl(map, exp, result.layers, true);
-    }
-  }
-  urls.push(...map.values());
-
-  const { text, keyboard } = renderOutput(urls);
-
-  await ctx.reply(text, {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: keyboard,
-  });
-}
-
-/* ─────────────────────────────────────────────
+/* ═══════════════════════════════════════════════
    DOWNLOAD FILE
-   ───────────────────────────────────────────── */
+   ═══════════════════════════════════════════════ */
 
-export async function downloadDocText(
+async function downloadDocText(
   ctx: Context,
   env: Env
 ): Promise<string | null> {
@@ -530,9 +631,9 @@ export async function downloadDocText(
   }
 }
 
-/* ─────────────────────────────────────────────
-   AUTO HANDLER (dipanggil dari index.ts)
-   ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════
+   AUTO HANDLER (untuk index.ts)
+   ═══════════════════════════════════════════════ */
 
 export async function handleDocumentAuto(
   ctx: Context,
@@ -542,21 +643,111 @@ export async function handleDocumentAuto(
   if (!text) return;
 
   if (looksLikeHtml(text)) {
-    await processHtmlInput(ctx, text);
+    await processInput(ctx, env, text, 'html');
   } else if (isLikelyBase64(text)) {
-    await processBase64Input(ctx, text.trim());
+    await processInput(ctx, env, text.trim(), 'base64');
   } else {
-    await processHtmlInput(ctx, text);
+    await processInput(ctx, env, text, 'html');
   }
 }
 
-/* ─────────────────────────────────────────────
+/* ═══════════════════════════════════════════════
+   CALLBACK HANDLERS
+   ═══════════════════════════════════════════════ */
+
+export function setupDecodeCallbacks(bot: Bot, env: Env): void {
+  // Pagination
+  bot.callbackQuery(/^dc:p:([a-f0-9]+):(\d+)$/, async (ctx) => {
+    const [, sessionId, pageStr] = ctx.match as RegExpMatchArray;
+    const pageIdx = parseInt(pageStr ?? '0', 10);
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
+      return;
+    }
+
+    const session = await getSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Session kadaluarsa. Kirim ulang file.',
+        show_alert: true,
+      });
+      await ctx
+        .editMessageReplyMarkup({ reply_markup: undefined })
+        .catch(() => {});
+      return;
+    }
+
+    if (ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    if (pageIdx < 0 || pageIdx >= session.page_count) {
+      await ctx.answerCallbackQuery({ text: '❌ Halaman tidak ada' });
+      return;
+    }
+
+    let offset = 0;
+    for (let i = 0; i < pageIdx; i++) {
+      offset += session.pages[i]?.length ?? 0;
+    }
+
+    const { text, keyboard } = renderPage({
+      sessionId,
+      pageIdx,
+      pageCount: session.page_count,
+      urls: session.pages[pageIdx] ?? [],
+      total: session.total,
+      offset,
+    });
+
+    await ctx.editMessageText(text, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: keyboard,
+    });
+    await ctx.answerCallbackQuery();
+  });
+
+  // Selesai & hapus
+  bot.callbackQuery(/^dc:x:([a-f0-9]+)$/, async (ctx) => {
+    const [, sessionId] = ctx.match as RegExpMatchArray;
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
+      return;
+    }
+
+    const session = await getSession(env.DB, sessionId);
+    if (session && ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    await deleteSession(env.DB, sessionId);
+
+    await ctx
+      .editMessageText('✅ <b>Selesai</b> — data sudah dihapus dari DB.', {
+        parse_mode: 'HTML',
+        reply_markup: undefined,
+      })
+      .catch(() => {});
+
+    await ctx.answerCallbackQuery({ text: '🗑️ Session dihapus' });
+  });
+
+  // Noop
+  bot.callbackQuery('dc:noop', async (ctx) => {
+    await ctx.answerCallbackQuery();
+  });
+}
+
+/* ═══════════════════════════════════════════════
    COMMAND
-   ───────────────────────────────────────────── */
+   ═══════════════════════════════════════════════ */
 
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
-  description: 'Decode Base64 / HTML → URL (auto + param expand)',
+  description: 'Decode HTML/Base64 → URL video',
   usage: '/decode base64-atau-html',
   adminOnly: true,
 
@@ -567,11 +758,11 @@ export const decodeCommand: CommandDefinition = {
       const text = await downloadDocText(ctx, env);
       if (!text) return;
       if (looksLikeHtml(text)) {
-        await processHtmlInput(ctx, text);
+        await processInput(ctx, env, text, 'html');
       } else if (isLikelyBase64(text)) {
-        await processBase64Input(ctx, text.trim());
+        await processInput(ctx, env, text.trim(), 'base64');
       } else {
-        await processHtmlInput(ctx, text);
+        await processInput(ctx, env, text, 'html');
       }
       return;
     }
@@ -582,11 +773,12 @@ export const decodeCommand: CommandDefinition = {
 
     if (!input) {
       await ctx.reply(
-        '<b>🔓 Decode Base64 / HTML</b>\n\n' +
+        '<b>🔓 Decode → URL Video</b>\n\n' +
           '<b>Mode teks:</b> <code>/decode aHR0cHM6...</code>\n' +
           '<b>Mode reply:</b> reply ke pesan → /decode\n' +
           '<b>Mode file:</b> kirim .html/.txt → auto proses\n\n' +
-          '<i>Auto expand <code>bsrc=</code>, <code>url=</code>, dll.</i>',
+          '<i>Hanya URL video yang ditampilkan.\n' +
+          'Buffer sementara di DB (1 jam), auto-hapus setelah klik ✅.</i>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
@@ -601,9 +793,9 @@ export const decodeCommand: CommandDefinition = {
     }
 
     if (looksLikeHtml(input)) {
-      await processHtmlInput(ctx, input);
+      await processInput(ctx, env, input, 'html');
     } else {
-      await processBase64Input(ctx, input);
+      await processInput(ctx, env, input, 'base64');
     }
   },
 };
