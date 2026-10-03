@@ -1,0 +1,119 @@
+name: Repo Snapshot for Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build snapshot
+        run: |
+          OUTPUT="repo-snapshot.txt"
+          echo "=== REPO STRUCTURE ===" > "$OUTPUT"
+          echo "" >> "$OUTPUT"
+
+          # Struktur folder (tanpa folder yang tidak perlu)
+          find . -type d \
+            -not -path "./.git*" \
+            -not -path "./node_modules*" \
+            -not -path "./venv*" \
+            -not -path "./.venv*" \
+            -not -path "./__pycache__*" \
+            -not -path "./dist*" \
+            -not -path "./build*" \
+            | sort >> "$OUTPUT"
+
+          echo "" >> "$OUTPUT"
+          echo "=== FILE LIST ===" >> "$OUTPUT"
+          find . -type f \
+            -not -path "./.git/*" \
+            -not -path "./node_modules/*" \
+            -not -path "./venv/*" \
+            -not -path "./.venv/*" \
+            -not -path "./__pycache__/*" \
+            -not -path "./dist/*" \
+            -not -path "./build/*" \
+            -not -name "repo-snapshot.txt" \
+            -not -name "*.log" \
+            -not -name "*.lock" \
+            | sort >> "$OUTPUT"
+
+          echo "" >> "$OUTPUT"
+          echo "=== FILE CONTENTS ===" >> "$OUTPUT"
+
+          # File yang isinya akan dimasukkan (kode & konfigurasi saja)
+          find . -type f \
+            -not -path "./.git/*" \
+            -not -path "./node_modules/*" \
+            -not -path "./venv/*" \
+            -not -path "./.venv/*" \
+            -not -path "./__pycache__/*" \
+            -not -path "./dist/*" \
+            -not -path "./build/*" \
+            -not -name "repo-snapshot.txt" \
+            -not -name "*.log" \
+            -not -name "*.lock" \
+            -not -name ".env" \
+            -not -name ".env.*" \
+            -not -name "*.pem" \
+            -not -name "*.key" \
+            -not -name "*.secret" \
+            -not -name "*.png" \
+            -not -name "*.jpg" \
+            -not -name "*.jpeg" \
+            -not -name "*.gif" \
+            -not -name "*.webp" \
+            -not -name "*.ico" \
+            -not -name "*.pdf" \
+            -not -name "*.zip" \
+            -not -name "*.mp4" \
+            -not -name "*.sqlite" \
+            -not -name "*.db" \
+            -size -200k \
+            | sort | while read -r file; do
+              echo "" >> "$OUTPUT"
+              echo "===== FILE: $file =====" >> "$OUTPUT"
+              # Sensor token/secret yang umum
+              sed -E \
+                -e 's/(TOKEN|SECRET|API_KEY|PASSWORD|PASS|PRIVATE_KEY)[^=]*=.*/\1=***REDACTED***/Ig' \
+                -e 's/[0-9]{8,10}:[A-Za-z0-9_-]{35}/***TELEGRAM_BOT_TOKEN_REDACTED***/g' \
+                "$file" >> "$OUTPUT" 2>/dev/null || echo "[binary atau tidak bisa dibaca]" >> "$OUTPUT"
+              echo "" >> "$OUTPUT"
+              echo "===== END FILE =====" >> "$OUTPUT"
+            done
+
+          echo "" >> "$OUTPUT"
+          echo "=== SNAPSHOT SELESAI: $(date -u) ===" >> "$OUTPUT"
+
+          # Batasi ukuran total agar tidak terlalu besar
+          if [ -f "$OUTPUT" ]; then
+            SIZE=$(wc -c < "$OUTPUT")
+            echo "Total ukuran snapshot: $SIZE bytes"
+            if [ "$SIZE" -gt 1000000 ]; then
+              echo "PERINGATAN: snapshot > 1MB, mungkin perlu dipecah." 
+            fi
+          fi
+
+      - name: Commit snapshot back to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo-snapshot.txt
+          if git diff --staged --quiet; then
+            echo "Tidak ada perubahan."
+          else
+            git commit -m "chore: update repo-snapshot.txt [skip ci]"
+            git push
+          fi
