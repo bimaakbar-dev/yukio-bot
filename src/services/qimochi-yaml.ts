@@ -1,13 +1,9 @@
 // src/services/qimochi-yaml.ts
 import type { AniListMedia } from '../types/anime';
-import type {
-  UnifiedCharacter,
-  UnifiedEpisode,
-  UnifiedRelation,
-} from './qimochi-chain-extras';
 
-const MAX_CHARACTERS = 100;
-const MAX_EPISODES_WARN = 700;
+/* ============================================================
+   METADATA — YAML frontmatter (.md)
+   ============================================================ */
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
@@ -26,12 +22,6 @@ const STATUS_MAP: Record<string, string> = {
   NOT_YET_RELEASED: 'upcoming',
   CANCELLED: 'cancelled',
   HIATUS: 'hiatus',
-};
-
-const ROLE_MAP: Record<string, string> = {
-  main: 'main',
-  supporting: 'supporting',
-  background: 'background',
 };
 
 function slugify(str: string): string {
@@ -88,10 +78,6 @@ function guessSeason(month: number | null): string | null {
   return null;
 }
 
-/* ============================================================
-   METADATA — frontmatter lengkap
-   ============================================================ */
-
 export interface MetadataInput {
   media: AniListMedia;
   malId: number | null;
@@ -102,10 +88,7 @@ export function buildMetadataYaml(input: MetadataInput): string {
   const { media, malId, kitsuId } = input;
   const lines: string[] = [];
 
-  // === FRONTMATTER OPEN ===
   lines.push('---');
-
-  // === TITLE ===
   lines.push(`title: ${yamlString(media.title.romaji || 'Unknown')}`);
   if (media.title.english) {
     lines.push(`titleEnglish: ${yamlString(media.title.english)}`);
@@ -115,7 +98,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === EXTERNAL IDs ===
   const effectiveMalId = malId ?? media.myanimelistId ?? null;
   if (effectiveMalId) {
     lines.push(`malId: ${effectiveMalId}`);
@@ -129,7 +111,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === TYPE / STATUS / SOURCE ===
   lines.push(`type: ${FORMAT_MAP[media.format] ?? 'Unknown'}`);
   lines.push(`status: ${STATUS_MAP[media.status] ?? 'finished'}`);
 
@@ -140,7 +121,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === SEASON / YEAR / EPISODES / DURATION / RATING ===
   const season = guessSeason(media.startDate.month);
   if (season) lines.push(`season: ${season}`);
   if (media.seasonYear) lines.push(`year: ${media.seasonYear}`);
@@ -159,7 +139,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === AIRED ===
   const airedFrom = formatDate(
     media.startDate.year,
     media.startDate.month,
@@ -184,7 +163,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === STATS ===
   lines.push('stats:');
   if (media.averageScore && media.averageScore > 0) {
     lines.push(`  score: ${(media.averageScore / 10).toFixed(1)}`);
@@ -194,7 +172,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   lines.push('  # scoredBy: # edit manual');
   lines.push('');
 
-  // === GENRES ===
   const genres = (media.genres ?? []).map(slugify).filter(Boolean);
   if (genres.length > 0) {
     lines.push('genres:');
@@ -204,7 +181,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === STUDIOS ===
   const studios = (media.studios?.nodes ?? [])
     .map((s) => slugify(s.name))
     .filter(Boolean);
@@ -216,12 +192,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === FRANCHISES (placeholder — diisi dari section Franchises) ===
-  lines.push('# Ganti dengan section "Franchises" dari /dba');
-  lines.push('franchises: []');
-  lines.push('');
-
-  // === IMAGES ===
   if (media.coverImage.extraLarge) {
     lines.push(`image: "${media.coverImage.extraLarge}"`);
   } else {
@@ -241,15 +211,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // === PLACEHOLDER SECTIONS ===
-  lines.push('# Ganti dengan section "Episodes" dari /dba');
-  lines.push('episodeList: []');
-  lines.push('');
-  lines.push('# Ganti dengan section "Characters" dari /dba');
-  lines.push('characters: []');
-  lines.push('');
-
-  // === DRAFT ===
   lines.push('draft: false');
   lines.push('---');
 
@@ -257,136 +218,9 @@ export function buildMetadataYaml(input: MetadataInput): string {
 }
 
 /* ============================================================
-   CHARACTERS
-   ============================================================ */
-
-export function buildCharactersYaml(chars: UnifiedCharacter[]): string {
-  if (!chars || chars.length === 0) {
-    return '# ⚠️ Tidak ada data karakter. Isi manual.\ncharacters: []';
-  }
-
-  const main = chars.filter((c) => c.role === 'main');
-  const supporting = chars.filter((c) => c.role === 'supporting');
-  const sorted = [...main, ...supporting].slice(0, MAX_CHARACTERS);
-
-  if (sorted.length === 0) {
-    return '# ⚠️ Tidak ada karakter main/supporting. Isi manual.\ncharacters: []';
-  }
-
-  const lines: string[] = [];
-  lines.push('characters:');
-
-  for (const char of sorted) {
-    lines.push(`  - name: ${yamlString(char.name)}`);
-    lines.push('    # nameNative: # edit manual');
-    if (char.image) {
-      lines.push(`    image: "${char.image}"`);
-    } else {
-      lines.push('    # image: # edit manual');
-    }
-    lines.push(`    role: ${ROLE_MAP[char.role] ?? 'supporting'}`);
-    lines.push('    # voiceActors: # edit manual');
-  }
-
-  if (chars.length > MAX_CHARACTERS) {
-    lines.push('');
-    lines.push(
-      `# ⚠️ Di-truncate dari ${chars.length} ke ${MAX_CHARACTERS}. Tambah manual kalau perlu.`
-    );
-  }
-
-  return lines.join('\n');
-}
-
-/* ============================================================
-   EPISODES
-   ============================================================ */
-
-export function buildEpisodesYaml(episodes: UnifiedEpisode[]): string {
-  if (!episodes || episodes.length === 0) {
-    return '# ⚠️ Tidak ada data episode. Isi manual.\nepisodeList: []';
-  }
-
-  const lines: string[] = [];
-  lines.push('episodeList:');
-
-  for (const ep of episodes) {
-    lines.push(`  - number: ${ep.number}`);
-    lines.push(`    title: ${yamlString(ep.title)}`);
-    if (ep.aired) {
-      lines.push(`    aired: "${ep.aired}"`);
-    } else {
-      lines.push('    # aired: # edit manual');
-    }
-    if (ep.duration && ep.duration > 0) {
-      lines.push(`    duration: ${ep.duration}`);
-    }
-  }
-
-  if (episodes.length >= MAX_EPISODES_WARN) {
-    lines.push('');
-    lines.push(
-      `# ⚠️ Di-truncate ${MAX_EPISODES_WARN} episode (time budget). Sisanya isi manual.`
-    );
-  }
-
-  return lines.join('\n');
-}
-
-/* ============================================================
-   FRANCHISES
-   ============================================================ */
-
-export function buildFranchisesYaml(relations: UnifiedRelation[]): string {
-  if (!relations || relations.length === 0) {
-    return '# ⚠️ Tidak ada data franchise/relation. Isi manual.\nfranchises: []';
-  }
-
-  const lines: string[] = [];
-  lines.push('franchises:');
-
-  for (const rel of relations) {
-    lines.push(`  - relation: ${rel.relation}`);
-    lines.push(`    slug: ${yamlString(rel.slug)}`);
-    lines.push(`    title: ${yamlString(rel.title)}`);
-  }
-
-  lines.push('');
-  lines.push('# ⚠️ Verifikasi slug di atas cocok dengan file .md yang ada.');
-
-  return lines.join('\n');
-}
-
-/* ============================================================
-   SUMMARY
+   SUMMARY (sinopsis)
    ============================================================ */
 
 export function getSynopsisRaw(media: AniListMedia): string {
   return cleanSynopsisRaw(media.description);
-}
-
-/* ============================================================
-   ALL
-   ============================================================ */
-
-export interface AllInput {
-  metadata: string;
-  characters: string;
-  episodes: string;
-  franchises: string;
-  summary: string;
-}
-
-export function buildAllMarkdown(input: AllInput): string {
-  const parts: string[] = [];
-  parts.push(input.metadata);
-  parts.push('');
-  parts.push(input.characters);
-  parts.push('');
-  parts.push(input.episodes);
-  parts.push('');
-  parts.push(input.franchises);
-  parts.push('');
-  parts.push(input.summary);
-  return parts.join('\n');
 }
