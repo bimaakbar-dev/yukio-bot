@@ -4,6 +4,7 @@ import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import { searchJikan } from '../services/jikan';
 import {
   getCharacters,
   getAllEpisodes,
@@ -23,6 +24,7 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3800;
 const AI_TIMEOUT_MS = 12000;
 
+const TIMEOUT_JIKAN_SEARCH = 8000;
 const TIMEOUT_JIKAN_CHARS = 12000;
 const TIMEOUT_JIKAN_EPS = 15000;
 const TIMEOUT_JIKAN_RELS = 10000;
@@ -282,6 +284,25 @@ async function safeFetch<T>(
 }
 
 /* ============================================================
+   RESOLVE MAL ID — retry Jikan kalau session tidak punya malId
+   ============================================================ */
+
+async function resolveMalId(
+  session: SessionRow,
+  fromChain: number | null
+): Promise<number | null> {
+  if (fromChain) return fromChain;
+  if (session.mal_id) return session.mal_id;
+
+  const { data: jikan } = await safeFetch(
+    () => searchJikan(session.title),
+    TIMEOUT_JIKAN_SEARCH
+  );
+
+  return jikan?.mal_id ?? null;
+}
+
+/* ============================================================
    AI SYNOPSIS
    ============================================================ */
 
@@ -323,6 +344,17 @@ function fallbackYaml(section: string, error: string): string {
     `# ⚠️ Gagal fetch dari Jikan: ${error}\n` +
     `# Sumber alternatif tidak menyediakan endpoint ini.\n` +
     `# Isi manual di bawah.\n`;
+  if (section === 'characters') return `${header}characters: []`;
+  if (section === 'episodes') return `${header}episodeList: []`;
+  if (section === 'franchises') return `${header}franchises: []`;
+  return header;
+}
+
+function noMalIdYaml(section: string, source: string | null): string {
+  const header =
+    `# ⚠️ Tidak bisa dapat MAL ID dari Jikan.\n` +
+    `# Sumber awal: ${source ?? 'unknown'}\n` +
+    `# Coba klik tombol sekali lagi (Jikan mungkin pulih), atau isi manual.\n`;
   if (section === 'characters') return `${header}characters: []`;
   if (section === 'episodes') return `${header}episodeList: []`;
   if (section === 'franchises') return `${header}franchises: []`;
@@ -485,7 +517,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
 
     try {
-      // Re-fetch media — pakai chain juga
       let result;
       try {
         result = await chainSearch(session.title);
@@ -498,13 +529,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
       }
 
       const media = result.media;
-      const malId = result.malId ?? session.mal_id;
 
       /* ---------- METADATA ---------- */
       if (action === 'm') {
         const yaml = buildMetadataYaml({
           media,
-          malId: result.malId,
+          malId: result.malId ?? session.mal_id,
           kitsuId: result.kitsuId,
         });
         await sendLongMessage(ctx, `Metadata — ${session.title}`, yaml);
@@ -513,13 +543,13 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- CHARACTERS ---------- */
       if (action === 'c') {
+        const malId = await resolveMalId(session, result.malId);
+
         if (!malId) {
           await sendLongMessage(
             ctx,
             `Characters — ${session.title}`,
-            '# ⚠️ Tidak ada MAL ID. Tidak bisa fetch characters.\n# Sumber saat ini: ' +
-              (result.source ?? 'unknown') +
-              '\ncharacters: []'
+            noMalIdYaml('characters', result.source)
           );
           return;
         }
@@ -539,13 +569,13 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- EPISODES ---------- */
       if (action === 'e') {
+        const malId = await resolveMalId(session, result.malId);
+
         if (!malId) {
           await sendLongMessage(
             ctx,
             `Episodes — ${session.title}`,
-            '# ⚠️ Tidak ada MAL ID. Tidak bisa fetch episodes.\n# Sumber saat ini: ' +
-              (result.source ?? 'unknown') +
-              '\nepisodeList: []'
+            noMalIdYaml('episodes', result.source)
           );
           return;
         }
@@ -565,13 +595,13 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- FRANCHISES ---------- */
       if (action === 'f') {
+        const malId = await resolveMalId(session, result.malId);
+
         if (!malId) {
           await sendLongMessage(
             ctx,
             `Franchises — ${session.title}`,
-            '# ⚠️ Tidak ada MAL ID. Tidak bisa fetch relations.\n# Sumber saat ini: ' +
-              (result.source ?? 'unknown') +
-              '\nfranchises: []'
+            noMalIdYaml('franchises', result.source)
           );
           return;
         }
@@ -620,18 +650,19 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- ALL ---------- */
       if (action === 'a') {
-        await ctx.reply('⏳ All (1/5): Metadata...');
+        const malId = await resolveMalId(session, result.malId);
 
+        await ctx.reply('⏳ All (1/5): Metadata...');
         const metaYaml = buildMetadataYaml({
           media,
-          malId: result.malId,
+          malId: result.malId ?? session.mal_id,
           kitsuId: result.kitsuId,
         });
 
         await ctx.reply('⏳ All (2/5): Characters...');
         let charsYaml: string;
         if (!malId) {
-          charsYaml = '# ⚠️ Tidak ada MAL ID. Isi manual.\ncharacters: []';
+          charsYaml = noMalIdYaml('characters', result.source);
         } else {
           const { data: chars, error } = await safeFetch(
             () => getCharacters(malId),
@@ -645,7 +676,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         await ctx.reply('⏳ All (3/5): Episodes...');
         let epsYaml: string;
         if (!malId) {
-          epsYaml = '# ⚠️ Tidak ada MAL ID. Isi manual.\nepisodeList: []';
+          epsYaml = noMalIdYaml('episodes', result.source);
         } else {
           const { data: eps, error } = await safeFetch(
             () => getAllEpisodes(malId, 100),
@@ -659,7 +690,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         await ctx.reply('⏳ All (4/5): Franchises...');
         let relsYaml: string;
         if (!malId) {
-          relsYaml = '# ⚠️ Tidak ada MAL ID. Isi manual.\nfranchises: []';
+          relsYaml = noMalIdYaml('franchises', result.source);
         } else {
           const { data: rels, error } = await safeFetch(
             () => getRelations(malId),
