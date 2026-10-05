@@ -15,7 +15,6 @@ import {
   buildCharactersYaml,
   buildEpisodesYaml,
   buildFranchisesYaml,
-  buildSummaryMd,
   buildAllMarkdown,
 } from '../services/qimochi-yaml';
 import { askAI } from '../services/ai';
