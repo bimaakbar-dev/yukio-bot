@@ -120,12 +120,10 @@ export default {
         );
       }
     }
-
+    
     if (url.pathname === '/debug/anilist') {
   const t0 = Date.now();
-
-  const anilistUrl = 'https://graphql.anilist.co';
-  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(anilistUrl)}`;
+  const proxyUrl = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
 
   const query = `
     query ($idMal: Int) {
@@ -168,7 +166,6 @@ export default {
           ok: res.ok,
           status: res.status,
           elapsed: Date.now() - t0,
-          proxy: 'allorigins',
           bodyPreview: text.slice(0, 2000),
         },
         null,
@@ -181,13 +178,13 @@ export default {
       JSON.stringify({
         ok: false,
         elapsed: Date.now() - t0,
-        proxy: 'allorigins',
         error: err?.message ?? String(err),
       }),
       { status: 500, headers: { 'Content-Type': 'application/json' } }
     );
   }
 }
+
     if (url.pathname === '/discord/register') {
       return registerDiscordCommands(env);
     }
