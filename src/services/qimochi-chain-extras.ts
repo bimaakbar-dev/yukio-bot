@@ -1,11 +1,5 @@
 // src/services/qimochi-chain-extras.ts
 import { fetchWithRetry } from '../lib/http';
-import { searchJikan } from './jikan';
-import {
-  getCharacters as getJikanCharacters,
-  getAllEpisodes as getJikanEpisodes,
-  getRelations as getJikanRelations,
-} from './jikan-extras';
 
 /* ============================================================
    UNIFIED TYPES
@@ -69,27 +63,6 @@ async function withTimeout<T>(
   }
 }
 
-function slugify(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
-
-async function resolveMalId(
-  malId: number | null,
-  title: string
-): Promise<number | null> {
-  if (malId) return malId;
-  if (!title) return null;
-  const search = await withTimeout(() => searchJikan(title), 6000);
-  return search?.mal_id ?? null;
-}
-
 /* ============================================================
    KITSU — CHARACTERS
    ============================================================ */
@@ -110,14 +83,19 @@ interface KitsuRoleEntry {
   attributes?: { role?: string };
   relationships?: {
     character?: { data?: { id: string; type: string } | null };
-    voiceActor?: { data?: { id: string; type: string } | null };
   };
 }
 
 async function getKitsuCharacters(
   kitsuId: string
 ): Promise<UnifiedCharacter[] | null> {
-  const url = `https://kitsu.io/api/edge/anime/${kitsuId}/characters?include=character,voiceActor&page[limit]=40`;
+  const params = new URLSearchParams();
+  params.set('include', 'character');
+  params.set('page[limit]', '40');
+
+  const url = `https://kitsu.io/api/edge/anime/${kitsuId}/characters?${params.toString()}`;
+
+  console.log(`[Kitsu] characters URL: ${url}`);
 
   const res = await fetchWithRetry(
     url,
@@ -151,7 +129,6 @@ async function getKitsuCharacters(
 
   for (const role of data) {
     const charRef = role.relationships?.character?.data;
-    const vaRef = role.relationships?.voiceActor?.data;
     if (!charRef) continue;
 
     const charItem = indexed.get(`characters:${charRef.id}`);
@@ -170,23 +147,11 @@ async function getKitsuCharacters(
           ? 'supporting'
           : 'background';
 
-    const vas: UnifiedCharacter['voiceActors'] = [];
-    if (vaRef) {
-      const vaItem = indexed.get(`people:${vaRef.id}`);
-      if (vaItem?.attributes?.name) {
-        vas.push({
-          name: vaItem.attributes.name,
-          image: vaItem.attributes.image?.original ?? undefined,
-          language: 'Japanese',
-        });
-      }
-    }
-
     out.push({
       name: charName,
       image: charItem.attributes?.image?.original ?? undefined,
       role: roleNorm,
-      voiceActors: vas,
+      voiceActors: [],
     });
 
     if (out.length >= MAX_ITEMS) break;
@@ -213,7 +178,13 @@ interface KitsuEpisodeItem {
 async function getKitsuEpisodes(
   kitsuId: string
 ): Promise<UnifiedEpisode[] | null> {
-  const url = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?page[limit]=100&sort=number`;
+  const params = new URLSearchParams();
+  params.set('page[limit]', '100');
+  params.set('sort', 'number');
+
+  const url = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?${params.toString()}`;
+
+  console.log(`[Kitsu] episodes URL: ${url}`);
 
   const res = await fetchWithRetry(
     url,
@@ -258,18 +229,26 @@ async function getKitsuEpisodes(
    SHIKIMORI — CHARACTERS
    ============================================================ */
 
-interface ShikimoriRole {
-  id: number;
-  name: string;
-  russian?: string;
-  image?: { original?: string; preview?: string } | null;
+interface ShikimoriRoleEntry {
   roles?: string[];
   roles_russian?: string[];
-  person?: {
-    id?: number;
-    name?: string;
+  character?: {
+    id: number;
+    name: string;
     russian?: string;
-    image?: { original?: string; preview?: string } | null;
+    image?: {
+      original?: string;
+      preview?: string;
+    } | null;
+  } | null;
+  person?: {
+    id: number;
+    name: string;
+    russian?: string;
+    image?: {
+      original?: string;
+      preview?: string;
+    } | null;
   } | null;
 }
 
@@ -301,17 +280,20 @@ async function getShikimoriCharacters(
 
   if (!res.ok) return null;
 
-  const data = (await res.json()) as ShikimoriRole[];
+  const data = (await res.json()) as ShikimoriRoleEntry[];
   if (!Array.isArray(data) || data.length === 0) return null;
 
   const out: UnifiedCharacter[] = [];
   const seen = new Set<string>();
 
-  for (const role of data) {
-    if (!role.name || seen.has(role.name)) continue;
-    seen.add(role.name);
+  for (const entry of data) {
+    if (!entry.character) continue;
 
-    const roles = role.roles ?? [];
+    const name = entry.character.name;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+
+    const roles = entry.roles ?? [];
     const isMain = roles.some((r) => r.toLowerCase() === 'main');
     const isSupporting = roles.some((r) => r.toLowerCase() === 'supporting');
     const roleNorm: UnifiedCharacter['role'] = isMain
@@ -320,20 +302,13 @@ async function getShikimoriCharacters(
         ? 'supporting'
         : 'background';
 
-    const vas: UnifiedCharacter['voiceActors'] = [];
-    if (role.person?.name) {
-      vas.push({
-        name: role.person.name,
-        image: shikimoriImage(role.person.image),
-        language: 'Japanese',
-      });
-    }
-
     out.push({
-      name: role.name,
-      image: shikimoriImage(role.image),
+      name,
+      image: shikimoriImage(entry.character.image),
       role: roleNorm,
-      voiceActors: vas,
+      // Shikimori /roles tidak menyertakan seiyuu (person selalu null
+      // untuk entry karakter). VA diisi manual oleh user.
+      voiceActors: [],
     });
 
     if (out.length >= MAX_ITEMS) break;
@@ -343,221 +318,29 @@ async function getShikimoriCharacters(
 }
 
 /* ============================================================
-   SHIKIMORI — RELATIONS
-   ============================================================ */
-
-interface ShikimoriAnimeFull {
-  id: number;
-  name: string;
-  related?: {
-    id: number;
-    name: string;
-    kind?: string;
-    relation?: string;
-  }[];
-}
-
-function mapShikimoriRelation(raw: string | undefined): string {
-  if (!raw) return 'other';
-  const lower = raw.toLowerCase();
-  if (lower.includes('sequel')) return 'sequel';
-  if (lower.includes('prequel')) return 'prequel';
-  if (lower.includes('spin')) return 'spin_off';
-  if (lower.includes('side')) return 'side_story';
-  if (lower.includes('alternative')) return 'alternative';
-  if (lower.includes('adaptation')) return 'adaptation';
-  if (lower.includes('summary')) return 'summary';
-  return 'other';
-}
-
-async function getShikimoriRelations(
-  malId: number
-): Promise<UnifiedRelation[] | null> {
-  const url = `https://shikimori.one/api/animes/${malId}`;
-
-  const res = await fetchWithRetry(
-    url,
-    {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'yukio-bot/1.0',
-      },
-    },
-    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
-  );
-
-  if (!res.ok) return null;
-
-  const data = (await res.json()) as ShikimoriAnimeFull;
-  const related = data?.related ?? [];
-  if (related.length === 0) return null;
-
-  const out: UnifiedRelation[] = [];
-  for (const rel of related) {
-    if (!rel.name) continue;
-    out.push({
-      relation: mapShikimoriRelation(rel.relation),
-      slug: slugify(rel.name),
-      title: rel.name,
-    });
-  }
-
-  return out.length > 0 ? out : null;
-}
-
-/* ============================================================
-   JIKAN NORMALIZERS
-   ============================================================ */
-
-interface JikanCharRaw {
-  character: {
-    name: string;
-    images?: { jpg?: { image_url?: string } };
-  };
-  role: string;
-  voice_actors?: {
-    person: {
-      name: string;
-      images?: { jpg?: { image_url?: string } };
-    };
-    language: string;
-  }[];
-}
-
-function normalizeJikanCharacters(raw: unknown): UnifiedCharacter[] {
-  const arr = raw as JikanCharRaw[];
-  if (!Array.isArray(arr)) return [];
-
-  const out: UnifiedCharacter[] = [];
-  for (const entry of arr) {
-    if (!entry.character?.name) continue;
-    const roleRaw = (entry.role ?? 'supporting').toLowerCase();
-    const role: UnifiedCharacter['role'] =
-      roleRaw === 'main'
-        ? 'main'
-        : roleRaw === 'supporting'
-          ? 'supporting'
-          : 'background';
-
-    const vas: UnifiedCharacter['voiceActors'] = [];
-    for (const v of entry.voice_actors ?? []) {
-      if (v.person?.name) {
-        vas.push({
-          name: v.person.name,
-          image: v.person.images?.jpg?.image_url,
-          language: v.language ?? 'Japanese',
-        });
-      }
-    }
-
-    out.push({
-      name: entry.character.name,
-      image: entry.character.images?.jpg?.image_url,
-      role,
-      voiceActors: vas,
-    });
-
-    if (out.length >= MAX_ITEMS) break;
-  }
-
-  return out;
-}
-
-interface JikanEpRaw {
-  mal_id: number;
-  title?: string;
-  aired?: string | null;
-  duration?: number | null;
-}
-
-function normalizeJikanEpisodes(raw: unknown): UnifiedEpisode[] {
-  const arr = raw as JikanEpRaw[];
-  if (!Array.isArray(arr)) return [];
-
-  const out: UnifiedEpisode[] = [];
-  for (const ep of arr) {
-    out.push({
-      number: ep.mal_id ?? 0,
-      title: ep.title ?? `Episode ${ep.mal_id}`,
-      aired: ep.aired ? ep.aired.split('T')[0] : undefined,
-      duration: ep.duration ?? undefined,
-    });
-    if (out.length >= MAX_EPISODES) break;
-  }
-
-  return out;
-}
-
-interface JikanRelRaw {
-  relation: string;
-  entry: { mal_id: number; type: string; name: string; url: string }[];
-}
-
-function mapJikanRelation(raw: string): string {
-  const map: Record<string, string> = {
-    Sequel: 'sequel',
-    Prequel: 'prequel',
-    'Side Story': 'side_story',
-    'Parent Story': 'parent_story',
-    Alternative: 'alternative',
-    'Alternative Version': 'alternative',
-    'Spin-Off': 'spin_off',
-    Summary: 'summary',
-    'Full Story': 'full_story',
-    Character: 'character',
-    Other: 'other',
-    Adaptation: 'adaptation',
-  };
-  return map[raw] ?? 'other';
-}
-
-function normalizeJikanRelations(raw: unknown): UnifiedRelation[] {
-  const arr = raw as JikanRelRaw[];
-  if (!Array.isArray(arr)) return [];
-
-  const out: UnifiedRelation[] = [];
-  for (const rel of arr) {
-    const relationKey = mapJikanRelation(rel.relation);
-    for (const entry of rel.entry ?? []) {
-      if (!entry.name) continue;
-      out.push({
-        relation: relationKey,
-        slug: slugify(entry.name),
-        title: entry.name,
-      });
-    }
-  }
-
-  return out;
-}
-
-/* ============================================================
-   CHAIN RESOLVERS
+   CHAIN RESOLVERS — CHARACTERS
    ============================================================ */
 
 export async function chainCharacters(
   ctx: ChainContext
 ): Promise<ChainResult<UnifiedCharacter>> {
   const errors: string[] = [];
-  const malId = await resolveMalId(ctx.malId, ctx.title);
 
-  if (malId) {
-    const jikan = await withTimeout(
-      () => getJikanCharacters(malId),
+  // === 1. SHIKIMORI (butuh malId) ===
+  if (ctx.malId) {
+    const shiki = await withTimeout(
+      () => getShikimoriCharacters(ctx.malId!),
       PER_SOURCE_TIMEOUT
     );
-    if (jikan && jikan.length > 0) {
-      return {
-        data: normalizeJikanCharacters(jikan),
-        source: 'Jikan',
-        errors,
-      };
+    if (shiki && shiki.length > 0) {
+      return { data: shiki, source: 'Shikimori', errors };
     }
-    errors.push('Jikan: gagal atau kosong');
+    errors.push('Shikimori: gagal atau kosong');
   } else {
-    errors.push('Jikan: tidak ada MAL ID');
+    errors.push('Shikimori: tidak ada MAL ID');
   }
 
+  // === 2. KITSU (fallback) ===
   if (ctx.kitsuId) {
     const kitsu = await withTimeout(
       () => getKitsuCharacters(ctx.kitsuId!),
@@ -571,43 +354,19 @@ export async function chainCharacters(
     errors.push('Kitsu: tidak ada Kitsu ID');
   }
 
-  if (malId) {
-    const shiki = await withTimeout(
-      () => getShikimoriCharacters(malId),
-      PER_SOURCE_TIMEOUT
-    );
-    if (shiki && shiki.length > 0) {
-      return { data: shiki, source: 'Shikimori', errors };
-    }
-    errors.push('Shikimori: gagal atau kosong');
-  }
-
   return { data: null, source: 'none', errors };
 }
+
+/* ============================================================
+   CHAIN RESOLVERS — EPISODES
+   ============================================================ */
 
 export async function chainEpisodes(
   ctx: ChainContext
 ): Promise<ChainResult<UnifiedEpisode>> {
   const errors: string[] = [];
-  const malId = await resolveMalId(ctx.malId, ctx.title);
 
-  if (malId) {
-    const jikan = await withTimeout(
-      () => getJikanEpisodes(malId, MAX_EPISODES),
-      PER_SOURCE_TIMEOUT * 2
-    );
-    if (jikan && jikan.length > 0) {
-      return {
-        data: normalizeJikanEpisodes(jikan),
-        source: 'Jikan',
-        errors,
-      };
-    }
-    errors.push('Jikan: gagal atau kosong');
-  } else {
-    errors.push('Jikan: tidak ada MAL ID');
-  }
-
+  // === KITSU (satu-satunya sumber list episode) ===
   if (ctx.kitsuId) {
     const kitsu = await withTimeout(
       () => getKitsuEpisodes(ctx.kitsuId!),
@@ -624,39 +383,18 @@ export async function chainEpisodes(
   return { data: null, source: 'none', errors };
 }
 
+/* ============================================================
+   CHAIN RESOLVERS — RELATIONS
+   ============================================================ */
+
 export async function chainRelations(
-  ctx: ChainContext
+  _ctx: ChainContext
 ): Promise<ChainResult<UnifiedRelation>> {
-  const errors: string[] = [];
-  const malId = await resolveMalId(ctx.malId, ctx.title);
-
-  if (malId) {
-    const jikan = await withTimeout(
-      () => getJikanRelations(malId),
-      PER_SOURCE_TIMEOUT
-    );
-    if (jikan && jikan.length > 0) {
-      return {
-        data: normalizeJikanRelations(jikan),
-        source: 'Jikan',
-        errors,
-      };
-    }
-    errors.push('Jikan: gagal atau kosong');
-  } else {
-    errors.push('Jikan: tidak ada MAL ID');
-  }
-
-  if (malId) {
-    const shiki = await withTimeout(
-      () => getShikimoriRelations(malId),
-      PER_SOURCE_TIMEOUT
-    );
-    if (shiki && shiki.length > 0) {
-      return { data: shiki, source: 'Shikimori', errors };
-    }
-    errors.push('Shikimori: gagal atau kosong');
-  }
-
-  return { data: null, source: 'none', errors };
+  // TODO: test manual endpoint Shikimori /animes?franchise=X
+  // Sementara return kosong biar compile jalan.
+  return {
+    data: null,
+    source: 'none',
+    errors: ['Relations: belum diimplementasi (menunggu test endpoint)'],
+  };
 }
