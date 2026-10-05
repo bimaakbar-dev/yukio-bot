@@ -1,6 +1,10 @@
 // src/services/qimochi-chain-extras.ts
 import { fetchWithRetry } from '../lib/http';
 
+/* ============================================================
+   UNIFIED TYPES
+   ============================================================ */
+
 export interface UnifiedCharacter {
   name: string;
   image?: string;
@@ -39,11 +43,22 @@ export interface ChainResult<T> {
 
 const PER_SOURCE_TIMEOUT = 8000;
 const MAX_ITEMS = 30;
-const MAX_EPISODES = 1500;
-const KITSU_PAGE_LIMIT = 20; 
+
+/* Episodes config
+ * CF Workers Free: 50 subrequest/invocation
+ * Set max 35 pages → 700 eps, buffer 15 subrequests untuk safety
+ */
+const MAX_EPISODES = 700;
+const KITSU_PAGE_LIMIT = 20;
 const PARALLEL_BATCH = 5;
 const EPISODES_TIME_BUDGET_MS = 20000;
+
+/* Relations config */
 const MAX_RELATIONS = 30;
+
+/* ============================================================
+   UTILITIES
+   ============================================================ */
 
 async function withTimeout<T>(
   fn: () => Promise<T>,
@@ -69,6 +84,10 @@ function slugify(str: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
 }
+
+/* ============================================================
+   KITSU — CHARACTERS
+   ============================================================ */
 
 interface KitsuIncluded {
   id: string;
@@ -163,6 +182,10 @@ async function getKitsuCharacters(
   return out.length > 0 ? out : null;
 }
 
+/* ============================================================
+   KITSU — EPISODES (parallel + subrequest-safe)
+   ============================================================ */
+
 interface KitsuEpisodeItem {
   id: string;
   attributes?: {
@@ -176,7 +199,7 @@ interface KitsuEpisodeItem {
 
 type FetchPageResult =
   | { ok: true; data: KitsuEpisodeItem[] }
-  | { ok: false; reason: 'error' | 'rate_limit' };
+  | { ok: false; reason: 'error' | 'rate_limit' | 'subrequest_limit' };
 
 async function getKitsuEpisodesPage(
   kitsuId: string,
@@ -189,33 +212,46 @@ async function getKitsuEpisodesPage(
 
   const url = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?${params.toString()}`;
 
-  const res = await fetchWithRetry(
-    url,
-    {
-      headers: {
-        Accept: 'application/vnd.api+json',
-        'Content-Type': 'application/vnd.api+json',
-        'User-Agent': 'yukio-bot/1.0',
+  try {
+    const res = await fetchWithRetry(
+      url,
+      {
+        headers: {
+          Accept: 'application/vnd.api+json',
+          'Content-Type': 'application/vnd.api+json',
+          'User-Agent': 'yukio-bot/1.0',
+        },
       },
-    },
-    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
-  );
-
-  if (res.status === 429) {
-    console.warn(`[Kitsu] episodes 429 rate limited @ offset ${offset}`);
-    return { ok: false, reason: 'rate_limit' };
-  }
-
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    console.warn(
-      `[Kitsu] episodes HTTP ${res.status} @ offset ${offset}: ${errBody.slice(0, 100)}`
+      { retries: 0, timeout: PER_SOURCE_TIMEOUT }
     );
+
+    if (res.status === 429) {
+      console.warn(`[Kitsu] episodes 429 @ offset ${offset}`);
+      return { ok: false, reason: 'rate_limit' };
+    }
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.warn(
+        `[Kitsu] episodes HTTP ${res.status} @ offset ${offset}: ${errBody.slice(0, 100)}`
+      );
+      return { ok: false, reason: 'error' };
+    }
+
+    const json = (await res.json()) as { data?: KitsuEpisodeItem[] };
+    return { ok: true, data: json.data ?? [] };
+  } catch (err: any) {
+    const msg = err?.message ?? String(err);
+    console.warn(`[Kitsu] episodes fetch error @ offset ${offset}: ${msg}`);
+    // Deteksi subrequest limit
+    if (
+      msg.includes('Too many subrequests') ||
+      msg.includes('subrequest')
+    ) {
+      return { ok: false, reason: 'subrequest_limit' };
+    }
     return { ok: false, reason: 'error' };
   }
-
-  const json = (await res.json()) as { data?: KitsuEpisodeItem[] };
-  return { ok: true, data: json.data ?? [] };
 }
 
 async function getKitsuEpisodes(
@@ -224,6 +260,7 @@ async function getKitsuEpisodes(
   const startTime = Date.now();
   const allEpisodes: KitsuEpisodeItem[] = [];
   let truncated = false;
+  let hitLimit = false;
 
   const maxPages = Math.ceil(MAX_EPISODES / KITSU_PAGE_LIMIT);
 
@@ -236,6 +273,8 @@ async function getKitsuEpisodes(
     batchStart < maxPages;
     batchStart += PARALLEL_BATCH
   ) {
+    if (hitLimit) break;
+
     const elapsed = Date.now() - startTime;
     if (elapsed > EPISODES_TIME_BUDGET_MS) {
       console.warn(
@@ -245,7 +284,6 @@ async function getKitsuEpisodes(
       break;
     }
 
-    // Build batch of page offsets
     const batchOffsets: number[] = [];
     for (let i = 0; i < PARALLEL_BATCH; i++) {
       const pageIdx = batchStart + i;
@@ -256,33 +294,39 @@ async function getKitsuEpisodes(
     if (batchOffsets.length === 0) break;
 
     console.log(
-      `[Kitsu] batch fetch pages offsets=[${batchOffsets.join(', ')}] (elapsed: ${elapsed}ms)`
+      `[Kitsu] batch pages=[${batchOffsets.join(', ')}] (elapsed: ${elapsed}ms)`
     );
 
-    // Fetch all pages in this batch in parallel
-    const results = await Promise.all(
+    // Pakai allSettled biar batch tetap lanjut walau ada 1 yang error
+    const results = await Promise.allSettled(
       batchOffsets.map((offset) => getKitsuEpisodesPage(kitsuId, offset))
     );
 
-    let batchHadError = false;
     let batchHadEnd = false;
 
     for (const result of results) {
-      if (!result.ok) {
-        batchHadError = true;
+      if (result.status === 'rejected') {
+        console.warn(`[Kitsu] batch promise rejected: ${result.reason}`);
         continue;
       }
-      if (result.data.length === 0) {
+      const pageResult = result.value;
+      if (!pageResult.ok) {
+        if (pageResult.reason === 'subrequest_limit') {
+          hitLimit = true;
+        }
+        continue;
+      }
+      if (pageResult.data.length === 0) {
         batchHadEnd = true;
         continue;
       }
-      allEpisodes.push(...result.data);
-      if (result.data.length < KITSU_PAGE_LIMIT) {
+      allEpisodes.push(...pageResult.data);
+      if (pageResult.data.length < KITSU_PAGE_LIMIT) {
         batchHadEnd = true;
       }
     }
 
-    if (batchHadError) {
+    if (hitLimit) {
       if (allEpisodes.length > 0) truncated = true;
       break;
     }
@@ -297,7 +341,6 @@ async function getKitsuEpisodes(
 
   if (allEpisodes.length === 0) return null;
 
-  // Dedup by number, transform, sort
   const out: UnifiedEpisode[] = [];
   const seen = new Set<number>();
 
@@ -325,11 +368,15 @@ async function getKitsuEpisodes(
   out.sort((a, b) => a.number - b.number);
 
   console.log(
-    `[Kitsu] episodes done: ${out.length} eps in ${Date.now() - startTime}ms (truncated: ${truncated})`
+    `[Kitsu] episodes done: ${out.length} eps in ${Date.now() - startTime}ms (truncated: ${truncated}, hitLimit: ${hitLimit})`
   );
 
   return { episodes: out, truncated };
 }
+
+/* ============================================================
+   SHIKIMORI — CHARACTERS
+   ============================================================ */
 
 interface ShikimoriRoleEntry {
   roles?: string[];
@@ -417,6 +464,10 @@ async function getShikimoriCharacters(
   return out.length > 0 ? out : null;
 }
 
+/* ============================================================
+   SHIKIMORI — RELATIONS
+   ============================================================ */
+
 interface ShikimoriRelatedAnime {
   id: number;
   name: string;
@@ -466,8 +517,6 @@ async function getShikimoriRelations(
 ): Promise<UnifiedRelation[] | null> {
   const url = `https://shikimori.one/api/animes/${malId}/related`;
 
-  console.log(`[Shikimori] related URL: ${url}`);
-
   const res = await fetchWithRetry(
     url,
     {
@@ -511,6 +560,10 @@ async function getShikimoriRelations(
   return out.length > 0 ? out : null;
 }
 
+/* ============================================================
+   CHAIN RESOLVERS — CHARACTERS
+   ============================================================ */
+
 export async function chainCharacters(
   ctx: ChainContext
 ): Promise<ChainResult<UnifiedCharacter>> {
@@ -545,6 +598,10 @@ export async function chainCharacters(
   return { data: null, source: 'none', errors };
 }
 
+/* ============================================================
+   CHAIN RESOLVERS — EPISODES
+   ============================================================ */
+
 export interface EpisodesChainResult extends ChainResult<UnifiedEpisode> {
   truncated?: boolean;
 }
@@ -572,6 +629,10 @@ export async function chainEpisodes(
 
   return { data: null, source: 'none', errors };
 }
+
+/* ============================================================
+   CHAIN RESOLVERS — RELATIONS
+   ============================================================ */
 
 export async function chainRelations(
   ctx: ChainContext
