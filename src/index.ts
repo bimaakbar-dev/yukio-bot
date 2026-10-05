@@ -122,49 +122,72 @@ export default {
     }
 
     if (url.pathname === '/debug/anilist') {
-      const t0 = Date.now();
-      try {
-        const anilistUrl = 'https://graphql.anilist.co';
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(anilistUrl)}`;
-        
-        const res = await fetch(proxyUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({
-            query: '...',
-            variables: { idMal: 40748 },
-          }),
-        });
-        const text = await res.text();
-        return new Response(
-          JSON.stringify(
-            {
-              ok: res.ok,
-              status: res.status,
-              elapsed: Date.now() - t0,
-              headers: Object.fromEntries(res.headers.entries()),
-              bodyPreview: text.slice(0, 1500),
-            },
-            null,
-            2
-          ),
-          { headers: { 'Content-Type': 'application/json' } }
-        );
-      } catch (err: any) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            elapsed: Date.now() - t0,
-            error: err?.message ?? String(err),
-          }),
-          { status: 500, headers: { 'Content-Type': 'application/json' } }
-        );
+  const t0 = Date.now();
+
+  const anilistUrl = 'https://graphql.anilist.co';
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(anilistUrl)}`;
+
+  const query = `
+    query ($idMal: Int) {
+      Media(idMal: $idMal, type: ANIME) {
+        id
+        title { romaji }
+        characters(page: 1, perPage: 3) {
+          edges {
+            role
+            node { name { full } }
+            voiceActors(language: JAPANESE) {
+              id
+              name { full }
+              languageV2
+            }
+          }
+        }
       }
     }
+  `;
 
+  try {
+    const res = await fetch(proxyUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        query,
+        variables: { idMal: 40748 },
+      }),
+    });
+
+    const text = await res.text();
+
+    return new Response(
+      JSON.stringify(
+        {
+          ok: res.ok,
+          status: res.status,
+          elapsed: Date.now() - t0,
+          proxy: 'allorigins',
+          bodyPreview: text.slice(0, 2000),
+        },
+        null,
+        2
+      ),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (err: any) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        elapsed: Date.now() - t0,
+        proxy: 'allorigins',
+        error: err?.message ?? String(err),
+      }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+}
     if (url.pathname === '/discord/register') {
       return registerDiscordCommands(env);
     }
