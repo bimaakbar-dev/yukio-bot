@@ -11,6 +11,7 @@ const MAX_LAYERS = 5;
 const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
 const MSG_BUDGET = 3800;
+const JSON_INLINE_THRESHOLD = 3500;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -252,36 +253,66 @@ function slugify(s: string): string {
     .slice(0, 40) || `file-${Date.now()}`;
 }
 
+/* ============================================================
+   EPISODE NUMBER DETECTION
+   ============================================================ */
+
 /**
- * Deteksi nomor episode dari label HTML.
- * Prioritas:
- *   1. "Episode 4" / "Ep 4" / "Eps 4" / "E04"
- *   2. Label yang isinya cuma angka "4"
- *   3. Fallback ke 1
+ * Deteksi nomor episode. Prioritas:
+ *   1. Filename — "jjk-ep3.html" / "jjk-ep05" / "frieren_12"
+ *   2. Label HTML — "Episode 5" / "Ep 5" / "Eps 5" / "E05"
+ *   3. Label murni angka — "5", "05"
+ *   4. Fallback ke 1
+ *
+ * Exclude resolusi umum (144/240/360/480/540/720/1080/1440/2160) supaya
+ * tidak salah tangkap sebagai episode.
  */
-function parseEpisodeNumber(labels: (string | null)[]): number {
-  // Pass 1: pola "ep X" / "episode X" / "eps X" / "eX"
-  for (const label of labels) {
-    if (!label) continue;
-    const m = label.match(/(?:ep|eps|episode|e)\s*0*(\d+)/i);
+function parseEpisodeNumber(
+  filename: string | null,
+  labels: (string | null)[]
+): number {
+  const RESOLUTIONS = new Set([
+    144, 240, 360, 480, 540, 720, 1080, 1440, 2160,
+  ]);
+
+  const isValid = (n: number): boolean =>
+    n > 0 && n < 10000 && !RESOLUTIONS.has(n);
+
+  // Pass 1: dari filename
+  if (filename) {
+    const m = filename.match(/\b(?:ep|eps|episode|e)\s*[-_.]?\s*0*(\d+)\b/i);
     if (m && m[1]) {
       const n = parseInt(m[1], 10);
-      if (n > 0 && n < 10000) return n;
+      if (isValid(n)) return n;
     }
   }
 
-  // Pass 2: label cuma angka murni
+  // Pass 2: dari label — pola "Episode 5", "Ep 5", "Eps 5"
+  for (const label of labels) {
+    if (!label) continue;
+    const m = label.match(/\b(?:episode|eps|ep)\s*0*(\d+)\b/i);
+    if (m && m[1]) {
+      const n = parseInt(m[1], 10);
+      if (isValid(n)) return n;
+    }
+  }
+
+  // Pass 3: label murni angka
   for (const label of labels) {
     if (!label) continue;
     const m = label.trim().match(/^0*(\d+)$/);
     if (m && m[1]) {
       const n = parseInt(m[1], 10);
-      if (n > 0 && n < 10000) return n;
+      if (isValid(n)) return n;
     }
   }
 
   return 1;
 }
+
+/* ============================================================
+   URL EXTRACTION
+   ============================================================ */
 
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
@@ -547,9 +578,10 @@ function splitMessage(text: string, budget = MSG_BUDGET): string[] {
   return parts;
 }
 
-/**
- * Kirim document via Telegram Bot API manual (fetch).
- */
+/* ============================================================
+   TELEGRAM DOCUMENT UPLOAD
+   ============================================================ */
+
 async function sendDocumentViaApi(
   botToken: string,
   chatId: number,
@@ -619,14 +651,15 @@ async function sendDocumentViaApi(
 /**
  * Kirim hasil decode:
  *   1. URL list (inline, sebagai info)
- *   2. File .json (untuk copy-paste ke repo)
+ *   2. JSON — inline <pre> kalau kecil, file .json kalau besar
  */
 async function sendResult(
   ctx: Context,
   env: Env,
   items: ResolvedEntry[],
-  label?: string,
-  sourceLabels: (string | null)[] = []
+  label: string | undefined,
+  sourceLabels: (string | null)[],
+  sourceFilename: string | null
 ): Promise<void> {
   // URL list untuk info
   const urlList = buildUrlList(items, label);
@@ -637,12 +670,28 @@ async function sendResult(
     });
   }
 
-  // Detect nomor episode dari label
-  const episodeNumber = parseEpisodeNumber(sourceLabels);
+  // Detect nomor episode
+  const episodeNumber = parseEpisodeNumber(sourceFilename, sourceLabels);
 
   // Build JSON
   const json = buildJson(items, episodeNumber);
 
+  console.log(
+    `[Decode] episode number detected: ${episodeNumber} (json len: ${json.length})`
+  );
+
+  // Kecil → inline <pre>
+  if (json.length <= JSON_INLINE_THRESHOLD) {
+    await ctx.reply(
+      `📋 <b>JSON — Episode ${episodeNumber}</b>\n` +
+        `<i>Copy ke <code>src/data/anime/episodes/{slug}.json</code></i>\n\n` +
+        `<pre>${escapeHtml(json)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return;
+  }
+
+  // Besar → file attachment
   const filename = label
     ? `${label}.json`
     : `episode-${episodeNumber}.json`;
@@ -661,13 +710,16 @@ async function sendResult(
     );
   } catch (err) {
     console.warn('[Decode] sendDocument failed, fallback inline:', err);
-    // Fallback: kirim inline
     await ctx.reply(
       `📋 <b>JSON — Episode ${episodeNumber}</b>\n\n<pre>${escapeHtml(json)}</pre>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
   }
 }
+
+/* ============================================================
+   FILE DOWNLOAD
+   ============================================================ */
 
 async function downloadByFileId(
   ctx: Context,
@@ -783,6 +835,10 @@ function processText(
   return { videos, labels };
 }
 
+/* ============================================================
+   PUBLIC HANDLERS
+   ============================================================ */
+
 export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
   const result = await downloadDocText(ctx, env);
   if (!result) return;
@@ -815,7 +871,7 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
       { parse_mode: 'HTML' }
     );
 
-    await sendResult(ctx, env, videos, label, labels);
+    await sendResult(ctx, env, videos, label, labels, filename);
 
     await ctx.reply(
       `💡 Akses lagi: <code>/decode ${escapeHtml(label)}</code>`,
@@ -882,7 +938,14 @@ export const decodeCommand: CommandDefinition = {
             return;
           }
           await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-          await sendResult(ctx, env, processed.videos, ref.label, processed.labels);
+          await sendResult(
+            ctx,
+            env,
+            processed.videos,
+            ref.label,
+            processed.labels,
+            ref.filename
+          );
         } catch (err: any) {
           await ctx.api
             .editMessageText(
@@ -914,7 +977,7 @@ export const decodeCommand: CommandDefinition = {
         return;
       }
       await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-      await sendResult(ctx, env, processed.videos, undefined, processed.labels);
+      await sendResult(ctx, env, processed.videos, undefined, processed.labels, null);
     } catch (err: any) {
       console.error('[Decode] error:', err);
       await ctx.api
