@@ -6,8 +6,8 @@ import type {
   UnifiedRelation,
 } from './qimochi-chain-extras';
 
-const MAX_CHARACTERS = 20;
-const MAX_EPISODES_WARN = 1500;
+const MAX_CHARACTERS = 100;
+const MAX_EPISODES_WARN = 700;
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
