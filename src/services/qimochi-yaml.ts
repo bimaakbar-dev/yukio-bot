@@ -102,7 +102,10 @@ export function buildMetadataYaml(input: MetadataInput): string {
   const { media, malId, kitsuId } = input;
   const lines: string[] = [];
 
+  // === FRONTMATTER OPEN ===
   lines.push('---');
+
+  // === TITLE ===
   lines.push(`title: ${yamlString(media.title.romaji || 'Unknown')}`);
   if (media.title.english) {
     lines.push(`titleEnglish: ${yamlString(media.title.english)}`);
@@ -112,10 +115,21 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  if (malId) lines.push(`malId: ${malId}`);
-  if (kitsuId) lines.push(`kitsuId: ${yamlString(kitsuId)}`);
+  // === EXTERNAL IDs ===
+  const effectiveMalId = malId ?? media.myanimelistId ?? null;
+  if (effectiveMalId) {
+    lines.push(`malId: ${effectiveMalId}`);
+  } else {
+    lines.push('# malId: # edit manual');
+  }
+  if (kitsuId) {
+    lines.push(`kitsuId: ${yamlString(kitsuId)}`);
+  } else {
+    lines.push('# kitsuId: # edit manual');
+  }
   lines.push('');
 
+  // === TYPE / STATUS / SOURCE ===
   lines.push(`type: ${FORMAT_MAP[media.format] ?? 'Unknown'}`);
   lines.push(`status: ${STATUS_MAP[media.status] ?? 'finished'}`);
 
@@ -124,7 +138,9 @@ export function buildMetadataYaml(input: MetadataInput): string {
   } else {
     lines.push('# source: # edit manual');
   }
+  lines.push('');
 
+  // === SEASON / YEAR / EPISODES / DURATION / RATING ===
   const season = guessSeason(media.startDate.month);
   if (season) lines.push(`season: ${season}`);
   if (media.seasonYear) lines.push(`year: ${media.seasonYear}`);
@@ -143,6 +159,7 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
+  // === AIRED ===
   const airedFrom = formatDate(
     media.startDate.year,
     media.startDate.month,
@@ -167,6 +184,7 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
+  // === STATS ===
   lines.push('stats:');
   if (media.averageScore && media.averageScore > 0) {
     lines.push(`  score: ${(media.averageScore / 10).toFixed(1)}`);
@@ -176,6 +194,7 @@ export function buildMetadataYaml(input: MetadataInput): string {
   lines.push('  # scoredBy: # edit manual');
   lines.push('');
 
+  // === GENRES ===
   const genres = (media.genres ?? []).map(slugify).filter(Boolean);
   if (genres.length > 0) {
     lines.push('genres:');
@@ -185,6 +204,7 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
+  // === STUDIOS ===
   const studios = (media.studios?.nodes ?? [])
     .map((s) => slugify(s.name))
     .filter(Boolean);
@@ -196,9 +216,12 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
+  // === FRANCHISES (placeholder — diisi dari section Franchises) ===
+  lines.push('# Ganti dengan section "Franchises" dari /dba');
   lines.push('franchises: []');
   lines.push('');
 
+  // === IMAGES ===
   if (media.coverImage.extraLarge) {
     lines.push(`image: "${media.coverImage.extraLarge}"`);
   } else {
@@ -218,10 +241,15 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
+  // === PLACEHOLDER SECTIONS ===
+  lines.push('# Ganti dengan section "Episodes" dari /dba');
   lines.push('episodeList: []');
+  lines.push('');
+  lines.push('# Ganti dengan section "Characters" dari /dba');
   lines.push('characters: []');
   lines.push('');
 
+  // === DRAFT ===
   lines.push('draft: false');
   lines.push('---');
 
@@ -338,7 +366,7 @@ export function getSynopsisRaw(media: AniListMedia): string {
 }
 
 /* ============================================================
-   ALL (legacy)
+   ALL
    ============================================================ */
 
 export interface AllInput {
