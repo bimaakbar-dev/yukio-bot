@@ -1,6 +1,5 @@
 // src/services/qimochi-chain.ts
 import type { AniListMedia } from '../types/anime';
-import { searchJikan, jikanToAniList } from './jikan';
 import { searchKitsu, kitsuToAniList } from './kitsu';
 import { searchShikimori, shikimoriToAniList } from './shikimori';
 
@@ -30,33 +29,37 @@ async function withTimeout<T>(
 }
 
 /**
- * Cari anime dari 3 sumber secara berurutan:
- * Jikan → Kitsu → Shikimori
+ * Cari anime dari 2 sumber secara berurutan:
+ * Shikimori → Kitsu
  *
  * Return data dari sumber pertama yang berhasil.
- * Kalau semua gagal, throw error.
+ * Jikan sudah di-drop (blocked dari CF Workers).
  */
 export async function chainSearch(query: string): Promise<ChainSearchResult> {
   const tried: string[] = [];
   const errors: string[] = [];
 
-  // === 1. JIKAN ===
-  tried.push('Jikan');
-  const jikan = await withTimeout(() => searchJikan(query), TIMEOUT_PER_SOURCE);
+  // === 1. SHIKIMORI (paling reliable) ===
+  tried.push('Shikimori');
+  const shikimori = await withTimeout(
+    () => searchShikimori(query),
+    TIMEOUT_PER_SOURCE
+  );
 
-  if (jikan) {
+  if (shikimori) {
     return {
-      media: jikanToAniList(jikan),
-      malId: jikan.mal_id,
+      media: shikimoriToAniList(shikimori),
+      // Shikimori id == myanimelist_id
+      malId: shikimori.id ?? null,
       kitsuId: null,
-      source: 'Jikan (MAL)',
+      source: 'Shikimori',
       tried,
       errors,
     };
   }
-  errors.push('Jikan: timeout atau gagal');
+  errors.push('Shikimori: timeout atau gagal');
 
-  // === 2. KITSU ===
+  // === 2. KITSU (fallback) ===
   tried.push('Kitsu');
   const kitsuResult = await withTimeout(
     () => searchKitsu(query),
@@ -75,25 +78,6 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
     };
   }
   errors.push('Kitsu: timeout atau gagal');
-
-  // === 3. SHIKIMORI ===
-  tried.push('Shikimori');
-  const shikimori = await withTimeout(
-    () => searchShikimori(query),
-    TIMEOUT_PER_SOURCE
-  );
-
-  if (shikimori) {
-    return {
-      media: shikimoriToAniList(shikimori),
-      malId: null,
-      kitsuId: null,
-      source: 'Shikimori',
-      tried,
-      errors,
-    };
-  }
-  errors.push('Shikimori: timeout atau gagal');
 
   // === SEMUA GAGAL ===
   throw new Error(
