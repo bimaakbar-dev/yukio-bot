@@ -1,7 +1,7 @@
 // src/commands/database-anime.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
-import { InlineKeyboard, type Bot } from 'grammy';
+import { InlineKeyboard, InputFile, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 import { chainSearch } from '../services/qimochi-chain';
@@ -162,10 +162,6 @@ async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
   }
 }
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -193,15 +189,32 @@ function splitMessage(text: string, max: number): string[] {
   return parts;
 }
 
-/**
- * Kirim YAML panjang dengan komentar di atas <pre>.
- * Kalau panjang, di-split per bagian dengan header [i/n].
- */
 async function sendYamlMessage(
   ctx: Context,
   label: string,
   yaml: string
 ): Promise<void> {
+  if (yaml.length > 10000) {
+    try {
+      const buf = new TextEncoder().encode(yaml);
+      const filename = `dba-${Date.now()}.yaml`;
+
+      await ctx.replyWithDocument(
+        new InputFile(buf, filename),
+        {
+          caption:
+            `📋 <b>${escapeHtml(label)}</b>\n\n` +
+            `<i>File terlalu panjang (${yaml.length.toLocaleString()} char). ` +
+            `Dikirim sebagai attachment.</i>`,
+          parse_mode: 'HTML',
+        }
+      );
+      return;
+    } catch (err) {
+      console.warn('[DBA] sendDocument failed, fallback to text:', err);
+    }
+  }
+  
   const parts = splitMessage(yaml, MSG_LIMIT);
 
   if (parts.length === 1) {
