@@ -1,7 +1,7 @@
 // src/commands/database-anime.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
-import { InlineKeyboard, InputFile, type Bot } from 'grammy';
+import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 import { chainSearch } from '../services/qimochi-chain';
@@ -24,6 +24,7 @@ import { askAI } from '../services/ai';
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3800;
 const AI_TIMEOUT_MS = 12000;
+const FILE_THRESHOLD = 4000;
 
 /* ============================================================
    DB: SESSION
@@ -162,6 +163,10 @@ async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
   }
 }
 
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -176,6 +181,23 @@ function splitMessage(text: string, max: number): string[] {
   let current = '';
 
   for (const line of text.split('\n')) {
+    // Handle line yang lebih panjang dari max
+    if (line.length > max) {
+      if (current) {
+        parts.push(current);
+        current = '';
+      }
+      for (let i = 0; i < line.length; i += max) {
+        const chunk = line.slice(i, i + max);
+        if (i + max >= line.length) {
+          current = chunk;
+        } else {
+          parts.push(chunk);
+        }
+      }
+      continue;
+    }
+
     const prospective = current ? `${current}\n${line}` : line;
     if (prospective.length > max && current.length > 0) {
       parts.push(current);
@@ -189,48 +211,137 @@ function splitMessage(text: string, max: number): string[] {
   return parts;
 }
 
+/**
+ * Kirim document via Telegram Bot API manual (fetch).
+ * Lebih reliable dari grammy InputFile di CF Workers.
+ */
+async function sendDocumentViaApi(
+  botToken: string,
+  chatId: number,
+  filename: string,
+  content: string,
+  caption: string
+): Promise<void> {
+  const boundary =
+    '----YukioBot' + Math.random().toString(36).slice(2, 12);
+
+  const encoder = new TextEncoder();
+  const CRLF = '\r\n';
+  const chunks: Uint8Array[] = [];
+
+  const pushStr = (s: string) => {
+    chunks.push(encoder.encode(s));
+  };
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(`Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`);
+  pushStr(`${chatId}${CRLF}`);
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(`Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`);
+  pushStr(`${caption}${CRLF}`);
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(`Content-Disposition: form-data; name="parse_mode"${CRLF}${CRLF}`);
+  pushStr(`HTML${CRLF}`);
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(
+    `Content-Disposition: form-data; name="document"; filename="${filename}"${CRLF}`
+  );
+  pushStr(`Content-Type: text/yaml; charset=utf-8${CRLF}${CRLF}`);
+  chunks.push(encoder.encode(content));
+  pushStr(`${CRLF}`);
+
+  pushStr(`--${boundary}--${CRLF}`);
+
+  // Concat semua chunk jadi 1 Uint8Array
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const body = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    body.set(c, offset);
+    offset += c.length;
+  }
+
+  const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(
+      `sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`
+    );
+  }
+}
+
+/**
+ * Kirim YAML panjang dengan komentar di atas <pre>.
+ * Kalau > 4000 char → kirim sebagai file attachment (anti-spam).
+ * Kalau < 4000 char → split per pesan dengan delay.
+ */
 async function sendYamlMessage(
   ctx: Context,
   label: string,
   yaml: string
 ): Promise<void> {
-  if (yaml.length > 10000) {
+  // === FILE ATTACHMENT untuk YAML besar ===
+  if (yaml.length > FILE_THRESHOLD) {
     try {
-      const buf = new TextEncoder().encode(yaml);
-      const filename = `dba-${Date.now()}.yaml`;
+      const filename = `qimochi-${Date.now()}.yaml`;
+      const caption =
+        `📋 <b>${escapeHtml(label)}</b>\n\n` +
+        `<i>${yaml.length.toLocaleString()} char — dikirim sebagai file.</i>`;
 
-      await ctx.replyWithDocument(
-        new InputFile(buf, filename),
-        {
-          caption:
-            `📋 <b>${escapeHtml(label)}</b>\n\n` +
-            `<i>File terlalu panjang (${yaml.length.toLocaleString()} char). ` +
-            `Dikirim sebagai attachment.</i>`,
-          parse_mode: 'HTML',
-        }
+      await sendDocumentViaApi(
+        ctx.api.token,
+        ctx.chat!.id,
+        filename,
+        yaml,
+        caption
       );
+
+      console.log(`[DBA] file attachment sent (${yaml.length} char)`);
       return;
-    } catch (err) {
-      console.warn('[DBA] sendDocument failed, fallback to text:', err);
+    } catch (err: any) {
+      console.error(`[DBA] sendDocument failed: ${err?.message ?? err}`);
+      // Lanjut ke fallback text split
     }
   }
-  
-  const parts = splitMessage(yaml, MSG_LIMIT);
 
-  if (parts.length === 1) {
-    await ctx.reply(
-      `📋 <b>${escapeHtml(label)}</b>\n\n<pre>${escapeHtml(parts[0] ?? '')}</pre>`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-    return;
-  }
+  // === TEXT SPLIT (fallback) ===
+  const parts = splitMessage(yaml, MSG_LIMIT);
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i] ?? '';
-    await ctx.reply(
-      `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${parts.length}]\n\n<pre>${escapeHtml(part)}</pre>`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
+    const header =
+      parts.length > 1
+        ? `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${parts.length}]\n\n`
+        : `📋 <b>${escapeHtml(label)}</b>\n\n`;
+
+    try {
+      await ctx.reply(`${header}<pre>${escapeHtml(part)}</pre>`, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      });
+    } catch (err: any) {
+      console.error(
+        `[DBA] sendMessage part ${i + 1}/${parts.length} failed: ${err?.message ?? err}`
+      );
+      throw err;
+    }
+
+    // Delay antar part untuk hindari rate limit
+    if (i < parts.length - 1) {
+      await new Promise((r) => setTimeout(r, 800));
+    }
   }
 }
 
