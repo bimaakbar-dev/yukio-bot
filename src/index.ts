@@ -124,18 +124,17 @@ export default {
     if (url.pathname === '/debug/anilist') {
       const t0 = Date.now();
       try {
-        const res = await fetch('https://graphql.anilist.co', {
+        const anilistUrl = 'https://graphql.anilist.co';
+        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(anilistUrl)}`;
+        
+        const res = await fetch(proxyUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Accept: 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Origin': 'https://anilist.co',
-            'Referer': 'https://anilist.co/',
           },
           body: JSON.stringify({
-            query:
-              'query ($idMal: Int) { Media(idMal: $idMal, type: ANIME) { id title { romaji } characters(page: 1, perPage: 3) { edges { role node { name { full } } voiceActors(language: JAPANESE) { id name { full } languageV2 } } } } }',
+            query: '...',
             variables: { idMal: 40748 },
           }),
         });
