@@ -23,6 +23,11 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3800;
 const AI_TIMEOUT_MS = 12000;
 
+const TIMEOUT_SEARCH = 10000;
+const TIMEOUT_CHARS = 12000;
+const TIMEOUT_EPISODES = 15000;
+const TIMEOUT_RELATIONS = 10000;
+
 /* ============================================================
    DB: SESSION
    ============================================================ */
@@ -233,6 +238,41 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
+function cleanSynopsis(raw: string | null | undefined): string {
+  if (!raw) return '';
+  return raw
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&#0?39;/g, "'")
+    .trim();
+}
+
+/* ============================================================
+   SAFE FETCH — timeout wrapper
+   ============================================================ */
+
+async function safeFetch<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number
+): Promise<{ data: T | null; error: string | null }> {
+  try {
+    const result = await Promise.race([
+      fn(),
+      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+    ]);
+
+    if (result === null) {
+      return { data: null, error: `timeout ${timeoutMs}ms` };
+    }
+    return { data: result, error: null };
+  } catch (err: any) {
+    return { data: null, error: err?.message ?? 'unknown' };
+  }
+}
+
 /* ============================================================
    AI SYNOPSIS REWRITE
    ============================================================ */
@@ -254,7 +294,6 @@ async function rewriteSynopsis(
     `- 2-3 paragraf pendek\n` +
     `- Jangan spoiler\n` +
     `- Jangan tambahkan info yang tidak ada di referensi\n` +
-    `- Jangan pakai kata pembuka seperti "Anime ini bercerita tentang..."\n` +
     `- Langsung mulai dari tokoh utama atau setting\n\n` +
     `Output hanya sinopsis, tanpa penjelasan tambahan.`;
 
@@ -271,6 +310,16 @@ async function rewriteSynopsis(
   }
 }
 
+function fallbackYaml(section: string, error: string): string {
+  const header =
+    `# ⚠️ Gagal fetch dari Jikan: ${error}\n` +
+    `# Coba tombol sekali lagi, atau isi manual di bawah.\n`;
+  if (section === 'characters') return `${header}characters: []`;
+  if (section === 'episodes') return `${header}episodeList: []`;
+  if (section === 'franchises') return `${header}franchises: []`;
+  return header;
+}
+
 /* ============================================================
    COMMAND HANDLER
    ============================================================ */
@@ -282,7 +331,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
     await ctx.reply(
       '<b>📚 Database Anime</b>\n\n' +
         '<b>Contoh:</b>\n' +
-        '<code>/dba jujutsu kaisen</code>\n\n' +
+        '<code>/dba nama anime</code>\n\n' +
         '<i>Bot akan cari data, lalu tampil tombol untuk pilih section.</i>',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
@@ -292,13 +341,20 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const loading = await ctx.reply('🔍 Mencari...');
 
   try {
-    const jikan = await searchJikan(query);
+    const { data: jikan, error } = await safeFetch(
+      () => searchJikan(query),
+      TIMEOUT_SEARCH
+    );
 
     if (!jikan) {
+      const hint = error?.includes('timeout')
+        ? '\n\n<i>Jikan API lambat. Coba lagi dalam 30 detik.</i>'
+        : '';
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
-        `❌ Anime <b>${escapeHtml(query)}</b> tidak ditemukan di MAL.`
+        `❌ Anime <b>${escapeHtml(query)}</b> tidak ditemukan.${hint}`,
+        { parse_mode: 'HTML' }
       );
       return;
     }
@@ -341,22 +397,14 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       });
     }
   } catch (err: any) {
-    console.error('[DBA] callback error:', err);
-    const msg = err?.message ?? 'unknown';
-  
-    let hint = '';
-    if (msg.includes('aborted') || msg.includes('timeout')) {
-      hint = '\n\n<i>Jikan API lambat. Coba lagi dalam 30 detik.</i>';
-    } else if (msg.includes('429')) {
-      hint = '\n\n<i>Rate limit Jikan. Tunggu 1 menit.</i>';
-    } else if (msg.includes('HTTP 5')) {
-      hint = '\n\n<i>Jikan sedang down. Coba lagi nanti.</i>';
-    }
-  
-    await ctx.reply(
-      `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
-      { parse_mode: 'HTML' }
-    );
+    console.error('[DBA] command error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`
+      )
+      .catch(() => {});
   }
 }
 
@@ -429,15 +477,23 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
 
     try {
-      const jikan = await searchJikan(session.title);
+      const { data: jikan, error: searchError } = await safeFetch(
+        () => searchJikan(session.title),
+        TIMEOUT_SEARCH
+      );
 
       if (!jikan) {
-        await ctx.reply('❌ Data Jikan hilang. Ulangi /dba.');
+        await ctx.reply(
+          `❌ Gagal ambil data Jikan: ${escapeHtml(searchError ?? 'unknown')}\n\n` +
+            '<i>Ulangi /dba atau tunggu 30 detik.</i>',
+          { parse_mode: 'HTML' }
+        );
         return;
       }
 
       const media = jikanToAniList(jikan);
 
+      /* ---------- METADATA ---------- */
       if (action === 'm') {
         const yaml = buildMetadataYaml({
           media,
@@ -448,41 +504,61 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
+      /* ---------- CHARACTERS ---------- */
       if (action === 'c') {
-        const chars = await getCharacters(session.mal_id);
-        const yaml = buildCharactersYaml(chars);
+        const { data: chars, error } = await safeFetch(
+          () => getCharacters(session.mal_id),
+          TIMEOUT_CHARS
+        );
+
+        const yaml = chars
+          ? buildCharactersYaml(chars)
+          : fallbackYaml('characters', error ?? 'unknown');
+
         await sendLongMessage(ctx, `Characters — ${session.title}`, yaml);
         return;
       }
 
+      /* ---------- EPISODES ---------- */
       if (action === 'e') {
-        const eps = await getAllEpisodes(session.mal_id, 100);
-        const yaml = buildEpisodesYaml(eps);
+        const { data: eps, error } = await safeFetch(
+          () => getAllEpisodes(session.mal_id, 100),
+          TIMEOUT_EPISODES
+        );
+
+        const yaml = eps
+          ? buildEpisodesYaml(eps)
+          : fallbackYaml('episodes', error ?? 'unknown');
+
         await sendLongMessage(ctx, `Episodes — ${session.title}`, yaml);
         return;
       }
 
+      /* ---------- FRANCHISES ---------- */
       if (action === 'f') {
-        const rels = await getRelations(session.mal_id);
-        const yaml = buildFranchisesYaml(rels);
+        const { data: rels, error } = await safeFetch(
+          () => getRelations(session.mal_id),
+          TIMEOUT_RELATIONS
+        );
+
+        const yaml = rels
+          ? buildFranchisesYaml(rels)
+          : fallbackYaml('franchises', error ?? 'unknown');
+
         await sendLongMessage(ctx, `Franchises — ${session.title}`, yaml);
         return;
       }
 
+      /* ---------- SUMMARY ---------- */
       if (action === 's') {
-        const raw = media.description ?? '';
-        const cleaned = raw
-          .replace(/<br\s*\/?>/gi, '\n')
-          .replace(/<\/p>/gi, '\n\n')
-          .replace(/<[^>]+>/g, '')
-          .replace(/&quot;/g, '"')
-          .replace(/&amp;/g, '&')
-          .replace(/&#0?39;/g, "'")
-          .trim();
+        const cleaned = cleanSynopsis(media.description);
 
-        const ai = await rewriteSynopsis(env, session.title, cleaned);
+        const { data: ai } = await safeFetch(
+          () => rewriteSynopsis(env, session.title, cleaned),
+          AI_TIMEOUT_MS
+        );
 
-        let body = '';
+        let body: string;
         if (ai) {
           body =
             '<!--\n' +
@@ -502,8 +578,9 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
+      /* ---------- ALL ---------- */
       if (action === 'a') {
-        await ctx.reply('⏳ Mengumpulkan semua data... (1/4)');
+        await ctx.reply('⏳ All (1/5): Metadata...');
 
         const metaYaml = buildMetadataYaml({
           media,
@@ -511,32 +588,42 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           kitsuId: null,
         });
 
-        await ctx.reply('⏳ Characters... (2/4)');
-        const chars = await getCharacters(session.mal_id);
-        const charsYaml = buildCharactersYaml(chars);
+        await ctx.reply('⏳ All (2/5): Characters...');
+        const { data: chars, error: charsErr } = await safeFetch(
+          () => getCharacters(session.mal_id),
+          TIMEOUT_CHARS
+        );
+        const charsYaml = chars
+          ? buildCharactersYaml(chars)
+          : fallbackYaml('characters', charsErr ?? 'unknown');
 
-        await ctx.reply('⏳ Episodes... (3/4)');
-        const eps = await getAllEpisodes(session.mal_id, 100);
-        const epsYaml = buildEpisodesYaml(eps);
+        await ctx.reply('⏳ All (3/5): Episodes...');
+        const { data: eps, error: epsErr } = await safeFetch(
+          () => getAllEpisodes(session.mal_id, 100),
+          TIMEOUT_EPISODES
+        );
+        const epsYaml = eps
+          ? buildEpisodesYaml(eps)
+          : fallbackYaml('episodes', epsErr ?? 'unknown');
 
-        await ctx.reply('⏳ Franchises + Summary... (4/4)');
-        const rels = await getRelations(session.mal_id);
-        const relsYaml = buildFranchisesYaml(rels);
+        await ctx.reply('⏳ All (4/5): Franchises...');
+        const { data: rels, error: relsErr } = await safeFetch(
+          () => getRelations(session.mal_id),
+          TIMEOUT_RELATIONS
+        );
+        const relsYaml = rels
+          ? buildFranchisesYaml(rels)
+          : fallbackYaml('franchises', relsErr ?? 'unknown');
 
-        const raw = media.description ?? '';
-        const cleaned = raw
-          .replace(/<br\s*\/?>/gi, '\n')
-          .replace(/<\/p>/gi, '\n\n')
-          .replace(/<[^>]+>/g, '')
-          .replace(/&quot;/g, '"')
-          .replace(/&amp;/g, '&')
-          .replace(/&#0?39;/g, "'")
-          .trim();
-
-        const ai = await rewriteSynopsis(env, session.title, cleaned);
+        await ctx.reply('⏳ All (5/5): Summary...');
+        const cleaned = cleanSynopsis(media.description);
+        const { data: ai } = await safeFetch(
+          () => rewriteSynopsis(env, session.title, cleaned),
+          AI_TIMEOUT_MS
+        );
         const summary =
           '<!--\n' +
-          '  ⚠️ Sinopsis ini di-generate AI. Tinjau ulang sebelum commit.\n' +
+          '  ⚠️ Sinopsis di-generate AI. Tinjau ulang sebelum commit.\n' +
           '-->\n\n' +
           (ai || cleaned || 'Tulis sinopsis manual...');
 
@@ -554,8 +641,19 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
       }
     } catch (err: any) {
       console.error('[DBA] callback error:', err);
+      const msg = err?.message ?? 'unknown';
+
+      let hint = '';
+      if (msg.includes('aborted') || msg.includes('timeout')) {
+        hint = '\n\n<i>Jikan API lambat. Coba lagi dalam 30 detik.</i>';
+      } else if (msg.includes('429')) {
+        hint = '\n\n<i>Rate limit Jikan. Tunggu 1 menit.</i>';
+      } else if (msg.includes('HTTP 5')) {
+        hint = '\n\n<i>Jikan sedang down. Coba lagi nanti.</i>';
+      }
+
       await ctx.reply(
-        `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+        `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
         { parse_mode: 'HTML' }
       );
     }
