@@ -83,7 +83,6 @@ export async function searchShikimori(
   const basic = list[0];
   if (!basic?.id) return null;
 
-  // Fetch detail — studio, franchise, videos, rating hanya ada di endpoint ini
   try {
     const detailUrl = `${SHIKIMORI_URL}/${basic.id}`;
     const detailRes = await fetchWithRetry(
@@ -123,6 +122,62 @@ function pickString(
   return v;
 }
 
+/**
+ * Map rating Shikimori → enum QimochiDB.
+ * Shikimori: g, pg, pg_13, r, r_plus, rx
+ * QimochiDB: G, PG, PG-13, R, R+, Rx
+ */
+function mapShikimoriRating(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const lower = raw.toLowerCase().trim();
+
+  const map: Record<string, string> = {
+    g: 'G',
+    pg: 'PG',
+    pg_13: 'PG-13',
+    'pg-13': 'PG-13',
+    r: 'R',
+    r_plus: 'R+',
+    'r+': 'R+',
+    rx: 'Rx',
+  };
+
+  return map[lower] ?? null;
+}
+
+function parseShikimoriDate(dateStr: string | null | undefined): {
+  year: number | null;
+  month: number | null;
+  day: number | null;
+} | null {
+  if (!dateStr) return null;
+  const date = new Date(dateStr);
+  if (isNaN(date.getTime())) return null;
+  return {
+    year: date.getFullYear(),
+    month: date.getMonth() + 1,
+    day: date.getDate(),
+  };
+}
+
+function pickTrailer(videos: ShikimoriVideo[] | undefined): string | null {
+  if (!Array.isArray(videos) || videos.length === 0) return null;
+
+  // Prioritas: youtube hosting, kind: pv
+  const youtube = videos.find(
+    (v) => v.hosting === 'youtube' && v.url && v.kind === 'pv'
+  );
+  if (youtube?.url) return youtube.url;
+
+  const anyYoutube = videos.find(
+    (v) => v.hosting === 'youtube' && v.url
+  );
+  if (anyYoutube?.url) return anyYoutube.url;
+
+  const first = videos.find((v) => v.url);
+  return first?.url ?? null;
+}
+
 /* ============================================================
    MAPPER
    ============================================================ */
@@ -158,7 +213,8 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
       : `https://shikimori.one${imgPrev}`
     : '';
 
-  const date = s.aired_on ? new Date(s.aired_on) : null;
+  const airedDate = parseShikimoriDate(s.aired_on);
+  const releasedDate = parseShikimoriDate(s.released_on);
 
   const genres: string[] = Array.isArray(s.genres)
     ? s.genres
@@ -187,15 +243,30 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
     description: s.description ?? null,
     format,
     status,
-    seasonYear: date?.getFullYear() ?? null,
+    seasonYear: airedDate?.year ?? null,
     episodes: s.episodes || null,
     genres,
     averageScore,
     studios: { nodes: studios },
     startDate: {
-      year: date?.getFullYear() ?? null,
-      month: date ? date.getMonth() + 1 : null,
-      day: date ? date.getDate() : null,
+      year: airedDate?.year ?? null,
+      month: airedDate?.month ?? null,
+      day: airedDate?.day ?? null,
     },
+
+    /* === Extended === */
+    duration: s.duration && s.duration > 0 ? s.duration : null,
+    rating: mapShikimoriRating(s.rating),
+    endDate: releasedDate
+      ? {
+          year: releasedDate.year,
+          month: releasedDate.month,
+          day: releasedDate.day,
+        }
+      : null,
+    trailer: pickTrailer(s.videos),
+    franchise: s.franchise ?? null,
+    myanimelistId: s.myanimelist_id ?? s.id,
+    // banner & source tidak ada di Shikimori
   };
 }
