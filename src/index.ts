@@ -8,6 +8,7 @@ import { handleDocumentAuto } from './commands/decode';
 import { setupAnimeCallbacks } from './commands/anime';
 import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
+import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
@@ -27,6 +28,7 @@ function createBot(env: Env): Bot {
   registerCommands(bot, env);
   setupBusinessHandler(bot, env);
   setupAnimeCallbacks(bot, env);
+  setupDatabaseAnimeCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
