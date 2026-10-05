@@ -22,9 +22,9 @@ import {
 import { askAI } from '../services/ai';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
-const MSG_LIMIT = 3800;
+const MSG_LIMIT = 3500;
 const AI_TIMEOUT_MS = 12000;
-const FILE_THRESHOLD = 4000;
+const FILE_THRESHOLD = 500;
 
 /* ============================================================
    DB: SESSION
@@ -181,7 +181,6 @@ function splitMessage(text: string, max: number): string[] {
   let current = '';
 
   for (const line of text.split('\n')) {
-    // Handle line yang lebih panjang dari max
     if (line.length > max) {
       if (current) {
         parts.push(current);
@@ -213,7 +212,6 @@ function splitMessage(text: string, max: number): string[] {
 
 /**
  * Kirim document via Telegram Bot API manual (fetch).
- * Lebih reliable dari grammy InputFile di CF Workers.
  */
 async function sendDocumentViaApi(
   botToken: string,
@@ -255,7 +253,6 @@ async function sendDocumentViaApi(
 
   pushStr(`--${boundary}--${CRLF}`);
 
-  // Concat semua chunk jadi 1 Uint8Array
   let totalLen = 0;
   for (const c of chunks) totalLen += c.length;
   const body = new Uint8Array(totalLen);
@@ -283,16 +280,15 @@ async function sendDocumentViaApi(
 }
 
 /**
- * Kirim YAML panjang dengan komentar di atas <pre>.
- * Kalau > 4000 char → kirim sebagai file attachment (anti-spam).
- * Kalau < 4000 char → split per pesan dengan delay.
+ * Kirim YAML — pakai env.TELEGRAM_BOT_TOKEN untuk file attachment.
  */
 async function sendYamlMessage(
   ctx: Context,
+  env: Env,
   label: string,
   yaml: string
 ): Promise<void> {
-  // === FILE ATTACHMENT untuk YAML besar ===
+  // === FILE ATTACHMENT (threshold rendah, hampir semua YAML → file) ===
   if (yaml.length > FILE_THRESHOLD) {
     try {
       const filename = `qimochi-${Date.now()}.yaml`;
@@ -301,7 +297,7 @@ async function sendYamlMessage(
         `<i>${yaml.length.toLocaleString()} char — dikirim sebagai file.</i>`;
 
       await sendDocumentViaApi(
-        ctx.api.token,
+        env.TELEGRAM_BOT_TOKEN,
         ctx.chat!.id,
         filename,
         yaml,
@@ -312,11 +308,11 @@ async function sendYamlMessage(
       return;
     } catch (err: any) {
       console.error(`[DBA] sendDocument failed: ${err?.message ?? err}`);
-      // Lanjut ke fallback text split
+      // Fallback text
     }
   }
 
-  // === TEXT SPLIT (fallback) ===
+  // === TEXT SPLIT (fallback untuk YAML kecil atau kalau file gagal) ===
   const parts = splitMessage(yaml, MSG_LIMIT);
 
   for (let i = 0; i < parts.length; i++) {
@@ -338,7 +334,6 @@ async function sendYamlMessage(
       throw err;
     }
 
-    // Delay antar part untuk hindari rate limit
     if (i < parts.length - 1) {
       await new Promise((r) => setTimeout(r, 800));
     }
@@ -677,7 +672,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           kitsuId: result.kitsuId ?? session.kitsu_id,
         });
         const header = headerMetadata(session.title);
-        await sendYamlMessage(ctx, `Metadata — ${session.title}`, header + yaml);
+        await sendYamlMessage(
+          ctx,
+          env,
+          `Metadata — ${session.title}`,
+          header + yaml
+        );
         return;
       }
 
@@ -701,7 +701,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         const header = headerCharacters(session.title);
-        await sendYamlMessage(ctx, label, header + yaml);
+        await sendYamlMessage(ctx, env, label, header + yaml);
         return;
       }
 
@@ -725,7 +725,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         const header = headerEpisodes(session.title);
-        await sendYamlMessage(ctx, label, header + yaml);
+        await sendYamlMessage(ctx, env, label, header + yaml);
         return;
       }
 
@@ -749,7 +749,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         const header = headerFranchises(session.title);
-        await sendYamlMessage(ctx, label, header + yaml);
+        await sendYamlMessage(ctx, env, label, header + yaml);
         return;
       }
 
@@ -789,7 +789,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         const header = headerSummary(session.title);
-        await sendYamlMessage(ctx, `Summary — ${session.title}`, header + body);
+        await sendYamlMessage(
+          ctx,
+          env,
+          `Summary — ${session.title}`,
+          header + body
+        );
         return;
       }
 
@@ -863,7 +868,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           summary: headerSummary(session.title) + summary,
         });
 
-        await sendYamlMessage(ctx, `All — ${session.title}`, full);
+        await sendYamlMessage(ctx, env, `All — ${session.title}`, full);
         await deleteSession(env.DB, sessionId);
         return;
       }
