@@ -4,7 +4,6 @@ import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
-import { searchJikan, jikanToAniList } from '../services/jikan';
 import {
   getCharacters,
   getAllEpisodes,
