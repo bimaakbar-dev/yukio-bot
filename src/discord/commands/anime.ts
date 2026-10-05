@@ -292,6 +292,7 @@ async function processAnime(
           releaseDate: media.startDate?.year
             ? `${media.startDate.year}-01-01`
             : null,
+          originalSynopsis: media.description,
         },
         need
       );
