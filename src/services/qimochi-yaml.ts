@@ -7,7 +7,7 @@ import type {
 } from './qimochi-chain-extras';
 
 const MAX_CHARACTERS = 20;
-const MAX_EPISODES_WARN = 200;
+const MAX_EPISODES_WARN = 1500;
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
