@@ -110,10 +110,44 @@ export function stripHtml(s: string): string {
 
 /**
  * Deteksi apakah string mengandung karakter Cyrillic (Rusia).
- * Shikimori API sering return description dalam bahasa Rusia.
  */
 export function hasCyrillic(s: string): boolean {
   return /[\u0400-\u04FF\u0500-\u052F]/.test(s);
+}
+
+/**
+ * Heuristic: apakah teks kemungkinan bahasa Indonesia?
+ * Cek kata umum Indonesia yang sering muncul di sinopsis.
+ */
+export function looksIndonesian(s: string): boolean {
+  const lower = s.toLowerCase();
+  const idWords = [
+    ' yang ',
+    ' dengan ',
+    ' untuk ',
+    ' adalah ',
+    ' dan ',
+    ' di ',
+    ' ke ',
+    ' dari ',
+    ' ini ',
+    ' itu ',
+    ' tidak ',
+    ' akan ',
+    ' setelah ',
+    ' ketika ',
+    ' seorang ',
+    ' sebuah ',
+    ' dalam ',
+    ' pada ',
+  ];
+
+  let matches = 0;
+  for (const w of idWords) {
+    if (lower.includes(w)) matches++;
+  }
+  // Minimal 3 kata umum Indonesia → dianggap Indonesia
+  return matches >= 3;
 }
 
 export function pick<T>(...values: (T | null | undefined)[]): T | null {
@@ -199,17 +233,16 @@ export function detectMissing(media: AniListMedia): string[] {
 
   if (!media.startDate?.year && !media.seasonYear) need.push('releaseDate');
 
+  // Flag synopsis kalau:
+  // - kosong / terlalu pendek
+  // - bukan bahasa Indonesia (Cyrillic atau English)
+  // Tujuan: body selalu Indonesia
   const desc = media.description ?? '';
   const cleanDesc = stripHtml(desc);
 
-  // Flag synopsis kalau:
-  // - kosong / terlalu pendek
-  // - mengandung Cyrillic (Russian) → perlu rewrite ke Indonesia
-  if (
-    !cleanDesc ||
-    cleanDesc.length < 50 ||
-    hasCyrillic(cleanDesc)
-  ) {
+  if (!cleanDesc || cleanDesc.length < 50) {
+    need.push('synopsis');
+  } else if (hasCyrillic(cleanDesc) || !looksIndonesian(cleanDesc)) {
     need.push('synopsis');
   }
 
@@ -247,7 +280,6 @@ async function enrichWithAI(
   if (existing.genre?.length) known.push(`genre: ${existing.genre.join(', ')}`);
   if (existing.releaseDate) known.push(`releaseDate: ${existing.releaseDate}`);
 
-  // Blok original synopsis — dipakai AI untuk rewrite (bisa Russian/English/Japanese)
   const originalBlock = existing.originalSynopsis
     ? `\nOriginal synopsis (may be in English, Russian, or Japanese — REWRITE it into Indonesian):\n"""\n${existing.originalSynopsis.slice(0, 2000)}\n"""\n\n`
     : '';
@@ -273,7 +305,7 @@ async function enrichWithAI(
     `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
     `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
     `- studio: full official name with "Studio" prefix if applicable (e.g., "Studio Pierrot", "MAPPA")\n` +
-    `- synopsis: If original synopsis is provided above, REWRITE it into natural Indonesian (do NOT translate literally). If no original, write factual summary in Indonesian.\n` +
+    `- synopsis: Tulis 2-3 paragraf dalam bahasa Indonesia natural (minimal 100 kata). If original synopsis is provided above, REWRITE it into natural Indonesian. JANGAN terjemahan literal.\n` +
     `- Output valid JSON only, no markdown, no explanation`;
 
   console.log(
@@ -284,7 +316,7 @@ async function enrichWithAI(
     const raw = await chatAI(
       env,
       [{ role: 'user', content: prompt }],
-      { maxTokens: 900, temperature: 0.1, smart: true }
+      { maxTokens: 1200, temperature: 0.3, smart: true }
     );
 
     console.log(`[Core] AI raw response len: ${raw?.length ?? 0}`);
@@ -446,9 +478,14 @@ export function buildQimochiHubResult(
   let synopsis = synopsisRaw;
   const isTooShort = !synopsis || synopsis.length < 50;
   const isCyrillic = synopsis ? hasCyrillic(synopsis) : false;
+  const isIndonesian = synopsis ? looksIndonesian(synopsis) : false;
 
+  // Pakai hasil AI kalau:
+  // - synopsis kosong/pendek
+  // - Cyrillic
+  // - bukan Indonesia (English, dll)
   if (
-    (isTooShort || isCyrillic) &&
+    (isTooShort || isCyrillic || !isIndonesian) &&
     enriched?.synopsis &&
     enriched.synopsis.length > 50
   ) {
@@ -456,7 +493,7 @@ export function buildQimochiHubResult(
     aiUsed.push('synopsis');
   }
 
-  if (!synopsis || synopsis.length < 30 || hasCyrillic(synopsis)) {
+  if (!synopsis || synopsis.length < 30) {
     synopsis =
       '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.\n\n' +
       `${title} adalah anime yang...`;
