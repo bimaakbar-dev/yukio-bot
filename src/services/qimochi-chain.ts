@@ -29,11 +29,40 @@ async function withTimeout<T>(
 }
 
 /**
+ * Merge dua hasil media dari Shikimori + Kitsu.
+ *
+ * Strategy:
+ * - description: Kitsu English > Shikimori (untuk AI rewrite)
+ * - banner: Kitsu (Shikimori tidak punya)
+ * - duration, rating, endDate, trailer, franchise, myanimelistId:
+ *   Shikimori > Kitsu
+ */
+function mergeMedia(
+  shiki: AniListMedia,
+  kitsu: AniListMedia | null
+): AniListMedia {
+  if (!kitsu) return shiki;
+
+  return {
+    ...shiki,
+    // Description: English Kitsu prioritas
+    description: kitsu.description ?? shiki.description,
+    // Banner: Kitsu (Shikimori tidak punya)
+    banner: shiki.banner ?? kitsu.banner ?? null,
+    // Extended: Shikimori prioritas
+    duration: shiki.duration ?? kitsu.duration ?? null,
+    rating: shiki.rating ?? kitsu.rating ?? null,
+    endDate: shiki.endDate ?? kitsu.endDate ?? null,
+    trailer: shiki.trailer ?? kitsu.trailer ?? null,
+  };
+}
+
+/**
  * Cari anime dari 2 sumber secara PARALEL:
  * Shikimori + Kitsu
  *
- * Shikimori → primary media (metadata lengkap, MAL ID, franchise)
- * Kitsu      → diambil kitsuId-nya untuk keperluan episodes
+ * Shikimori → primary metadata (MAL ID, franchise, extended)
+ * Kitsu      → kitsuId untuk episodes + banner + English description
  *
  * Kalau Shikimori gagal, fallback ke Kitsu sepenuhnya.
  * Jikan sudah di-drop (blocked dari CF Workers).
@@ -63,13 +92,17 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
   if (!shikimori) errors.push('Shikimori: timeout atau gagal');
   if (!kitsuResult) errors.push('Kitsu: timeout atau gagal');
 
-  // === PRIMARY: Shikimori ===
+  // === PRIMARY: Shikimori (+ merge Kitsu) ===
   if (shikimori) {
+    const shikiMedia = shikimoriToAniList(shikimori);
+    const kitsuMedia = kitsuResult ? kitsuToAniList(kitsuResult) : null;
+    const merged = mergeMedia(shikiMedia, kitsuMedia);
+
     const source = kitsuResult ? 'Shikimori + Kitsu' : 'Shikimori';
+
     return {
-      media: shikimoriToAniList(shikimori),
+      media: merged,
       malId: shikimori.id ?? null,
-      // Bonus dari paralel call: kitsuId untuk episodes
       kitsuId: kitsuResult?.anime.id ?? null,
       source,
       tried,
