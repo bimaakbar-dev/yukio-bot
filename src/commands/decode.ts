@@ -1,3 +1,4 @@
+// src/commands/decode.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
 import type { Env } from '../types/env';
@@ -251,6 +252,37 @@ function slugify(s: string): string {
     .slice(0, 40) || `file-${Date.now()}`;
 }
 
+/**
+ * Deteksi nomor episode dari label HTML.
+ * Prioritas:
+ *   1. "Episode 4" / "Ep 4" / "Eps 4" / "E04"
+ *   2. Label yang isinya cuma angka "4"
+ *   3. Fallback ke 1
+ */
+function parseEpisodeNumber(labels: (string | null)[]): number {
+  // Pass 1: pola "ep X" / "episode X" / "eps X" / "eX"
+  for (const label of labels) {
+    if (!label) continue;
+    const m = label.match(/(?:ep|eps|episode|e)\s*0*(\d+)/i);
+    if (m && m[1]) {
+      const n = parseInt(m[1], 10);
+      if (n > 0 && n < 10000) return n;
+    }
+  }
+
+  // Pass 2: label cuma angka murni
+  for (const label of labels) {
+    if (!label) continue;
+    const m = label.trim().match(/^0*(\d+)$/);
+    if (m && m[1]) {
+      const n = parseInt(m[1], 10);
+      if (n > 0 && n < 10000) return n;
+    }
+  }
+
+  return 1;
+}
+
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
   const cleaned = htmlDecode(s);
@@ -417,6 +449,60 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   return final;
 }
 
+/* ============================================================
+   BUILD OUTPUT — JSON (untuk Qimochi HUB)
+   ============================================================ */
+
+/**
+ * Build JSON sesuai schema Qimochi HUB (data/anime/episodes/{slug}.json).
+ * Output:
+ *   {
+ *     "episodes": [
+ *       {
+ *         "number": N,
+ *         "streams": [
+ *           { "quality": "1080p", "servers": [{ "name": "...", "url": "..." }] }
+ *         ]
+ *       }
+ *     ]
+ *   }
+ */
+function buildJson(
+  items: ResolvedEntry[],
+  episodeNumber: number
+): string {
+  const byQuality = new Map<string, { name: string; url: string }[]>();
+
+  for (const item of items) {
+    const q = item.resolution ?? 'Unknown';
+    if (!byQuality.has(q)) byQuality.set(q, []);
+    byQuality.get(q)!.push({
+      name: item.server ?? 'unknown',
+      url: item.url,
+    });
+  }
+
+  const qualities = [...byQuality.keys()].sort(
+    (a, b) => resolutionRank(b) - resolutionRank(a)
+  );
+
+  const streams = qualities.map((q) => ({
+    quality: q,
+    servers: byQuality.get(q)!,
+  }));
+
+  const payload = {
+    episodes: [
+      {
+        number: episodeNumber,
+        streams,
+      },
+    ],
+  };
+
+  return JSON.stringify(payload, null, 2) + '\n';
+}
+
 function buildUrlList(items: ResolvedEntry[], label?: string): string {
   const lines: string[] = [];
   lines.push('🎬 <b>URL Video</b>');
@@ -444,30 +530,6 @@ function buildUrlList(items: ResolvedEntry[], label?: string): string {
   return lines.join('\n').trim();
 }
 
-function buildYaml(items: ResolvedEntry[]): string {
-  const byQuality = new Map<string, { name: string; url: string }[]>();
-  for (const item of items) {
-    const q = item.resolution ?? 'Unknown';
-    if (!byQuality.has(q)) byQuality.set(q, []);
-    byQuality.get(q)!.push({ name: item.server ?? 'unknown', url: item.url });
-  }
-  const qualities = [...byQuality.keys()].sort((a, b) => resolutionRank(b) - resolutionRank(a));
-
-  const lines: string[] = [];
-  lines.push('episodes:');
-  lines.push('  - number: 1');
-  lines.push('    streams:');
-  for (const q of qualities) {
-    lines.push(`      - quality: "${q}"`);
-    lines.push('        servers:');
-    for (const s of byQuality.get(q)!) {
-      lines.push(`          - name: "${s.name}"`);
-      lines.push(`            url: "${s.url}"`);
-    }
-  }
-  return lines.join('\n');
-}
-
 function splitMessage(text: string, budget = MSG_BUDGET): string[] {
   if (text.length <= budget) return [text];
   const parts: string[] = [];
@@ -485,17 +547,125 @@ function splitMessage(text: string, budget = MSG_BUDGET): string[] {
   return parts;
 }
 
-async function sendResult(ctx: Context, items: ResolvedEntry[], label?: string): Promise<void> {
+/**
+ * Kirim document via Telegram Bot API manual (fetch).
+ */
+async function sendDocumentViaApi(
+  botToken: string,
+  chatId: number,
+  filename: string,
+  content: string,
+  caption: string
+): Promise<void> {
+  const boundary =
+    '----YukioDecode' + Math.random().toString(36).slice(2, 12);
+
+  const encoder = new TextEncoder();
+  const CRLF = '\r\n';
+  const chunks: Uint8Array[] = [];
+
+  const pushStr = (s: string) => {
+    chunks.push(encoder.encode(s));
+  };
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(`Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`);
+  pushStr(`${chatId}${CRLF}`);
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(`Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`);
+  pushStr(`${caption}${CRLF}`);
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(`Content-Disposition: form-data; name="parse_mode"${CRLF}${CRLF}`);
+  pushStr(`HTML${CRLF}`);
+
+  pushStr(`--${boundary}${CRLF}`);
+  pushStr(
+    `Content-Disposition: form-data; name="document"; filename="${filename}"${CRLF}`
+  );
+  pushStr(`Content-Type: application/json; charset=utf-8${CRLF}${CRLF}`);
+  chunks.push(encoder.encode(content));
+  pushStr(`${CRLF}`);
+
+  pushStr(`--${boundary}--${CRLF}`);
+
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const body = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    body.set(c, offset);
+    offset += c.length;
+  }
+
+  const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(
+      `sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`
+    );
+  }
+}
+
+/**
+ * Kirim hasil decode:
+ *   1. URL list (inline, sebagai info)
+ *   2. File .json (untuk copy-paste ke repo)
+ */
+async function sendResult(
+  ctx: Context,
+  env: Env,
+  items: ResolvedEntry[],
+  label?: string,
+  sourceLabels: (string | null)[] = []
+): Promise<void> {
+  // URL list untuk info
   const urlList = buildUrlList(items, label);
   for (const part of splitMessage(urlList)) {
-    await ctx.reply(part, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
-  }
-  const yaml = buildYaml(items);
-  for (const part of splitMessage(yaml)) {
-    await ctx.reply(`📋 <b>YAML</b>\n\n<pre>${escapeHtml(part)}</pre>`, {
+    await ctx.reply(part, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
     });
+  }
+
+  // Detect nomor episode dari label
+  const episodeNumber = parseEpisodeNumber(sourceLabels);
+
+  // Build JSON
+  const json = buildJson(items, episodeNumber);
+
+  const filename = label
+    ? `${label}.json`
+    : `episode-${episodeNumber}.json`;
+
+  const caption =
+    `📋 <b>JSON — Episode ${episodeNumber}</b>\n` +
+    `<i>Copy ke <code>src/data/anime/episodes/{slug}.json</code></i>`;
+
+  try {
+    await sendDocumentViaApi(
+      env.TELEGRAM_BOT_TOKEN,
+      ctx.chat!.id,
+      filename,
+      json,
+      caption
+    );
+  } catch (err) {
+    console.warn('[Decode] sendDocument failed, fallback inline:', err);
+    // Fallback: kirim inline
+    await ctx.reply(
+      `📋 <b>JSON — Episode ${episodeNumber}</b>\n\n<pre>${escapeHtml(json)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
   }
 }
 
@@ -598,11 +768,19 @@ async function downloadDocText(
   }
 }
 
-function processText(input: string, sourceType: 'base64' | 'html'): ResolvedEntry[] | null {
-  const entries = sourceType === 'html' ? extractEntries(input) : [{ base64: input, label: null }];
+function processText(
+  input: string,
+  sourceType: 'base64' | 'html'
+): { videos: ResolvedEntry[]; labels: (string | null)[] } | null {
+  const entries =
+    sourceType === 'html'
+      ? extractEntries(input)
+      : [{ base64: input, label: null }];
   if (entries.length === 0) return null;
   const videos = collectResolvedVideos(entries);
-  return videos.length > 0 ? videos : null;
+  if (videos.length === 0) return null;
+  const labels = entries.map((e) => e.label);
+  return { videos, labels };
 }
 
 export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
@@ -614,8 +792,8 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
 
   const loading = await ctx.reply('🌐 Proses...');
   try {
-    const videos = processText(text, sourceType);
-    if (!videos || videos.length === 0) {
+    const processed = processText(text, sourceType);
+    if (!processed) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
@@ -624,6 +802,7 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
       return;
     }
 
+    const { videos, labels } = processed;
     const label = slugify(filename);
     const { replaced } = await saveFileRef(env.DB, label, filename, fileId);
 
@@ -636,7 +815,7 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
       { parse_mode: 'HTML' }
     );
 
-    await sendResult(ctx, videos, label);
+    await sendResult(ctx, env, videos, label, labels);
 
     await ctx.reply(
       `💡 Akses lagi: <code>/decode ${escapeHtml(label)}</code>`,
@@ -693,8 +872,8 @@ export const decodeCommand: CommandDefinition = {
         const sourceType: 'base64' | 'html' = looksLikeHtml(text) ? 'html' : 'base64';
         const loading = await ctx.reply('🌐 Proses...');
         try {
-          const videos = processText(text, sourceType);
-          if (!videos || videos.length === 0) {
+          const processed = processText(text, sourceType);
+          if (!processed) {
             await ctx.api.editMessageText(
               ctx.chat!.id,
               loading.message_id,
@@ -703,7 +882,7 @@ export const decodeCommand: CommandDefinition = {
             return;
           }
           await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-          await sendResult(ctx, videos, ref.label);
+          await sendResult(ctx, env, processed.videos, ref.label, processed.labels);
         } catch (err: any) {
           await ctx.api
             .editMessageText(
@@ -725,8 +904,8 @@ export const decodeCommand: CommandDefinition = {
     const sourceType: 'base64' | 'html' = looksLikeHtml(input) ? 'html' : 'base64';
     const loading = await ctx.reply('🔓 Proses...');
     try {
-      const videos = processText(input, sourceType);
-      if (!videos || videos.length === 0) {
+      const processed = processText(input, sourceType);
+      if (!processed) {
         await ctx.api.editMessageText(
           ctx.chat!.id,
           loading.message_id,
@@ -735,7 +914,7 @@ export const decodeCommand: CommandDefinition = {
         return;
       }
       await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-      await sendResult(ctx, videos);
+      await sendResult(ctx, env, processed.videos, undefined, processed.labels);
     } catch (err: any) {
       console.error('[Decode] error:', err);
       await ctx.api
