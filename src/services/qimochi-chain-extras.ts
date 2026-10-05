@@ -43,7 +43,11 @@ export interface ChainResult<T> {
 
 const PER_SOURCE_TIMEOUT = 8000;
 const MAX_ITEMS = 30;
-const MAX_EPISODES = 100;
+
+/* Episodes config */
+const MAX_EPISODES = 200;
+const KITSU_PAGE_LIMIT = 20;
+const EPISODES_TIME_BUDGET_MS = 10000;
 
 /* ============================================================
    UTILITIES
@@ -91,7 +95,7 @@ async function getKitsuCharacters(
 ): Promise<UnifiedCharacter[] | null> {
   const params = new URLSearchParams();
   params.set('include', 'character');
-  params.set('page[limit]', '40');
+  params.set('page[limit]', '20');
 
   const url = `https://kitsu.io/api/edge/anime/${kitsuId}/characters?${params.toString()}`;
 
@@ -161,7 +165,7 @@ async function getKitsuCharacters(
 }
 
 /* ============================================================
-   KITSU — EPISODES
+   KITSU — EPISODES (pagination + time budget)
    ============================================================ */
 
 interface KitsuEpisodeItem {
@@ -175,11 +179,17 @@ interface KitsuEpisodeItem {
   };
 }
 
-async function getKitsuEpisodes(
-  kitsuId: string
-): Promise<UnifiedEpisode[] | null> {
+type FetchPageResult =
+  | { ok: true; data: KitsuEpisodeItem[] }
+  | { ok: false; reason: 'error' | 'rate_limit' };
+
+async function getKitsuEpisodesPage(
+  kitsuId: string,
+  offset: number
+): Promise<FetchPageResult> {
   const params = new URLSearchParams();
-  params.set('page[limit]', '100');
+  params.set('page[limit]', String(KITSU_PAGE_LIMIT));
+  params.set('page[offset]', String(offset));
   params.set('sort', 'number');
 
   const url = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?${params.toString()}`;
@@ -198,17 +208,73 @@ async function getKitsuEpisodes(
     { retries: 0, timeout: PER_SOURCE_TIMEOUT }
   );
 
-  if (!res.ok) return null;
+  if (res.status === 429) {
+    console.warn('[Kitsu] episodes rate limited (429)');
+    return { ok: false, reason: 'rate_limit' };
+  }
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    console.warn(
+      `[Kitsu] episodes HTTP ${res.status}: ${errBody.slice(0, 150)}`
+    );
+    return { ok: false, reason: 'error' };
+  }
 
   const json = (await res.json()) as { data?: KitsuEpisodeItem[] };
-  const data = json.data ?? [];
-  if (data.length === 0) return null;
+  return { ok: true, data: json.data ?? [] };
+}
+
+async function getKitsuEpisodes(
+  kitsuId: string
+): Promise<{ episodes: UnifiedEpisode[]; truncated: boolean } | null> {
+  const startTime = Date.now();
+  const allEpisodes: KitsuEpisodeItem[] = [];
+  let truncated = false;
+
+  const maxPages = Math.ceil(MAX_EPISODES / KITSU_PAGE_LIMIT);
+
+  for (let page = 0; page < maxPages; page++) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed > EPISODES_TIME_BUDGET_MS) {
+      console.warn(
+        `[Kitsu] episodes time budget exceeded (${elapsed}ms) — truncated`
+      );
+      truncated = true;
+      break;
+    }
+
+    const offset = page * KITSU_PAGE_LIMIT;
+    const result = await getKitsuEpisodesPage(kitsuId, offset);
+
+    if (!result.ok) {
+      if (allEpisodes.length > 0) truncated = true;
+      break;
+    }
+
+    if (result.data.length === 0) break;
+
+    allEpisodes.push(...result.data);
+
+    if (allEpisodes.length >= MAX_EPISODES) {
+      truncated = true;
+      break;
+    }
+
+    if (result.data.length < KITSU_PAGE_LIMIT) break;
+  }
+
+  if (allEpisodes.length === 0) return null;
 
   const out: UnifiedEpisode[] = [];
+  const seen = new Set<number>();
 
-  for (const ep of data) {
+  for (const ep of allEpisodes) {
     const attr = ep.attributes ?? {};
     const number = attr.number ?? out.length + 1;
+    if (seen.has(number)) continue;
+    seen.add(number);
+
     const title =
       attr.titles?.en ??
       attr.titles?.en_jp ??
@@ -216,13 +282,21 @@ async function getKitsuEpisodes(
       `Episode ${number}`;
     const aired = attr.airdate ? attr.airdate.split('T')[0] : undefined;
     const duration =
-      attr.length && attr.length > 0 ? Math.round(attr.length / 60) : undefined;
+      attr.length && attr.length > 0
+        ? Math.round(attr.length / 60)
+        : undefined;
 
     out.push({ number, title, aired, duration });
     if (out.length >= MAX_EPISODES) break;
   }
 
-  return out;
+  out.sort((a, b) => a.number - b.number);
+
+  console.log(
+    `[Kitsu] episodes fetched: ${out.length} in ${Date.now() - startTime}ms (truncated: ${truncated})`
+  );
+
+  return { episodes: out, truncated };
 }
 
 /* ============================================================
@@ -306,8 +380,6 @@ async function getShikimoriCharacters(
       name,
       image: shikimoriImage(entry.character.image),
       role: roleNorm,
-      // Shikimori /roles tidak menyertakan seiyuu (person selalu null
-      // untuk entry karakter). VA diisi manual oleh user.
       voiceActors: [],
     });
 
@@ -326,7 +398,6 @@ export async function chainCharacters(
 ): Promise<ChainResult<UnifiedCharacter>> {
   const errors: string[] = [];
 
-  // === 1. SHIKIMORI (butuh malId) ===
   if (ctx.malId) {
     const shiki = await withTimeout(
       () => getShikimoriCharacters(ctx.malId!),
@@ -340,7 +411,6 @@ export async function chainCharacters(
     errors.push('Shikimori: tidak ada MAL ID');
   }
 
-  // === 2. KITSU (fallback) ===
   if (ctx.kitsuId) {
     const kitsu = await withTimeout(
       () => getKitsuCharacters(ctx.kitsuId!),
@@ -361,19 +431,25 @@ export async function chainCharacters(
    CHAIN RESOLVERS — EPISODES
    ============================================================ */
 
+export interface EpisodesChainResult extends ChainResult<UnifiedEpisode> {
+  truncated?: boolean;
+}
+
 export async function chainEpisodes(
   ctx: ChainContext
-): Promise<ChainResult<UnifiedEpisode>> {
+): Promise<EpisodesChainResult> {
   const errors: string[] = [];
 
-  // === KITSU (satu-satunya sumber list episode) ===
   if (ctx.kitsuId) {
-    const kitsu = await withTimeout(
-      () => getKitsuEpisodes(ctx.kitsuId!),
-      PER_SOURCE_TIMEOUT
-    );
-    if (kitsu && kitsu.length > 0) {
-      return { data: kitsu, source: 'Kitsu', errors };
+    const result = await getKitsuEpisodes(ctx.kitsuId);
+
+    if (result && result.episodes.length > 0) {
+      return {
+        data: result.episodes,
+        source: 'Kitsu',
+        errors,
+        truncated: result.truncated,
+      };
     }
     errors.push('Kitsu: gagal atau kosong');
   } else {
@@ -390,8 +466,6 @@ export async function chainEpisodes(
 export async function chainRelations(
   _ctx: ChainContext
 ): Promise<ChainResult<UnifiedRelation>> {
-  // TODO: test manual endpoint Shikimori /animes?franchise=X
-  // Sementara return kosong biar compile jalan.
   return {
     data: null,
     source: 'none',
