@@ -1,19 +1,25 @@
 // src/services/qimochi-chain-extras.ts
 import { fetchWithRetry } from '../lib/http';
+import { getCharactersFromAniList } from './anilist';
 
 /* ============================================================
    UNIFIED TYPES
    ============================================================ */
 
+export interface UnifiedVoiceActor {
+  id: string; // slug
+  name: string;
+  nameNative?: string;
+  image?: string;
+  defaultLanguage?: string;
+}
+
 export interface UnifiedCharacter {
   name: string;
+  nameNative?: string;
   image?: string;
   role: 'main' | 'supporting' | 'background';
-  voiceActors: {
-    name: string;
-    image?: string;
-    language?: string;
-  }[];
+  voiceActors: string[]; // slug reference
 }
 
 export interface UnifiedEpisode {
@@ -41,8 +47,16 @@ export interface ChainResult<T> {
   errors: string[];
 }
 
+export interface CharactersChainResult extends ChainResult<UnifiedCharacter> {
+  voiceActors: UnifiedVoiceActor[];
+}
+
+/* ============================================================
+   CONSTANTS
+   ============================================================ */
+
 const PER_SOURCE_TIMEOUT = 8000;
-const MAX_ITEMS = 100; // ← DIUBAH dari 30
+const MAX_ITEMS = 100; // fallback (Shikimori/Kitsu)
 
 /* Episodes config */
 const MAX_EPISODES = 700;
@@ -83,7 +97,7 @@ function slugify(str: string): string {
 }
 
 /* ============================================================
-   KITSU — CHARACTERS
+   KITSU — CHARACTERS (fallback, tanpa VA)
    ============================================================ */
 
 interface KitsuIncluded {
@@ -113,8 +127,6 @@ async function getKitsuCharacters(
   params.set('page[limit]', '20');
 
   const url = `https://kitsu.io/api/edge/anime/${kitsuId}/characters?${params.toString()}`;
-
-  console.log(`[Kitsu] characters URL: ${url}`);
 
   const res = await fetchWithRetry(
     url,
@@ -180,7 +192,7 @@ async function getKitsuCharacters(
 }
 
 /* ============================================================
-   KITSU — EPISODES (parallel + subrequest-safe)
+   KITSU — EPISODES
    ============================================================ */
 
 interface KitsuEpisodeItem {
@@ -223,15 +235,10 @@ async function getKitsuEpisodesPage(
     );
 
     if (res.status === 429) {
-      console.warn(`[Kitsu] episodes 429 @ offset ${offset}`);
       return { ok: false, reason: 'rate_limit' };
     }
 
     if (!res.ok) {
-      const errBody = await res.text().catch(() => '');
-      console.warn(
-        `[Kitsu] episodes HTTP ${res.status} @ offset ${offset}: ${errBody.slice(0, 100)}`
-      );
       return { ok: false, reason: 'error' };
     }
 
@@ -239,11 +246,7 @@ async function getKitsuEpisodesPage(
     return { ok: true, data: json.data ?? [] };
   } catch (err: any) {
     const msg = err?.message ?? String(err);
-    console.warn(`[Kitsu] episodes fetch error @ offset ${offset}: ${msg}`);
-    if (
-      msg.includes('Too many subrequests') ||
-      msg.includes('subrequest')
-    ) {
+    if (msg.includes('subrequest')) {
       return { ok: false, reason: 'subrequest_limit' };
     }
     return { ok: false, reason: 'error' };
@@ -260,10 +263,6 @@ async function getKitsuEpisodes(
 
   const maxPages = Math.ceil(MAX_EPISODES / KITSU_PAGE_LIMIT);
 
-  console.log(
-    `[Kitsu] episodes start — maxPages: ${maxPages}, batch: ${PARALLEL_BATCH}`
-  );
-
   for (
     let batchStart = 0;
     batchStart < maxPages;
@@ -273,9 +272,6 @@ async function getKitsuEpisodes(
 
     const elapsed = Date.now() - startTime;
     if (elapsed > EPISODES_TIME_BUDGET_MS) {
-      console.warn(
-        `[Kitsu] episodes time budget exceeded (${elapsed}ms) — truncated`
-      );
       truncated = true;
       break;
     }
@@ -289,10 +285,6 @@ async function getKitsuEpisodes(
 
     if (batchOffsets.length === 0) break;
 
-    console.log(
-      `[Kitsu] batch pages=[${batchOffsets.join(', ')}] (elapsed: ${elapsed}ms)`
-    );
-
     const results = await Promise.allSettled(
       batchOffsets.map((offset) => getKitsuEpisodesPage(kitsuId, offset))
     );
@@ -300,15 +292,10 @@ async function getKitsuEpisodes(
     let batchHadEnd = false;
 
     for (const result of results) {
-      if (result.status === 'rejected') {
-        console.warn(`[Kitsu] batch promise rejected: ${result.reason}`);
-        continue;
-      }
+      if (result.status === 'rejected') continue;
       const pageResult = result.value;
       if (!pageResult.ok) {
-        if (pageResult.reason === 'subrequest_limit') {
-          hitLimit = true;
-        }
+        if (pageResult.reason === 'subrequest_limit') hitLimit = true;
         continue;
       }
       if (pageResult.data.length === 0) {
@@ -362,15 +349,11 @@ async function getKitsuEpisodes(
 
   out.sort((a, b) => a.number - b.number);
 
-  console.log(
-    `[Kitsu] episodes done: ${out.length} eps in ${Date.now() - startTime}ms (truncated: ${truncated}, hitLimit: ${hitLimit})`
-  );
-
   return { episodes: out, truncated };
 }
 
 /* ============================================================
-   SHIKIMORI — CHARACTERS
+   SHIKIMORI — CHARACTERS (fallback, tanpa VA)
    ============================================================ */
 
 interface ShikimoriRoleEntry {
@@ -556,45 +539,121 @@ async function getShikimoriRelations(
 }
 
 /* ============================================================
-   CHAIN RESOLVERS — CHARACTERS
+   CHAIN — CHARACTERS (AniList primary)
    ============================================================ */
 
+/**
+ * Ambil characters + VA master.
+ *
+ * Priority: AniList (dengan VA) → Shikimori (tanpa VA) → Kitsu (tanpa VA)
+ *
+ * Untuk AniList, kita butuh malId.
+ * Kalau malId null, skip AniList dan langsung fallback.
+ */
 export async function chainCharacters(
   ctx: ChainContext
-): Promise<ChainResult<UnifiedCharacter>> {
+): Promise<CharactersChainResult> {
   const errors: string[] = [];
 
+  // === 1. ANILIST (primary, dengan VA) ===
+  if (ctx.malId) {
+    const aniListChars = await withTimeout(
+      () => getCharactersFromAniList(ctx.malId!),
+      PER_SOURCE_TIMEOUT * 2
+    );
+
+    if (aniListChars && aniListChars.length > 0) {
+      const voiceActorsMap = new Map<string, UnifiedVoiceActor>();
+      const characters: UnifiedCharacter[] = [];
+
+      for (const char of aniListChars) {
+        const vaSlugs: string[] = [];
+
+        for (const va of char.voiceActors) {
+          const slug = slugify(va.name);
+          if (!slug) continue;
+
+          // Dedup VA master
+          if (!voiceActorsMap.has(slug)) {
+            voiceActorsMap.set(slug, {
+              id: slug,
+              name: va.name,
+              nameNative: va.nameNative,
+              image: va.image,
+              defaultLanguage: va.language || 'Japanese',
+            });
+          }
+
+          if (!vaSlugs.includes(slug)) {
+            vaSlugs.push(slug);
+          }
+        }
+
+        characters.push({
+          name: char.name,
+          nameNative: char.nameNative,
+          image: char.image,
+          role: char.role,
+          voiceActors: vaSlugs,
+        });
+      }
+
+      const voiceActors = [...voiceActorsMap.values()].sort((a, b) =>
+        a.id.localeCompare(b.id)
+      );
+
+      return {
+        data: characters,
+        voiceActors,
+        source: 'AniList',
+        errors,
+      };
+    }
+
+    errors.push('AniList: gagal atau kosong');
+  } else {
+    errors.push('AniList: tidak ada MAL ID');
+  }
+
+  // === 2. SHIKIMORI (fallback, tanpa VA) ===
   if (ctx.malId) {
     const shiki = await withTimeout(
       () => getShikimoriCharacters(ctx.malId!),
       PER_SOURCE_TIMEOUT
     );
     if (shiki && shiki.length > 0) {
-      return { data: shiki, source: 'Shikimori', errors };
+      return {
+        data: shiki,
+        voiceActors: [],
+        source: 'Shikimori (no VA)',
+        errors,
+      };
     }
     errors.push('Shikimori: gagal atau kosong');
-  } else {
-    errors.push('Shikimori: tidak ada MAL ID');
   }
 
+  // === 3. KITSU (fallback, tanpa VA) ===
   if (ctx.kitsuId) {
     const kitsu = await withTimeout(
       () => getKitsuCharacters(ctx.kitsuId!),
       PER_SOURCE_TIMEOUT
     );
     if (kitsu && kitsu.length > 0) {
-      return { data: kitsu, source: 'Kitsu', errors };
+      return {
+        data: kitsu,
+        voiceActors: [],
+        source: 'Kitsu (no VA)',
+        errors,
+      };
     }
     errors.push('Kitsu: gagal atau kosong');
-  } else {
-    errors.push('Kitsu: tidak ada Kitsu ID');
   }
 
-  return { data: null, source: 'none', errors };
+  return { data: null, voiceActors: [], source: 'none', errors };
 }
 
 /* ============================================================
-   CHAIN RESOLVERS — EPISODES
+   CHAIN — EPISODES
    ============================================================ */
 
 export interface EpisodesChainResult extends ChainResult<UnifiedEpisode> {
@@ -626,7 +685,7 @@ export async function chainEpisodes(
 }
 
 /* ============================================================
-   CHAIN RESOLVERS — RELATIONS
+   CHAIN — RELATIONS
    ============================================================ */
 
 export async function chainRelations(
