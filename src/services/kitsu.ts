@@ -59,7 +59,6 @@ interface KitsuSearchResult {
 export async function searchKitsu(
   title: string
 ): Promise<KitsuSearchResult | null> {
-  // URLSearchParams otomatis encode [ ] jadi %5B %5D
   const params = new URLSearchParams();
   params.set('filter[text]', title);
   params.set('include', 'categories');
@@ -101,6 +100,57 @@ export async function searchKitsu(
   return { anime, genres };
 }
 
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+function parseKitsuDate(dateStr: string | null | undefined): {
+  year: number | null;
+  month: number | null;
+  day: number | null;
+} | null {
+  if (!dateStr) return null;
+  const date = new Date(dateStr);
+  if (isNaN(date.getTime())) return null;
+  return {
+    year: date.getFullYear(),
+    month: date.getMonth() + 1,
+    day: date.getDate(),
+  };
+}
+
+/**
+ * Map age rating Kitsu → enum QimochiDB.
+ * Kitsu: G, PG, R, R18, PG-13 (jarang)
+ * QimochiDB: G, PG, PG-13, R, R+, Rx
+ */
+function mapKitsuRating(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const lower = raw.toLowerCase().trim();
+
+  const map: Record<string, string> = {
+    g: 'G',
+    pg: 'PG',
+    'pg-13': 'PG-13',
+    pg13: 'PG-13',
+    r: 'R',
+    'r+': 'R+',
+    r18: 'Rx',
+    rx: 'Rx',
+  };
+
+  return map[lower] ?? null;
+}
+
+function buildYoutubeUrl(videoId: string | null | undefined): string | null {
+  if (!videoId || videoId.trim() === '') return null;
+  return `https://youtu.be/${videoId.trim()}`;
+}
+
+/* ============================================================
+   MAPPER
+   ============================================================ */
+
 export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
   const { anime, genres } = result;
   const attr = anime.attributes ?? {};
@@ -118,7 +168,21 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     : null;
 
   const cover = attr.posterImage?.large || attr.posterImage?.original || '';
-  const date = attr.startDate ? new Date(attr.startDate) : null;
+
+  const startDate = parseKitsuDate(attr.startDate);
+  const endDate = parseKitsuDate(attr.endDate);
+
+  // Banner = coverImage (landscape) — beda dari posterImage (portrait)
+  const banner =
+    attr.coverImage?.large || attr.coverImage?.original || null;
+
+  const duration =
+    attr.episodeLength && attr.episodeLength > 0
+      ? attr.episodeLength
+      : null;
+
+  const rating = mapKitsuRating(attr.ageRating);
+  const trailer = buildYoutubeUrl(attr.youtubeVideoId);
 
   return {
     id: parseInt(anime.id, 10),
@@ -134,15 +198,30 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     description: attr.synopsis ?? null,
     format,
     status,
-    seasonYear: date?.getFullYear() ?? null,
+    seasonYear: startDate?.year ?? null,
     episodes: attr.episodeCount ?? null,
     genres: Array.isArray(genres) ? genres : [],
     averageScore,
     studios: { nodes: [] },
     startDate: {
-      year: date?.getFullYear() ?? null,
-      month: date ? date.getMonth() + 1 : null,
-      day: date ? date.getDate() : null,
+      year: startDate?.year ?? null,
+      month: startDate?.month ?? null,
+      day: startDate?.day ?? null,
     },
+
+    /* === Extended === */
+    duration,
+    rating,
+    endDate: endDate
+      ? {
+          year: endDate.year,
+          month: endDate.month,
+          day: endDate.day,
+        }
+      : null,
+    banner,
+    trailer,
+    // franchise & myanimelistId tidak ada di Kitsu
+    // source tidak ada di Kitsu (bisa di-enrich AI)
   };
 }
