@@ -257,16 +257,6 @@ function slugify(s: string): string {
    EPISODE NUMBER DETECTION
    ============================================================ */
 
-/**
- * Deteksi nomor episode. Prioritas:
- *   1. Filename — "jjk-ep3.html" / "jjk-ep05" / "frieren_12"
- *   2. Label HTML — "Episode 5" / "Ep 5" / "Eps 5" / "E05"
- *   3. Label murni angka — "5", "05"
- *   4. Fallback ke 1
- *
- * Exclude resolusi umum (144/240/360/480/540/720/1080/1440/2160) supaya
- * tidak salah tangkap sebagai episode.
- */
 function parseEpisodeNumber(
   filename: string | null,
   labels: (string | null)[]
@@ -278,7 +268,7 @@ function parseEpisodeNumber(
   const isValid = (n: number): boolean =>
     n > 0 && n < 10000 && !RESOLUTIONS.has(n);
 
-  // Pass 1: dari filename
+  // Pass 1: filename
   if (filename) {
     const m = filename.match(/\b(?:ep|eps|episode|e)\s*[-_.]?\s*0*(\d+)\b/i);
     if (m && m[1]) {
@@ -287,7 +277,7 @@ function parseEpisodeNumber(
     }
   }
 
-  // Pass 2: dari label — pola "Episode 5", "Ep 5", "Eps 5"
+  // Pass 2: label "Episode N"
   for (const label of labels) {
     if (!label) continue;
     const m = label.match(/\b(?:episode|eps|ep)\s*0*(\d+)\b/i);
@@ -481,27 +471,22 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
 }
 
 /* ============================================================
-   BUILD OUTPUT — JSON (untuk Qimochi HUB)
+   BUILD OUTPUT — SINGLE EPISODE JSON
    ============================================================ */
 
 /**
- * Build JSON sesuai schema Qimochi HUB (data/anime/episodes/{slug}.json).
+ * Build JSON untuk 1 episode — struktur final:
+ *   src/data/anime/{slug}/episodes/{number}.json
+ *
  * Output:
  *   {
- *     "episodes": [
- *       {
- *         "number": N,
- *         "streams": [
- *           { "quality": "1080p", "servers": [{ "name": "...", "url": "..." }] }
- *         ]
- *       }
+ *     "number": N,
+ *     "streams": [
+ *       { "quality": "1080p", "servers": [{ "name": "...", "url": "..." }] }
  *     ]
  *   }
  */
-function buildJson(
-  items: ResolvedEntry[],
-  episodeNumber: number
-): string {
+function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
   const byQuality = new Map<string, { name: string; url: string }[]>();
 
   for (const item of items) {
@@ -523,12 +508,8 @@ function buildJson(
   }));
 
   const payload = {
-    episodes: [
-      {
-        number: episodeNumber,
-        streams,
-      },
-    ],
+    number: episodeNumber,
+    streams,
   };
 
   return JSON.stringify(payload, null, 2) + '\n';
@@ -652,6 +633,9 @@ async function sendDocumentViaApi(
  * Kirim hasil decode:
  *   1. URL list (inline, sebagai info)
  *   2. JSON — inline <pre> kalau kecil, file .json kalau besar
+ *
+ * Target save user:
+ *   src/data/anime/{slug}/episodes/{number}.json
  */
 async function sendResult(
   ctx: Context,
@@ -673,18 +657,20 @@ async function sendResult(
   // Detect nomor episode
   const episodeNumber = parseEpisodeNumber(sourceFilename, sourceLabels);
 
-  // Build JSON
+  // Build JSON (single episode)
   const json = buildJson(items, episodeNumber);
 
   console.log(
     `[Decode] episode number detected: ${episodeNumber} (json len: ${json.length})`
   );
 
+  const targetPath = `src/data/anime/{slug}/episodes/${episodeNumber}.json`;
+
   // Kecil → inline <pre>
   if (json.length <= JSON_INLINE_THRESHOLD) {
     await ctx.reply(
-      `📋 <b>JSON — Episode ${episodeNumber}</b>\n` +
-        `<i>Copy ke <code>src/data/anime/episodes/{slug}.json</code></i>\n\n` +
+      `📋 <b>Episode ${episodeNumber}</b>\n` +
+        `<i>Save ke <code>${escapeHtml(targetPath)}</code></i>\n\n` +
         `<pre>${escapeHtml(json)}</pre>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
@@ -692,13 +678,11 @@ async function sendResult(
   }
 
   // Besar → file attachment
-  const filename = label
-    ? `${label}.json`
-    : `episode-${episodeNumber}.json`;
+  const filename = `ep-${episodeNumber}.json`;
 
   const caption =
-    `📋 <b>JSON — Episode ${episodeNumber}</b>\n` +
-    `<i>Copy ke <code>src/data/anime/episodes/{slug}.json</code></i>`;
+    `📋 <b>Episode ${episodeNumber}</b>\n` +
+    `<i>Rename & save ke <code>${escapeHtml(targetPath)}</code></i>`;
 
   try {
     await sendDocumentViaApi(
@@ -711,7 +695,7 @@ async function sendResult(
   } catch (err) {
     console.warn('[Decode] sendDocument failed, fallback inline:', err);
     await ctx.reply(
-      `📋 <b>JSON — Episode ${episodeNumber}</b>\n\n<pre>${escapeHtml(json)}</pre>`,
+      `📋 <b>Episode ${episodeNumber}</b>\n\n<pre>${escapeHtml(json)}</pre>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
   }
