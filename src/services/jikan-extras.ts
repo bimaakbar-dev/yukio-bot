@@ -2,7 +2,7 @@
 import { fetchWithRetry } from '../lib/http';
 
 const JIKAN_BASE = 'https://api.jikan.moe/v4';
-const FETCH_TIMEOUT = 8000;
+const FETCH_TIMEOUT = 15000;
 const MAX_EPISODES = 100;
 
 export interface JikanCharacterEntry {
@@ -47,22 +47,27 @@ export interface JikanRelationEntry {
 async function jikanGet<T>(path: string): Promise<T> {
   const url = `${JIKAN_BASE}${path}`;
 
-  const res = await fetchWithRetry(
-    url,
-    {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'yukio-bot/1.0',
+  try {
+    const res = await fetchWithRetry(
+      url,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'yukio-bot/1.0',
+        },
       },
-    },
-    { retries: 1, baseDelay: 600, timeout: FETCH_TIMEOUT }
-  );
+      { retries: 2, baseDelay: 1500, timeout: FETCH_TIMEOUT }
+    );
 
-  if (!res.ok) {
-    throw new Error(`Jikan HTTP ${res.status}: ${path}`);
+    if (!res.ok) {
+      throw new Error(`Jikan HTTP ${res.status}: ${path}`);
+    }
+
+    return (await res.json()) as T;
+  } catch (err: any) {
+    const msg = err?.message ?? String(err);
+    throw new Error(`Jikan fetch gagal (${path}): ${msg}`);
   }
-
-  return (await res.json()) as T;
 }
 
 export async function getCharacters(
