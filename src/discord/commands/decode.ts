@@ -47,7 +47,7 @@ interface ResolvedEntry {
 }
 
 /* ============================================================
-   DECODE HELPERS (shared dengan Telegram logic)
+   DECODE HELPERS
    ============================================================ */
 
 function normalizeBase64(input: string): string | null {
@@ -371,7 +371,7 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
 }
 
 /* ============================================================
-   BUILD OUTPUT — JSON
+   BUILD OUTPUT — SINGLE EPISODE JSON
    ============================================================ */
 
 function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
@@ -396,12 +396,8 @@ function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
   }));
 
   const payload = {
-    episodes: [
-      {
-        number: episodeNumber,
-        streams,
-      },
-    ],
+    number: episodeNumber,
+    streams,
   };
 
   return JSON.stringify(payload, null, 2) + '\n';
@@ -640,30 +636,30 @@ async function processDecode(
     const labels = entries.map((e) => e.label);
     const episodeNumber = parseEpisodeNumber(sourceFilename, labels);
 
-    // Build JSON
+    // Build JSON (single episode)
     const json = buildJson(videos, episodeNumber);
 
     console.log(
       `[Discord/Decode] episode number detected: ${episodeNumber} (json len: ${json.length})`
     );
 
+    const targetPath = `src/data/anime/{slug}/episodes/${episodeNumber}.json`;
+
     // Kecil → inline code block
     if (json.length <= JSON_INLINE_THRESHOLD) {
       await sendFollowup(appId, token, {
         content:
-          `📋 **JSON — Episode ${episodeNumber}**\n` +
-          `_Copy ke \`src/data/anime/episodes/{slug}.json\`_\n\n` +
+          `📋 **Episode ${episodeNumber}**\n` +
+          `_Save ke \`${targetPath}\`_\n\n` +
           '```json\n' + json + '\n```',
       });
     } else {
       // Besar → file attachment
-      const filename = sourceFilename
-        ? sourceFilename.replace(/\.(html?|txt)$/i, '.json')
-        : `episode-${episodeNumber}.json`;
+      const filename = `ep-${episodeNumber}.json`;
 
       const caption =
-        `📋 **JSON — Episode ${episodeNumber}**\n` +
-        `_Copy ke \`src/data/anime/episodes/{slug}.json\`_`;
+        `📋 **Episode ${episodeNumber}**\n` +
+        `_Rename & save ke \`${targetPath}\`_`;
 
       await sendFollowupFile(appId, token, filename, json, caption);
     }
