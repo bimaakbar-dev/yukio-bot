@@ -8,7 +8,7 @@ import { chatAI } from './ai';
    CONSTANTS
    ============================================================ */
 
-export const AI_TIMEOUT_MS = 3000;
+export const AI_TIMEOUT_MS = 8000;
 
 export const QH_FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
