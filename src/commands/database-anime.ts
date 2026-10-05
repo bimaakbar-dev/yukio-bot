@@ -20,15 +20,13 @@ import {
   buildEpisodesJson,
   buildFranchisesJson,
   buildVoiceActorsJson,
-  chunkArray,
-  chunkRangeLabel,
 } from '../services/qimochi-json';
 import { askAI } from '../services/ai';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3500;
 const AI_TIMEOUT_MS = 12000;
-const CHUNK_SIZE = 200;
+const BATCH_OVERHEAD = 300; // header + <pre> tags
 
 /* ============================================================
    DB: SESSION
@@ -178,7 +176,11 @@ function escapeHtml(s: string): string {
     .replace(/>/g, '&gt;');
 }
 
-function splitInline(text: string, max: number): string[] {
+/**
+ * Split teks bebas (YAML/plain) per baris dengan batas char.
+ * Aman untuk teks, TIDAK aman untuk JSON array.
+ */
+function splitText(text: string, max: number): string[] {
   if (text.length <= max) return [text];
 
   const parts: string[] = [];
@@ -215,15 +217,14 @@ function splitInline(text: string, max: number): string[] {
 }
 
 /**
- * Kirim section (YAML / JSON) inline via <pre>.
- * Kalau panjang, split per MSG_LIMIT dengan label [N/M].
+ * Kirim teks (YAML/plain) — split per baris.
  */
-async function sendSection(
+async function sendTextSection(
   ctx: Context,
   label: string,
   content: string
 ): Promise<void> {
-  const parts = splitInline(content, MSG_LIMIT);
+  const parts = splitText(content, MSG_LIMIT);
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i] ?? '';
@@ -232,19 +233,73 @@ async function sendSection(
         ? `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${parts.length}]\n\n`
         : `📋 <b>${escapeHtml(label)}</b>\n\n`;
 
-    try {
-      await ctx.reply(`${header}<pre>${escapeHtml(part)}</pre>`, {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      });
-    } catch (err: any) {
-      console.error(
-        `[DBA] sendSection part ${i + 1}/${parts.length} failed: ${err?.message ?? err}`
-      );
-      throw err;
-    }
+    await ctx.reply(`${header}<pre>${escapeHtml(part)}</pre>`, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
 
     if (i < parts.length - 1) {
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+}
+
+/**
+ * Kirim JSON array — split per ITEM (elemen array).
+ * Setiap pesan = JSON array valid yang bisa langsung di-save.
+ */
+async function sendJsonSection<T>(
+  ctx: Context,
+  label: string,
+  items: T[]
+): Promise<void> {
+  // Empty array
+  if (items.length === 0) {
+    await sendTextSection(ctx, label, '[]');
+    return;
+  }
+
+  const fullJson = JSON.stringify(items, null, 2);
+
+  // Muat 1 pesan — langsung kirim
+  if (fullJson.length <= MSG_LIMIT) {
+    await sendTextSection(ctx, label, fullJson);
+    return;
+  }
+
+  // Hitung per-batch dinamis dari rata-rata ukuran item
+  const budget = MSG_LIMIT - BATCH_OVERHEAD;
+  const avgBytes = fullJson.length / items.length;
+  const perBatch = Math.max(1, Math.floor(budget / avgBytes));
+  const totalBatches = Math.ceil(items.length / perBatch);
+
+  console.log(
+    `[DBA] JSON split "${label}": ${items.length} items, ~${Math.round(avgBytes)}B/item, ${perBatch}/batch, ${totalBatches} batches`
+  );
+
+  for (let i = 0; i < totalBatches; i++) {
+    const start = i * perBatch;
+    const end = Math.min(start + perBatch, items.length);
+    const batch = items.slice(start, end);
+    const batchJson = JSON.stringify(batch, null, 2);
+
+    // Safety warning
+    if (batchJson.length > MSG_LIMIT) {
+      console.warn(
+        `[DBA] Batch ${i + 1}/${totalBatches} terlalu besar (${batchJson.length} char)`
+      );
+    }
+
+    const header =
+      `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${totalBatches}]\n` +
+      `<i>Item ${start + 1}-${end} dari ${items.length}</i>\n\n`;
+
+    await ctx.reply(`${header}<pre>${escapeHtml(batchJson)}</pre>`, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+
+    if (i < totalBatches - 1) {
       await new Promise((r) => setTimeout(r, 400));
     }
   }
@@ -505,7 +560,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
     try {
       const chainCtx = buildChainContext(session);
 
-      /* ---------- METADATA ---------- */
+      /* ---------- METADATA (YAML) ---------- */
       if (action === 'm') {
         let result;
         try {
@@ -523,7 +578,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           malId: result.malId ?? session.mal_id,
           kitsuId: result.kitsuId ?? session.kitsu_id,
         });
-        await sendSection(ctx, `Metadata — ${session.title}`, yaml);
+        await sendTextSection(ctx, `Metadata — ${session.title}`, yaml);
         return;
       }
 
@@ -536,7 +591,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
         if (!result || !result.data || result.data.length === 0) {
           const errs = result?.errors ?? [error ?? 'unknown'];
-          await sendSection(
+          await sendTextSection(
             ctx,
             `Characters — ${session.title} [FAILED]`,
             fallbackJson(errs)
@@ -547,30 +602,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         const chars = result.data;
         const vas = result.voiceActors;
         const source = result.source;
-        const chunks = chunkArray(chars, CHUNK_SIZE);
 
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i]!;
-          const range = chunkRangeLabel(i, CHUNK_SIZE, chars.length);
-          const json = buildCharactersJson(chunk);
+        // Characters JSON
+        await sendJsonSection(
+          ctx,
+          `Characters — ${session.title} [${source}]`,
+          chars
+        );
 
-          await sendSection(
-            ctx,
-            `Characters ${range} — ${session.title} [${source}] [${i + 1}/${chunks.length}]`,
-            json
-          );
-
-          if (i < chunks.length - 1) {
-            await new Promise((r) => setTimeout(r, 400));
-          }
-        }
-
+        // Voice Actors (kalau ada)
         if (vas.length > 0) {
-          const vaJson = buildVoiceActorsJson(vas);
-          await sendSection(
+          await sendJsonSection(
             ctx,
-            `Voice Actors (${vas.length}) — ${session.title} [append ke voice-actors.json]`,
-            vaJson
+            `Voice Actors — ${session.title} [append ke voice-actors.json]`,
+            vas
           );
         } else {
           await ctx.reply(
@@ -591,7 +636,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
         if (!result || !result.data || result.data.length === 0) {
           const errs = result?.errors ?? [error ?? 'unknown'];
-          await sendSection(
+          await sendTextSection(
             ctx,
             `Episodes — ${session.title} [FAILED]`,
             fallbackJson(errs)
@@ -600,26 +645,13 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         const eps = result.data;
-        const chunks = chunkArray(eps, CHUNK_SIZE);
+        const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
 
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i]!;
-          const range = chunkRangeLabel(i, CHUNK_SIZE, eps.length);
-          const json = buildEpisodesJson(chunk);
-          const truncated = result.truncated && i === chunks.length - 1;
-          const truncNote = truncated ? ' [⚠️ truncated]' : '';
-
-          await sendSection(
-            ctx,
-            `Episodes ${range} — ${session.title} [${result.source}]${truncNote} [${i + 1}/${chunks.length}]`,
-            json
-          );
-
-          if (i < chunks.length - 1) {
-            await new Promise((r) => setTimeout(r, 400));
-          }
-        }
-
+        await sendJsonSection(
+          ctx,
+          `Episodes — ${session.title} [${result.source}]${truncNote}`,
+          eps
+        );
         return;
       }
 
@@ -632,7 +664,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
         if (!result || !result.data || result.data.length === 0) {
           const errs = result?.errors ?? [error ?? 'unknown'];
-          await sendSection(
+          await sendTextSection(
             ctx,
             `Franchises — ${session.title} [FAILED]`,
             fallbackJson(errs)
@@ -640,16 +672,15 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        const json = buildFranchisesJson(result.data);
-        await sendSection(
+        await sendJsonSection(
           ctx,
           `Franchises — ${session.title} [${result.source}]`,
-          json
+          result.data
         );
         return;
       }
 
-      /* ---------- SUMMARY ---------- */
+      /* ---------- SUMMARY (text) ---------- */
       if (action === 's') {
         let result;
         try {
@@ -668,11 +699,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           AI_TIMEOUT_MS
         );
 
-        const body = ai
-          ? ai
-          : raw || 'Tulis sinopsis manual...';
-
-        await sendSection(ctx, `Summary — ${session.title}`, body);
+        const body = ai ?? raw ?? 'Tulis sinopsis manual...';
+        await sendTextSection(ctx, `Summary — ${session.title}`, body);
         return;
       }
     } catch (err: any) {
