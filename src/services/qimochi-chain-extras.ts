@@ -42,12 +42,9 @@ export interface ChainResult<T> {
 }
 
 const PER_SOURCE_TIMEOUT = 8000;
-const MAX_ITEMS = 30;
+const MAX_ITEMS = 100; // ← DIUBAH dari 30
 
-/* Episodes config
- * CF Workers Free: 50 subrequest/invocation
- * Set max 35 pages → 700 eps, buffer 15 subrequests untuk safety
- */
+/* Episodes config */
 const MAX_EPISODES = 700;
 const KITSU_PAGE_LIMIT = 20;
 const PARALLEL_BATCH = 5;
@@ -243,7 +240,6 @@ async function getKitsuEpisodesPage(
   } catch (err: any) {
     const msg = err?.message ?? String(err);
     console.warn(`[Kitsu] episodes fetch error @ offset ${offset}: ${msg}`);
-    // Deteksi subrequest limit
     if (
       msg.includes('Too many subrequests') ||
       msg.includes('subrequest')
@@ -297,7 +293,6 @@ async function getKitsuEpisodes(
       `[Kitsu] batch pages=[${batchOffsets.join(', ')}] (elapsed: ${elapsed}ms)`
     );
 
-    // Pakai allSettled biar batch tetap lanjut walau ada 1 yang error
     const results = await Promise.allSettled(
       batchOffsets.map((offset) => getKitsuEpisodesPage(kitsuId, offset))
     );
