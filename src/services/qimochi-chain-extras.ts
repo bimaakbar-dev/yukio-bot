@@ -49,6 +49,9 @@ const MAX_EPISODES = 200;
 const KITSU_PAGE_LIMIT = 20;
 const EPISODES_TIME_BUDGET_MS = 10000;
 
+/* Relations config */
+const MAX_RELATIONS = 30;
+
 /* ============================================================
    UTILITIES
    ============================================================ */
@@ -65,6 +68,17 @@ async function withTimeout<T>(
   } catch {
     return null;
   }
+}
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
 }
 
 /* ============================================================
@@ -390,6 +404,105 @@ async function getShikimoriCharacters(
 }
 
 /* ============================================================
+   SHIKIMORI — RELATIONS
+   ============================================================ */
+
+interface ShikimoriRelatedAnime {
+  id: number;
+  name: string;
+  russian?: string;
+  image?: {
+    original?: string;
+    preview?: string;
+  } | null;
+  url?: string;
+  kind?: string;
+  score?: string;
+  status?: string;
+  episodes?: number;
+  aired_on?: string | null;
+  released_on?: string | null;
+}
+
+interface ShikimoriRelatedEntry {
+  relation?: string;
+  relation_russian?: string;
+  anime?: ShikimoriRelatedAnime | null;
+  manga?: unknown | null;
+}
+
+function mapShikimoriRelation(raw: string | undefined): string {
+  if (!raw) return 'other';
+  const lower = raw.toLowerCase();
+
+  if (lower.includes('sequel')) return 'sequel';
+  if (lower.includes('prequel')) return 'prequel';
+  if (lower.includes('parent')) return 'parent_story';
+  if (lower.includes('side story')) return 'side_story';
+  if (lower.includes('spin')) return 'spin_off';
+  if (lower.includes('alternative')) return 'alternative';
+  if (lower.includes('adaptation')) return 'adaptation';
+  if (lower.includes('summary')) return 'summary';
+  if (lower.includes('full story')) return 'full_story';
+  if (lower.includes('character')) return 'character';
+  if (lower.includes('compilation')) return 'compilation';
+  if (lower.includes('contains')) return 'contains';
+
+  return 'other';
+}
+
+async function getShikimoriRelations(
+  malId: number
+): Promise<UnifiedRelation[] | null> {
+  const url = `https://shikimori.one/api/animes/${malId}/related`;
+
+  console.log(`[Shikimori] related URL: ${url}`);
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
+  );
+
+  if (!res.ok) return null;
+
+  const data = (await res.json()) as ShikimoriRelatedEntry[];
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  const out: UnifiedRelation[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of data) {
+    // Skip manga relation (kita cuma butuh anime)
+    if (!entry.anime) continue;
+
+    const animeName = entry.anime.name;
+    if (!animeName) continue;
+
+    const slug = slugify(animeName);
+    if (!slug || seen.has(slug)) continue;
+    seen.add(slug);
+
+    const relation = mapShikimoriRelation(entry.relation);
+
+    out.push({
+      relation,
+      slug,
+      title: animeName,
+    });
+
+    if (out.length >= MAX_RELATIONS) break;
+  }
+
+  return out.length > 0 ? out : null;
+}
+
+/* ============================================================
    CHAIN RESOLVERS — CHARACTERS
    ============================================================ */
 
@@ -464,11 +577,22 @@ export async function chainEpisodes(
    ============================================================ */
 
 export async function chainRelations(
-  _ctx: ChainContext
+  ctx: ChainContext
 ): Promise<ChainResult<UnifiedRelation>> {
-  return {
-    data: null,
-    source: 'none',
-    errors: ['Relations: belum diimplementasi (menunggu test endpoint)'],
-  };
+  const errors: string[] = [];
+
+  if (ctx.malId) {
+    const shiki = await withTimeout(
+      () => getShikimoriRelations(ctx.malId!),
+      PER_SOURCE_TIMEOUT
+    );
+    if (shiki && shiki.length > 0) {
+      return { data: shiki, source: 'Shikimori', errors };
+    }
+    errors.push('Shikimori: gagal atau kosong');
+  } else {
+    errors.push('Shikimori: tidak ada MAL ID');
+  }
+
+  return { data: null, source: 'none', errors };
 }
