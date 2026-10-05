@@ -4,30 +4,28 @@ import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
-import { searchJikan } from '../services/jikan';
 import {
-  getCharacters,
-  getAllEpisodes,
-  getRelations,
-} from '../services/jikan-extras';
+  chainSearch,
+} from '../services/qimochi-chain';
+import {
+  chainCharacters,
+  chainEpisodes,
+  chainRelations,
+  type ChainContext,
+} from '../services/qimochi-chain-extras';
 import {
   buildMetadataYaml,
   buildCharactersYaml,
   buildEpisodesYaml,
   buildFranchisesYaml,
   buildAllMarkdown,
+  getSynopsisRaw,
 } from '../services/qimochi-yaml';
 import { askAI } from '../services/ai';
-import { chainSearch } from '../services/qimochi-chain';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3800;
 const AI_TIMEOUT_MS = 12000;
-
-const TIMEOUT_JIKAN_SEARCH = 8000;
-const TIMEOUT_JIKAN_CHARS = 12000;
-const TIMEOUT_JIKAN_EPS = 15000;
-const TIMEOUT_JIKAN_RELS = 10000;
 
 /* ============================================================
    DB: SESSION
@@ -248,58 +246,22 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
-function cleanSynopsis(raw: string | null | undefined): string {
-  if (!raw) return '';
-  return raw
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&#0?39;/g, "'")
-    .trim();
-}
-
-/* ============================================================
-   SAFE FETCH
-   ============================================================ */
-
-async function safeFetch<T>(
+function safeFetch<T>(
   fn: () => Promise<T>,
   timeoutMs: number
 ): Promise<{ data: T | null; error: string | null }> {
-  try {
-    const result = await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-
-    if (result === null) {
-      return { data: null, error: `timeout ${timeoutMs}ms` };
-    }
-    return { data: result, error: null };
-  } catch (err: any) {
-    return { data: null, error: err?.message ?? 'unknown' };
-  }
-}
-
-/* ============================================================
-   RESOLVE MAL ID — retry Jikan kalau session tidak punya malId
-   ============================================================ */
-
-async function resolveMalId(
-  session: SessionRow,
-  fromChain: number | null
-): Promise<number | null> {
-  if (fromChain) return fromChain;
-  if (session.mal_id) return session.mal_id;
-
-  const { data: jikan } = await safeFetch(
-    () => searchJikan(session.title),
-    TIMEOUT_JIKAN_SEARCH
-  );
-
-  return jikan?.mal_id ?? null;
+  return Promise.race([
+    fn().then(
+      (data) => ({ data, error: null }),
+      (err) => ({
+        data: null,
+        error: (err as Error)?.message ?? 'unknown',
+      })
+    ),
+    new Promise<{ data: T | null; error: string | null }>((r) =>
+      setTimeout(() => r({ data: null, error: `timeout ${timeoutMs}ms` }), timeoutMs)
+    ),
+  ]);
 }
 
 /* ============================================================
@@ -339,22 +301,11 @@ async function rewriteSynopsis(
   }
 }
 
-function fallbackYaml(section: string, error: string): string {
+function fallbackSection(section: string, errors: string[]): string {
   const header =
-    `# ⚠️ Gagal fetch dari Jikan: ${error}\n` +
-    `# Sumber alternatif tidak menyediakan endpoint ini.\n` +
-    `# Isi manual di bawah.\n`;
-  if (section === 'characters') return `${header}characters: []`;
-  if (section === 'episodes') return `${header}episodeList: []`;
-  if (section === 'franchises') return `${header}franchises: []`;
-  return header;
-}
-
-function noMalIdYaml(section: string, source: string | null): string {
-  const header =
-    `# ⚠️ Tidak bisa dapat MAL ID dari Jikan.\n` +
-    `# Sumber awal: ${source ?? 'unknown'}\n` +
-    `# Coba klik tombol sekali lagi (Jikan mungkin pulih), atau isi manual.\n`;
+    `# ⚠️ Semua sumber gagal.\n` +
+    errors.map((e) => `# - ${e}`).join('\n') +
+    `\n# Isi manual di bawah.\n`;
   if (section === 'characters') return `${header}characters: []`;
   if (section === 'episodes') return `${header}episodeList: []`;
   if (section === 'franchises') return `${header}franchises: []`;
@@ -468,6 +419,14 @@ export const dbaShortCommand: CommandDefinition = {
    CALLBACK HANDLERS
    ============================================================ */
 
+function buildChainContext(session: SessionRow): ChainContext {
+  return {
+    malId: session.mal_id,
+    kitsuId: session.kitsu_id,
+    title: session.title,
+  };
+}
+
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^qd:([mcefsax]):(q_[a-f0-9]+)$/, async (ctx) => {
     const match = ctx.match as RegExpMatchArray;
@@ -517,25 +476,25 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
 
     try {
-      let result;
-      try {
-        result = await chainSearch(session.title);
-      } catch (err: any) {
-        await ctx.reply(
-          `❌ Gagal ambil data ulang: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
-          { parse_mode: 'HTML' }
-        );
-        return;
-      }
-
-      const media = result.media;
+      const chainCtx = buildChainContext(session);
 
       /* ---------- METADATA ---------- */
       if (action === 'm') {
+        let result;
+        try {
+          result = await chainSearch(session.title);
+        } catch (err: any) {
+          await ctx.reply(
+            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
         const yaml = buildMetadataYaml({
-          media,
+          media: result.media,
           malId: result.malId ?? session.mal_id,
-          kitsuId: result.kitsuId,
+          kitsuId: result.kitsuId ?? session.kitsu_id,
         });
         await sendLongMessage(ctx, `Metadata — ${session.title}`, yaml);
         return;
@@ -543,88 +502,89 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- CHARACTERS ---------- */
       if (action === 'c') {
-        const malId = await resolveMalId(session, result.malId);
+        const { data: chars, error } = await safeFetch(
+          () => chainCharacters(chainCtx),
+          25000
+        );
 
-        if (!malId) {
+        if (!chars || !chars.data || chars.data.length === 0) {
+          const errs = chars?.errors ?? [error ?? 'unknown'];
           await sendLongMessage(
             ctx,
             `Characters — ${session.title}`,
-            noMalIdYaml('characters', result.source)
+            fallbackSection('characters', errs)
           );
           return;
         }
 
-        const { data: chars, error } = await safeFetch(
-          () => getCharacters(malId),
-          TIMEOUT_JIKAN_CHARS
-        );
-
-        const yaml = chars
-          ? buildCharactersYaml(chars)
-          : fallbackYaml('characters', error ?? 'unknown');
-
-        await sendLongMessage(ctx, `Characters — ${session.title}`, yaml);
+        const yaml = buildCharactersYaml(chars.data);
+        const label = `Characters — ${session.title} [${chars.source}]`;
+        await sendLongMessage(ctx, label, yaml);
         return;
       }
 
       /* ---------- EPISODES ---------- */
       if (action === 'e') {
-        const malId = await resolveMalId(session, result.malId);
+        const { data: eps, error } = await safeFetch(
+          () => chainEpisodes(chainCtx),
+          30000
+        );
 
-        if (!malId) {
+        if (!eps || !eps.data || eps.data.length === 0) {
+          const errs = eps?.errors ?? [error ?? 'unknown'];
           await sendLongMessage(
             ctx,
             `Episodes — ${session.title}`,
-            noMalIdYaml('episodes', result.source)
+            fallbackSection('episodes', errs)
           );
           return;
         }
 
-        const { data: eps, error } = await safeFetch(
-          () => getAllEpisodes(malId, 100),
-          TIMEOUT_JIKAN_EPS
-        );
-
-        const yaml = eps
-          ? buildEpisodesYaml(eps)
-          : fallbackYaml('episodes', error ?? 'unknown');
-
-        await sendLongMessage(ctx, `Episodes — ${session.title}`, yaml);
+        const yaml = buildEpisodesYaml(eps.data);
+        const label = `Episodes — ${session.title} [${eps.source}]`;
+        await sendLongMessage(ctx, label, yaml);
         return;
       }
 
       /* ---------- FRANCHISES ---------- */
       if (action === 'f') {
-        const malId = await resolveMalId(session, result.malId);
+        const { data: rels, error } = await safeFetch(
+          () => chainRelations(chainCtx),
+          25000
+        );
 
-        if (!malId) {
+        if (!rels || !rels.data || rels.data.length === 0) {
+          const errs = rels?.errors ?? [error ?? 'unknown'];
           await sendLongMessage(
             ctx,
             `Franchises — ${session.title}`,
-            noMalIdYaml('franchises', result.source)
+            fallbackSection('franchises', errs)
           );
           return;
         }
 
-        const { data: rels, error } = await safeFetch(
-          () => getRelations(malId),
-          TIMEOUT_JIKAN_RELS
-        );
-
-        const yaml = rels
-          ? buildFranchisesYaml(rels)
-          : fallbackYaml('franchises', error ?? 'unknown');
-
-        await sendLongMessage(ctx, `Franchises — ${session.title}`, yaml);
+        const yaml = buildFranchisesYaml(rels.data);
+        const label = `Franchises — ${session.title} [${rels.source}]`;
+        await sendLongMessage(ctx, label, yaml);
         return;
       }
 
       /* ---------- SUMMARY ---------- */
       if (action === 's') {
-        const cleaned = cleanSynopsis(media.description);
+        let result;
+        try {
+          result = await chainSearch(session.title);
+        } catch (err: any) {
+          await ctx.reply(
+            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
 
+        const raw = getSynopsisRaw(result.media);
         const { data: ai } = await safeFetch(
-          () => rewriteSynopsis(env, session.title, cleaned),
+          () => rewriteSynopsis(env, session.title, raw),
           AI_TIMEOUT_MS
         );
 
@@ -641,7 +601,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             '<!--\n' +
             '  ⚠️ AI gagal generate sinopsis. Tulis manual di sini.\n' +
             '-->\n\n' +
-            (cleaned || 'Tulis sinopsis manual...');
+            (raw || 'Tulis sinopsis manual...');
         }
 
         await sendLongMessage(ctx, `Summary — ${session.title}`, body);
@@ -650,68 +610,65 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- ALL ---------- */
       if (action === 'a') {
-        const malId = await resolveMalId(session, result.malId);
+        let searchResult;
+        try {
+          searchResult = await chainSearch(session.title);
+        } catch (err: any) {
+          await ctx.reply(
+            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
 
         await ctx.reply('⏳ All (1/5): Metadata...');
         const metaYaml = buildMetadataYaml({
-          media,
-          malId: result.malId ?? session.mal_id,
-          kitsuId: result.kitsuId,
+          media: searchResult.media,
+          malId: searchResult.malId ?? session.mal_id,
+          kitsuId: searchResult.kitsuId ?? session.kitsu_id,
         });
 
         await ctx.reply('⏳ All (2/5): Characters...');
-        let charsYaml: string;
-        if (!malId) {
-          charsYaml = noMalIdYaml('characters', result.source);
-        } else {
-          const { data: chars, error } = await safeFetch(
-            () => getCharacters(malId),
-            TIMEOUT_JIKAN_CHARS
-          );
-          charsYaml = chars
-            ? buildCharactersYaml(chars)
-            : fallbackYaml('characters', error ?? 'unknown');
-        }
+        const charsRes = await safeFetch(() => chainCharacters(chainCtx), 25000);
+        const charsYaml =
+          charsRes.data?.data && charsRes.data.data.length > 0
+            ? buildCharactersYaml(charsRes.data.data)
+            : fallbackSection(
+                'characters',
+                charsRes.data?.errors ?? [charsRes.error ?? 'unknown']
+              );
 
         await ctx.reply('⏳ All (3/5): Episodes...');
-        let epsYaml: string;
-        if (!malId) {
-          epsYaml = noMalIdYaml('episodes', result.source);
-        } else {
-          const { data: eps, error } = await safeFetch(
-            () => getAllEpisodes(malId, 100),
-            TIMEOUT_JIKAN_EPS
-          );
-          epsYaml = eps
-            ? buildEpisodesYaml(eps)
-            : fallbackYaml('episodes', error ?? 'unknown');
-        }
+        const epsRes = await safeFetch(() => chainEpisodes(chainCtx), 30000);
+        const epsYaml =
+          epsRes.data?.data && epsRes.data.data.length > 0
+            ? buildEpisodesYaml(epsRes.data.data)
+            : fallbackSection(
+                'episodes',
+                epsRes.data?.errors ?? [epsRes.error ?? 'unknown']
+              );
 
         await ctx.reply('⏳ All (4/5): Franchises...');
-        let relsYaml: string;
-        if (!malId) {
-          relsYaml = noMalIdYaml('franchises', result.source);
-        } else {
-          const { data: rels, error } = await safeFetch(
-            () => getRelations(malId),
-            TIMEOUT_JIKAN_RELS
-          );
-          relsYaml = rels
-            ? buildFranchisesYaml(rels)
-            : fallbackYaml('franchises', error ?? 'unknown');
-        }
+        const relsRes = await safeFetch(() => chainRelations(chainCtx), 25000);
+        const relsYaml =
+          relsRes.data?.data && relsRes.data.data.length > 0
+            ? buildFranchisesYaml(relsRes.data.data)
+            : fallbackSection(
+                'franchises',
+                relsRes.data?.errors ?? [relsRes.error ?? 'unknown']
+              );
 
         await ctx.reply('⏳ All (5/5): Summary...');
-        const cleaned = cleanSynopsis(media.description);
-        const { data: ai } = await safeFetch(
-          () => rewriteSynopsis(env, session.title, cleaned),
+        const raw = getSynopsisRaw(searchResult.media);
+        const aiRes = await safeFetch(
+          () => rewriteSynopsis(env, session.title, raw),
           AI_TIMEOUT_MS
         );
         const summary =
           '<!--\n' +
           '  ⚠️ Sinopsis di-generate AI. Tinjau ulang sebelum commit.\n' +
           '-->\n\n' +
-          (ai || cleaned || 'Tulis sinopsis manual...');
+          (aiRes.data || raw || 'Tulis sinopsis manual...');
 
         const full = buildAllMarkdown({
           metadata: metaYaml,
