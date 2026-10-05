@@ -4,10 +4,6 @@ import type { Env } from '../types/env';
 import { chainSearch, type ChainSearchResult } from './qimochi-chain';
 import { chatAI } from './ai';
 
-/* ============================================================
-   CONSTANTS
-   ============================================================ */
-
 export const AI_TIMEOUT_MS = 8000;
 
 export const QH_FORMAT_MAP: Record<string, string> = {
@@ -27,10 +23,6 @@ export const QH_STATUS_MAP: Record<string, string> = {
   CANCELLED: 'Hiatus',
   HIATUS: 'Hiatus',
 };
-
-/* ============================================================
-   TYPES
-   ============================================================ */
 
 export interface Enriched {
   studio?: string | null;
@@ -63,10 +55,6 @@ export interface SearchResult {
   tried: string[];
   errors: string[];
 }
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
 
 export function pickTitle(media: AniListMedia): string {
   return (
@@ -108,17 +96,10 @@ export function stripHtml(s: string): string {
     .trim();
 }
 
-/**
- * Deteksi apakah string mengandung karakter Cyrillic (Rusia).
- */
 export function hasCyrillic(s: string): boolean {
   return /[\u0400-\u04FF\u0500-\u052F]/.test(s);
 }
 
-/**
- * Heuristic: apakah teks kemungkinan bahasa Indonesia?
- * Cek kata umum Indonesia yang sering muncul di sinopsis.
- */
 export function looksIndonesian(s: string): boolean {
   const lower = s.toLowerCase();
   const idWords = [
@@ -146,7 +127,6 @@ export function looksIndonesian(s: string): boolean {
   for (const w of idWords) {
     if (lower.includes(w)) matches++;
   }
-  // Minimal 3 kata umum Indonesia → dianggap Indonesia
   return matches >= 3;
 }
 
@@ -199,10 +179,6 @@ export function normalizeStudioName(name: string): string {
   return `Studio ${trimmed}`;
 }
 
-/* ============================================================
-   SEARCH (wrapper chainSearch)
-   ============================================================ */
-
 export async function searchAnime(query: string): Promise<SearchResult> {
   const result: ChainSearchResult = await chainSearch(query);
   return {
@@ -214,10 +190,6 @@ export async function searchAnime(query: string): Promise<SearchResult> {
     errors: result.errors,
   };
 }
-
-/* ============================================================
-   DETECT MISSING
-   ============================================================ */
 
 export function detectMissing(media: AniListMedia): string[] {
   const need: string[] = [];
@@ -233,10 +205,6 @@ export function detectMissing(media: AniListMedia): string[] {
 
   if (!media.startDate?.year && !media.seasonYear) need.push('releaseDate');
 
-  // Flag synopsis kalau:
-  // - kosong / terlalu pendek
-  // - bukan bahasa Indonesia (Cyrillic atau English)
-  // Tujuan: body selalu Indonesia
   const desc = media.description ?? '';
   const cleanDesc = stripHtml(desc);
 
@@ -248,10 +216,6 @@ export function detectMissing(media: AniListMedia): string[] {
 
   return need;
 }
-
-/* ============================================================
-   AI ENRICHMENT
-   ============================================================ */
 
 function extractJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -371,10 +335,6 @@ export async function enrichWithAITimeout(
   ]);
 }
 
-/* ============================================================
-   BUILD — Qimochi HUB YAML (schema simple)
-   ============================================================ */
-
 export function buildQimochiHubResult(
   media: AniListMedia,
   enriched: Enriched | null
@@ -468,7 +428,6 @@ export function buildQimochiHubResult(
   lines.push(`releaseDate: ${releaseDate}`);
   lines.push(`addedAt: ${addedAt}`);
   lines.push(`rating: ${rating}`);
-  lines.push('episodes: []');
   lines.push('---');
   const yaml = lines.join('\n');
 
@@ -480,10 +439,6 @@ export function buildQimochiHubResult(
   const isCyrillic = synopsis ? hasCyrillic(synopsis) : false;
   const isIndonesian = synopsis ? looksIndonesian(synopsis) : false;
 
-  // Pakai hasil AI kalau:
-  // - synopsis kosong/pendek
-  // - Cyrillic
-  // - bukan Indonesia (English, dll)
   if (
     (isTooShort || isCyrillic || !isIndonesian) &&
     enriched?.synopsis &&
