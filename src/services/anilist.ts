@@ -1,7 +1,7 @@
 // src/services/anilist.ts
 import { fetchWithRetry } from '../lib/http';
 
-const ANILIST_URL = 'https://graphql.anilist.co';
+const ANILIST_URL = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
 const TIMEOUT = 8000;
 const PER_PAGE = 25;
 const MAX_PAGES = 8; // max 200 karakter
