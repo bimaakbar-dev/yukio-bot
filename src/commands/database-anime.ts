@@ -15,12 +15,7 @@ import {
   buildMetadataYaml,
   getSynopsisRaw,
 } from '../services/qimochi-yaml';
-import {
-  buildCharactersJson,
-  buildEpisodesJson,
-  buildFranchisesJson,
-  buildVoiceActorsJson,
-} from '../services/qimochi-json';
+
 import { askAI } from '../services/ai';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
