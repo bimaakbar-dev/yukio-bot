@@ -1,14 +1,26 @@
+// src/services/shikimori.ts
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from '../types/anime';
 
 const SHIKIMORI_URL = 'https://shikimori.one/api/animes';
 
+export interface ShikimoriVideo {
+  id: number;
+  url: string;
+  image_url?: string;
+  player_url?: string;
+  name?: string;
+  kind?: string;
+  hosting?: string;
+}
+
 interface ShikimoriAnime {
   id: number;
   name: string;
   russian?: string;
-  english?: string | null;
-  japanese?: string | null;
+  english?: string | string[] | null;
+  japanese?: string | string[] | null;
+  synonyms?: string[];
   image?: {
     original?: string;
     preview?: string;
@@ -17,9 +29,15 @@ interface ShikimoriAnime {
   status?: string;
   score?: string;
   episodes?: number;
+  episodes_aired?: number;
   duration?: number;
+  rating?: string;
   aired_on?: string | null;
   released_on?: string | null;
+  description?: string | null;
+  description_html?: string | null;
+  franchise?: string | null;
+  myanimelist_id?: number | null;
   studios?: {
     id: number;
     name: string;
@@ -31,6 +49,7 @@ interface ShikimoriAnime {
     name: string;
     russian: string;
   }[];
+  videos?: ShikimoriVideo[];
 }
 
 export async function searchShikimori(
@@ -64,7 +83,7 @@ export async function searchShikimori(
   const basic = list[0];
   if (!basic?.id) return null;
 
-  // Fetch detail — studio hanya ada di endpoint ini
+  // Fetch detail — studio, franchise, videos, rating hanya ada di endpoint ini
   try {
     const detailUrl = `${SHIKIMORI_URL}/${basic.id}`;
     const detailRes = await fetchWithRetry(
@@ -81,7 +100,7 @@ export async function searchShikimori(
     if (detailRes.ok) {
       const detail = (await detailRes.json()) as ShikimoriAnime;
       console.log(
-        `[Shikimori] detail fetched — studios: ${detail.studios?.length ?? 0}`
+        `[Shikimori] detail fetched — studios: ${detail.studios?.length ?? 0}, franchise: ${detail.franchise ?? '-'}, videos: ${detail.videos?.length ?? 0}`
       );
       return detail;
     }
@@ -91,6 +110,22 @@ export async function searchShikimori(
 
   return basic;
 }
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+function pickString(
+  v: string | string[] | null | undefined
+): string | null {
+  if (!v) return null;
+  if (Array.isArray(v)) return v[0] ?? null;
+  return v;
+}
+
+/* ============================================================
+   MAPPER
+   ============================================================ */
 
 export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
   let status = 'RELEASING';
@@ -142,14 +177,14 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
     id: s.id,
     title: {
       romaji: s.name ?? 'Unknown',
-      english: s.english ?? null,
-      native: s.japanese ?? null,
+      english: pickString(s.english),
+      native: pickString(s.japanese),
     },
     coverImage: {
       extraLarge: original,
       large: preview || original,
     },
-    description: null,
+    description: s.description ?? null,
     format,
     status,
     seasonYear: date?.getFullYear() ?? null,
