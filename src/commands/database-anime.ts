@@ -18,15 +18,15 @@ import {
   buildAllMarkdown,
 } from '../services/qimochi-yaml';
 import { askAI } from '../services/ai';
+import { chainSearch } from '../services/qimochi-chain';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3800;
 const AI_TIMEOUT_MS = 12000;
 
-const TIMEOUT_SEARCH = 10000;
-const TIMEOUT_CHARS = 12000;
-const TIMEOUT_EPISODES = 15000;
-const TIMEOUT_RELATIONS = 10000;
+const TIMEOUT_JIKAN_CHARS = 12000;
+const TIMEOUT_JIKAN_EPS = 15000;
+const TIMEOUT_JIKAN_RELS = 10000;
 
 /* ============================================================
    DB: SESSION
@@ -46,12 +46,14 @@ async function ensureDb(db: D1Database): Promise<void> {
           `CREATE TABLE IF NOT EXISTS qimochi_sessions (
             session_id   TEXT PRIMARY KEY,
             user_id      INTEGER NOT NULL,
-            mal_id       INTEGER NOT NULL,
+            mal_id       INTEGER,
+            kitsu_id     TEXT,
             title        TEXT NOT NULL,
             cover        TEXT,
             year         TEXT,
             type         TEXT,
             studio       TEXT,
+            source       TEXT,
             created_at   INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL
           )`
@@ -71,12 +73,14 @@ async function ensureDb(db: D1Database): Promise<void> {
 interface SessionRow {
   session_id: string;
   user_id: number;
-  mal_id: number;
+  mal_id: number | null;
+  kitsu_id: string | null;
   title: string;
   cover: string | null;
   year: string | null;
   type: string | null;
   studio: string | null;
+  source: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -85,12 +89,14 @@ async function saveSession(
   db: D1Database,
   userId: number,
   data: {
-    malId: number;
+    malId: number | null;
+    kitsuId: string | null;
     title: string;
     cover: string | null;
     year: string | null;
     type: string | null;
     studio: string | null;
+    source: string | null;
   }
 ): Promise<string> {
   await ensureDb(db);
@@ -101,18 +107,20 @@ async function saveSession(
   await db
     .prepare(
       `INSERT INTO qimochi_sessions
-        (session_id, user_id, mal_id, title, cover, year, type, studio, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (session_id, user_id, mal_id, kitsu_id, title, cover, year, type, studio, source, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
       userId,
       data.malId,
+      data.kitsuId,
       data.title,
       data.cover,
       data.year,
       data.type,
       data.studio,
+      data.source,
       now,
       now + SESSION_TTL_MS
     )
@@ -233,6 +241,7 @@ function buildPreviewText(session: SessionRow): string {
   if (session.year) lines.push(`📅 ${escapeHtml(session.year)}`);
   if (session.type) lines.push(`🎬 ${escapeHtml(session.type)}`);
   if (session.studio) lines.push(`🏢 ${escapeHtml(session.studio)}`);
+  if (session.source) lines.push(`📡 ${escapeHtml(session.source)}`);
   lines.push('');
   lines.push('Pilih action:');
   return lines.join('\n');
@@ -251,7 +260,7 @@ function cleanSynopsis(raw: string | null | undefined): string {
 }
 
 /* ============================================================
-   SAFE FETCH — timeout wrapper
+   SAFE FETCH
    ============================================================ */
 
 async function safeFetch<T>(
@@ -274,7 +283,7 @@ async function safeFetch<T>(
 }
 
 /* ============================================================
-   AI SYNOPSIS REWRITE
+   AI SYNOPSIS
    ============================================================ */
 
 async function rewriteSynopsis(
@@ -313,7 +322,8 @@ async function rewriteSynopsis(
 function fallbackYaml(section: string, error: string): string {
   const header =
     `# ⚠️ Gagal fetch dari Jikan: ${error}\n` +
-    `# Coba tombol sekali lagi, atau isi manual di bawah.\n`;
+    `# Sumber alternatif tidak menyediakan endpoint ini.\n` +
+    `# Isi manual di bawah.\n`;
   if (section === 'characters') return `${header}characters: []`;
   if (section === 'episodes') return `${header}episodeList: []`;
   if (section === 'franchises') return `${header}franchises: []`;
@@ -338,37 +348,35 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
     return;
   }
 
-  const loading = await ctx.reply('🔍 Mencari...');
+  const loading = await ctx.reply('🔍 Mencari (Jikan → Kitsu → Shikimori)...');
 
   try {
-    const { data: jikan, error } = await safeFetch(
-      () => searchJikan(query),
-      TIMEOUT_SEARCH
-    );
-
-    if (!jikan) {
-      const hint = error?.includes('timeout')
-        ? '\n\n<i>Jikan API lambat. Coba lagi dalam 30 detik.</i>'
-        : '';
+    let result;
+    try {
+      result = await chainSearch(query);
+    } catch (err: any) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
-        `❌ Anime <b>${escapeHtml(query)}</b> tidak ditemukan.${hint}`,
+        `❌ Anime <b>${escapeHtml(query)}</b> tidak ditemukan.\n\n` +
+          `<i>${escapeHtml((err?.message ?? 'unknown').slice(0, 400))}</i>`,
         { parse_mode: 'HTML' }
       );
       return;
     }
 
-    const media = jikanToAniList(jikan);
+    const media = result.media;
     const studio = media.studios?.nodes?.[0]?.name ?? null;
 
     const sessionId = await saveSession(env.DB, ctx.from!.id, {
-      malId: jikan.mal_id,
+      malId: result.malId,
+      kitsuId: result.kitsuId,
       title: media.title.romaji,
       cover: media.coverImage.extraLarge,
       year: media.seasonYear ? String(media.seasonYear) : null,
       type: media.format,
       studio,
+      source: result.source,
     });
 
     const session = await getSession(env.DB, sessionId);
@@ -402,7 +410,8 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       .editMessageText(
         ctx.chat!.id,
         loading.message_id,
-        `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`
+        `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+        { parse_mode: 'HTML' }
       )
       .catch(() => {});
   }
@@ -477,28 +486,27 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
 
     try {
-      const { data: jikan, error: searchError } = await safeFetch(
-        () => searchJikan(session.title),
-        TIMEOUT_SEARCH
-      );
-
-      if (!jikan) {
+      // Re-fetch media — pakai chain juga
+      let result;
+      try {
+        result = await chainSearch(session.title);
+      } catch (err: any) {
         await ctx.reply(
-          `❌ Gagal ambil data Jikan: ${escapeHtml(searchError ?? 'unknown')}\n\n` +
-            '<i>Ulangi /dba atau tunggu 30 detik.</i>',
+          `❌ Gagal ambil data ulang: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
           { parse_mode: 'HTML' }
         );
         return;
       }
 
-      const media = jikanToAniList(jikan);
+      const media = result.media;
+      const malId = result.malId ?? session.mal_id;
 
       /* ---------- METADATA ---------- */
       if (action === 'm') {
         const yaml = buildMetadataYaml({
           media,
-          malId: jikan.mal_id,
-          kitsuId: null,
+          malId: result.malId,
+          kitsuId: result.kitsuId,
         });
         await sendLongMessage(ctx, `Metadata — ${session.title}`, yaml);
         return;
@@ -506,9 +514,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- CHARACTERS ---------- */
       if (action === 'c') {
+        if (!malId) {
+          await sendLongMessage(
+            ctx,
+            `Characters — ${session.title}`,
+            '# ⚠️ Tidak ada MAL ID. Tidak bisa fetch characters.\n# Sumber saat ini: ' +
+              (result.source ?? 'unknown') +
+              '\ncharacters: []'
+          );
+          return;
+        }
+
         const { data: chars, error } = await safeFetch(
-          () => getCharacters(session.mal_id),
-          TIMEOUT_CHARS
+          () => getCharacters(malId),
+          TIMEOUT_JIKAN_CHARS
         );
 
         const yaml = chars
@@ -521,9 +540,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- EPISODES ---------- */
       if (action === 'e') {
+        if (!malId) {
+          await sendLongMessage(
+            ctx,
+            `Episodes — ${session.title}`,
+            '# ⚠️ Tidak ada MAL ID. Tidak bisa fetch episodes.\n# Sumber saat ini: ' +
+              (result.source ?? 'unknown') +
+              '\nepisodeList: []'
+          );
+          return;
+        }
+
         const { data: eps, error } = await safeFetch(
-          () => getAllEpisodes(session.mal_id, 100),
-          TIMEOUT_EPISODES
+          () => getAllEpisodes(malId, 100),
+          TIMEOUT_JIKAN_EPS
         );
 
         const yaml = eps
@@ -536,9 +566,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       /* ---------- FRANCHISES ---------- */
       if (action === 'f') {
+        if (!malId) {
+          await sendLongMessage(
+            ctx,
+            `Franchises — ${session.title}`,
+            '# ⚠️ Tidak ada MAL ID. Tidak bisa fetch relations.\n# Sumber saat ini: ' +
+              (result.source ?? 'unknown') +
+              '\nfranchises: []'
+          );
+          return;
+        }
+
         const { data: rels, error } = await safeFetch(
-          () => getRelations(session.mal_id),
-          TIMEOUT_RELATIONS
+          () => getRelations(malId),
+          TIMEOUT_JIKAN_RELS
         );
 
         const yaml = rels
@@ -584,36 +625,51 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
         const metaYaml = buildMetadataYaml({
           media,
-          malId: jikan.mal_id,
-          kitsuId: null,
+          malId: result.malId,
+          kitsuId: result.kitsuId,
         });
 
         await ctx.reply('⏳ All (2/5): Characters...');
-        const { data: chars, error: charsErr } = await safeFetch(
-          () => getCharacters(session.mal_id),
-          TIMEOUT_CHARS
-        );
-        const charsYaml = chars
-          ? buildCharactersYaml(chars)
-          : fallbackYaml('characters', charsErr ?? 'unknown');
+        let charsYaml: string;
+        if (!malId) {
+          charsYaml = '# ⚠️ Tidak ada MAL ID. Isi manual.\ncharacters: []';
+        } else {
+          const { data: chars, error } = await safeFetch(
+            () => getCharacters(malId),
+            TIMEOUT_JIKAN_CHARS
+          );
+          charsYaml = chars
+            ? buildCharactersYaml(chars)
+            : fallbackYaml('characters', error ?? 'unknown');
+        }
 
         await ctx.reply('⏳ All (3/5): Episodes...');
-        const { data: eps, error: epsErr } = await safeFetch(
-          () => getAllEpisodes(session.mal_id, 100),
-          TIMEOUT_EPISODES
-        );
-        const epsYaml = eps
-          ? buildEpisodesYaml(eps)
-          : fallbackYaml('episodes', epsErr ?? 'unknown');
+        let epsYaml: string;
+        if (!malId) {
+          epsYaml = '# ⚠️ Tidak ada MAL ID. Isi manual.\nepisodeList: []';
+        } else {
+          const { data: eps, error } = await safeFetch(
+            () => getAllEpisodes(malId, 100),
+            TIMEOUT_JIKAN_EPS
+          );
+          epsYaml = eps
+            ? buildEpisodesYaml(eps)
+            : fallbackYaml('episodes', error ?? 'unknown');
+        }
 
         await ctx.reply('⏳ All (4/5): Franchises...');
-        const { data: rels, error: relsErr } = await safeFetch(
-          () => getRelations(session.mal_id),
-          TIMEOUT_RELATIONS
-        );
-        const relsYaml = rels
-          ? buildFranchisesYaml(rels)
-          : fallbackYaml('franchises', relsErr ?? 'unknown');
+        let relsYaml: string;
+        if (!malId) {
+          relsYaml = '# ⚠️ Tidak ada MAL ID. Isi manual.\nfranchises: []';
+        } else {
+          const { data: rels, error } = await safeFetch(
+            () => getRelations(malId),
+            TIMEOUT_JIKAN_RELS
+          );
+          relsYaml = rels
+            ? buildFranchisesYaml(rels)
+            : fallbackYaml('franchises', error ?? 'unknown');
+        }
 
         await ctx.reply('⏳ All (5/5): Summary...');
         const cleaned = cleanSynopsis(media.description);
@@ -645,11 +701,11 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       let hint = '';
       if (msg.includes('aborted') || msg.includes('timeout')) {
-        hint = '\n\n<i>Jikan API lambat. Coba lagi dalam 30 detik.</i>';
+        hint = '\n\n<i>API lambat. Coba lagi dalam 30 detik.</i>';
       } else if (msg.includes('429')) {
-        hint = '\n\n<i>Rate limit Jikan. Tunggu 1 menit.</i>';
+        hint = '\n\n<i>Rate limit. Tunggu 1 menit.</i>';
       } else if (msg.includes('HTTP 5')) {
-        hint = '\n\n<i>Jikan sedang down. Coba lagi nanti.</i>';
+        hint = '\n\n<i>Server down. Coba lagi nanti.</i>';
       }
 
       await ctx.reply(
