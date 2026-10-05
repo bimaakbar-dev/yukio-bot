@@ -1,6 +1,6 @@
 === REPO DUMP ===
-Generated: Mon Oct  5 03:33:38 UTC 2026
-Commit: 5974efc
+Generated: Mon Oct  5 04:51:58 UTC 2026
+Commit: 48a443c
 
 === STRUCTURE ===
 .
@@ -24,6 +24,7 @@ Commit: 5974efc
 ./src/commands/ai.ts
 ./src/commands/anime.ts
 ./src/commands/clearcache.ts
+./src/commands/database-anime.ts
 ./src/commands/decode.ts
 ./src/commands/help.ts
 ./src/commands/list.ts
@@ -42,8 +43,12 @@ Commit: 5974efc
 ./src/lib/permissions.ts
 ./src/services/ai.ts
 ./src/services/animeapi.ts
+./src/services/jikan-extras.ts
 ./src/services/jikan.ts
 ./src/services/kitsu.ts
+./src/services/qimochi-chain-extras.ts
+./src/services/qimochi-chain.ts
+./src/services/qimochi-yaml.ts
 ./src/services/shikimori.ts
 ./src/types/anime.ts
 ./src/types/env.ts
@@ -1683,6 +1688,714 @@ export const clearcacheCommand: CommandDefinition = {
 };
 ===== END FILE =====
 
+===== FILE: ./src/commands/database-anime.ts =====
+// src/commands/database-anime.ts
+import type { CommandDefinition } from './registry';
+import type { Context } from 'grammy';
+import { InlineKeyboard, type Bot } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+import {
+  chainSearch,
+} from '../services/qimochi-chain';
+import {
+  chainCharacters,
+  chainEpisodes,
+  chainRelations,
+  type ChainContext,
+} from '../services/qimochi-chain-extras';
+import {
+  buildMetadataYaml,
+  buildCharactersYaml,
+  buildEpisodesYaml,
+  buildFranchisesYaml,
+  buildAllMarkdown,
+  getSynopsisRaw,
+} from '../services/qimochi-yaml';
+import { askAI } from '../services/ai';
+
+const SESSION_TTL_MS = 30 * 60 * 1000;
+const MSG_LIMIT = 3800;
+const AI_TIMEOUT_MS = 12000;
+
+/* ============================================================
+   DB: SESSION
+   ============================================================ */
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS qimochi_sessions (
+            session_id   TEXT PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            mal_id       INTEGER,
+            kitsu_id     TEXT,
+            title        TEXT NOT NULL,
+            cover        TEXT,
+            year         TEXT,
+            type         TEXT,
+            studio       TEXT,
+            source       TEXT,
+            created_at   INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL
+          )`
+        )
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[DBA] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+interface SessionRow {
+  session_id: string;
+  user_id: number;
+  mal_id: number | null;
+  kitsu_id: string | null;
+  title: string;
+  cover: string | null;
+  year: string | null;
+  type: string | null;
+  studio: string | null;
+  source: string | null;
+  created_at: number;
+  expires_at: number;
+}
+
+async function saveSession(
+  db: D1Database,
+  userId: number,
+  data: {
+    malId: number | null;
+    kitsuId: string | null;
+    title: string;
+    cover: string | null;
+    year: string | null;
+    type: string | null;
+    studio: string | null;
+    source: string | null;
+  }
+): Promise<string> {
+  await ensureDb(db);
+
+  const sessionId = `q_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO qimochi_sessions
+        (session_id, user_id, mal_id, kitsu_id, title, cover, year, type, studio, source, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      userId,
+      data.malId,
+      data.kitsuId,
+      data.title,
+      data.cover,
+      data.year,
+      data.type,
+      data.studio,
+      data.source,
+      now,
+      now + SESSION_TTL_MS
+    )
+    .run();
+
+  return sessionId;
+}
+
+async function getSession(
+  db: D1Database,
+  sessionId: string
+): Promise<SessionRow | null> {
+  await ensureDb(db);
+
+  const row = await db
+    .prepare('SELECT * FROM qimochi_sessions WHERE session_id = ?')
+    .bind(sessionId)
+    .first<SessionRow>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM qimochi_sessions WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return row;
+}
+
+async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
+  try {
+    await db
+      .prepare('DELETE FROM qimochi_sessions WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.error('[DBA] delete error:', err);
+  }
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function splitMessage(text: string, max: number): string[] {
+  if (text.length <= max) return [text];
+
+  const parts: string[] = [];
+  let current = '';
+
+  for (const line of text.split('\n')) {
+    const prospective = current ? `${current}\n${line}` : line;
+    if (prospective.length > max && current.length > 0) {
+      parts.push(current);
+      current = line;
+    } else {
+      current = prospective;
+    }
+  }
+
+  if (current) parts.push(current);
+  return parts;
+}
+
+async function sendLongMessage(
+  ctx: Context,
+  label: string,
+  content: string
+): Promise<void> {
+  const parts = splitMessage(content, MSG_LIMIT);
+
+  if (parts.length === 1) {
+    await ctx.reply(
+      `📋 <b>${escapeHtml(label)}</b>\n\n<pre>${escapeHtml(parts[0] ?? '')}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return;
+  }
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i] ?? '';
+    await ctx.reply(
+      `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${parts.length}]\n\n<pre>${escapeHtml(part)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+  }
+}
+
+function buildKeyboard(sessionId: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('📋 Metadata', `qd:m:${sessionId}`)
+    .text('👥 Characters', `qd:c:${sessionId}`)
+    .row()
+    .text('🎬 Episodes', `qd:e:${sessionId}`)
+    .text('🔗 Franchises', `qd:f:${sessionId}`)
+    .row()
+    .text('📝 Summary', `qd:s:${sessionId}`)
+    .text('📦 All', `qd:a:${sessionId}`)
+    .row()
+    .text('❌ Batal', `qd:x:${sessionId}`);
+}
+
+function buildPreviewText(session: SessionRow): string {
+  const lines: string[] = [];
+  lines.push(`<b>${escapeHtml(session.title)}</b>`);
+  lines.push('');
+  if (session.year) lines.push(`📅 ${escapeHtml(session.year)}`);
+  if (session.type) lines.push(`🎬 ${escapeHtml(session.type)}`);
+  if (session.studio) lines.push(`🏢 ${escapeHtml(session.studio)}`);
+  if (session.source) lines.push(`📡 ${escapeHtml(session.source)}`);
+  lines.push('');
+  lines.push('Pilih action:');
+  return lines.join('\n');
+}
+
+function safeFetch<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number
+): Promise<{ data: T | null; error: string | null }> {
+  return Promise.race([
+    fn().then(
+      (data) => ({ data, error: null }),
+      (err) => ({
+        data: null,
+        error: (err as Error)?.message ?? 'unknown',
+      })
+    ),
+    new Promise<{ data: T | null; error: string | null }>((r) =>
+      setTimeout(() => r({ data: null, error: `timeout ${timeoutMs}ms` }), timeoutMs)
+    ),
+  ]);
+}
+
+/* ============================================================
+   AI SYNOPSIS
+   ============================================================ */
+
+async function rewriteSynopsis(
+  env: Env,
+  title: string,
+  originalSynopsis: string
+): Promise<string | null> {
+  if (!originalSynopsis || originalSynopsis.length < 30) return null;
+
+  const prompt =
+    `Tulis ulang sinopsis anime berikut menjadi sinopsis baru dalam bahasa Indonesia.\n\n` +
+    `Judul: ${title}\n\n` +
+    `Sinopsis referensi (English):\n${originalSynopsis}\n\n` +
+    `ATURAN:\n` +
+    `- Tulis sebagai sinopsis baru, BUKAN terjemahan literal\n` +
+    `- Bahasa Indonesia natural dan mengalir\n` +
+    `- 2-3 paragraf pendek\n` +
+    `- Jangan spoiler\n` +
+    `- Jangan tambahkan info yang tidak ada di referensi\n` +
+    `- Langsung mulai dari tokoh utama atau setting\n\n` +
+    `Output hanya sinopsis, tanpa penjelasan tambahan.`;
+
+  try {
+    const result = await Promise.race([
+      askAI(env, prompt, { maxTokens: 700, temperature: 0.6, smart: true }),
+      new Promise<string>((r) => setTimeout(() => r(''), AI_TIMEOUT_MS)),
+    ]);
+
+    return result && result.length > 50 ? result.trim() : null;
+  } catch (err) {
+    console.error('[DBA] AI rewrite failed:', err);
+    return null;
+  }
+}
+
+function fallbackSection(section: string, errors: string[]): string {
+  const header =
+    `# ⚠️ Semua sumber gagal.\n` +
+    errors.map((e) => `# - ${e}`).join('\n') +
+    `\n# Isi manual di bawah.\n`;
+  if (section === 'characters') return `${header}characters: []`;
+  if (section === 'episodes') return `${header}episodeList: []`;
+  if (section === 'franchises') return `${header}franchises: []`;
+  return header;
+}
+
+/* ============================================================
+   COMMAND HANDLER
+   ============================================================ */
+
+async function handleCommand(ctx: Context, env: Env): Promise<void> {
+  const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+
+  if (!query) {
+    await ctx.reply(
+      '<b>📚 Database Anime</b>\n\n' +
+        '<b>Contoh:</b>\n' +
+        '<code>/dba nama anime</code>\n\n' +
+        '<i>Bot akan cari data, lalu tampil tombol untuk pilih section.</i>',
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return;
+  }
+
+  const loading = await ctx.reply('🔍 Mencari (Jikan → Kitsu → Shikimori)...');
+
+  try {
+    let result;
+    try {
+      result = await chainSearch(query);
+    } catch (err: any) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Anime <b>${escapeHtml(query)}</b> tidak ditemukan.\n\n` +
+          `<i>${escapeHtml((err?.message ?? 'unknown').slice(0, 400))}</i>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const media = result.media;
+    const studio = media.studios?.nodes?.[0]?.name ?? null;
+
+    const sessionId = await saveSession(env.DB, ctx.from!.id, {
+      malId: result.malId,
+      kitsuId: result.kitsuId,
+      title: media.title.romaji,
+      cover: media.coverImage.extraLarge,
+      year: media.seasonYear ? String(media.seasonYear) : null,
+      type: media.format,
+      studio,
+      source: result.source,
+    });
+
+    const session = await getSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '❌ Gagal simpan session.'
+      );
+      return;
+    }
+
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    if (session.cover) {
+      await ctx.replyWithPhoto(session.cover, {
+        caption: buildPreviewText(session),
+        parse_mode: 'HTML',
+        reply_markup: buildKeyboard(sessionId),
+      });
+    } else {
+      await ctx.reply(buildPreviewText(session), {
+        parse_mode: 'HTML',
+        reply_markup: buildKeyboard(sessionId),
+        link_preview_options: { is_disabled: true },
+      });
+    }
+  } catch (err: any) {
+    console.error('[DBA] command error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  }
+}
+
+export const databaseAnimeCommand: CommandDefinition = {
+  name: 'database-anime',
+  description: 'Generate YAML untuk QimochiDB',
+  usage: '/dba <judul>',
+  adminOnly: true,
+  handler: handleCommand,
+};
+
+export const dbaShortCommand: CommandDefinition = {
+  name: 'dba',
+  description: 'Alias pendek untuk /database-anime',
+  usage: '/dba <judul>',
+  adminOnly: true,
+  handler: handleCommand,
+};
+
+/* ============================================================
+   CALLBACK HANDLERS
+   ============================================================ */
+
+function buildChainContext(session: SessionRow): ChainContext {
+  return {
+    malId: session.mal_id,
+    kitsuId: session.kitsu_id,
+    title: session.title,
+  };
+}
+
+export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(/^qd:([mcefsax]):(q_[a-f0-9]+)$/, async (ctx) => {
+    const match = ctx.match as RegExpMatchArray;
+    const action = match[1];
+    const sessionId = match[2];
+
+    if (!action || !sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌ Callback invalid' });
+      return;
+    }
+
+    const session = await getSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Session kadaluarsa. Ulangi /dba.',
+        show_alert: true,
+      });
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      return;
+    }
+
+    if (ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    if (action === 'x') {
+      await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+      await deleteSession(env.DB, sessionId);
+      await ctx
+        .editMessageCaption({
+          caption: `❌ <b>Dibatalkan</b>`,
+          parse_mode: 'HTML',
+          reply_markup: undefined,
+        })
+        .catch(() => {
+          ctx
+            .editMessageText('❌ <b>Dibatalkan</b>', {
+              parse_mode: 'HTML',
+              reply_markup: undefined,
+            })
+            .catch(() => {});
+        });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
+
+    try {
+      const chainCtx = buildChainContext(session);
+
+      /* ---------- METADATA ---------- */
+      if (action === 'm') {
+        let result;
+        try {
+          result = await chainSearch(session.title);
+        } catch (err: any) {
+          await ctx.reply(
+            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        const yaml = buildMetadataYaml({
+          media: result.media,
+          malId: result.malId ?? session.mal_id,
+          kitsuId: result.kitsuId ?? session.kitsu_id,
+        });
+        await sendLongMessage(ctx, `Metadata — ${session.title}`, yaml);
+        return;
+      }
+
+      /* ---------- CHARACTERS ---------- */
+      if (action === 'c') {
+        const { data: chars, error } = await safeFetch(
+          () => chainCharacters(chainCtx),
+          25000
+        );
+
+        if (!chars || !chars.data || chars.data.length === 0) {
+          const errs = chars?.errors ?? [error ?? 'unknown'];
+          await sendLongMessage(
+            ctx,
+            `Characters — ${session.title}`,
+            fallbackSection('characters', errs)
+          );
+          return;
+        }
+
+        const yaml = buildCharactersYaml(chars.data);
+        const label = `Characters — ${session.title} [${chars.source}]`;
+        await sendLongMessage(ctx, label, yaml);
+        return;
+      }
+
+      /* ---------- EPISODES ---------- */
+      if (action === 'e') {
+        const { data: eps, error } = await safeFetch(
+          () => chainEpisodes(chainCtx),
+          30000
+        );
+
+        if (!eps || !eps.data || eps.data.length === 0) {
+          const errs = eps?.errors ?? [error ?? 'unknown'];
+          await sendLongMessage(
+            ctx,
+            `Episodes — ${session.title}`,
+            fallbackSection('episodes', errs)
+          );
+          return;
+        }
+
+        const yaml = buildEpisodesYaml(eps.data);
+        const label = `Episodes — ${session.title} [${eps.source}]`;
+        await sendLongMessage(ctx, label, yaml);
+        return;
+      }
+
+      /* ---------- FRANCHISES ---------- */
+      if (action === 'f') {
+        const { data: rels, error } = await safeFetch(
+          () => chainRelations(chainCtx),
+          25000
+        );
+
+        if (!rels || !rels.data || rels.data.length === 0) {
+          const errs = rels?.errors ?? [error ?? 'unknown'];
+          await sendLongMessage(
+            ctx,
+            `Franchises — ${session.title}`,
+            fallbackSection('franchises', errs)
+          );
+          return;
+        }
+
+        const yaml = buildFranchisesYaml(rels.data);
+        const label = `Franchises — ${session.title} [${rels.source}]`;
+        await sendLongMessage(ctx, label, yaml);
+        return;
+      }
+
+      /* ---------- SUMMARY ---------- */
+      if (action === 's') {
+        let result;
+        try {
+          result = await chainSearch(session.title);
+        } catch (err: any) {
+          await ctx.reply(
+            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        const raw = getSynopsisRaw(result.media);
+        const { data: ai } = await safeFetch(
+          () => rewriteSynopsis(env, session.title, raw),
+          AI_TIMEOUT_MS
+        );
+
+        let body: string;
+        if (ai) {
+          body =
+            '<!--\n' +
+            '  ⚠️ Sinopsis ini di-generate AI. Tinjau ulang sebelum commit.\n' +
+            '  Kalau tidak sesuai, edit manual.\n' +
+            '-->\n\n' +
+            ai;
+        } else {
+          body =
+            '<!--\n' +
+            '  ⚠️ AI gagal generate sinopsis. Tulis manual di sini.\n' +
+            '-->\n\n' +
+            (raw || 'Tulis sinopsis manual...');
+        }
+
+        await sendLongMessage(ctx, `Summary — ${session.title}`, body);
+        return;
+      }
+
+      /* ---------- ALL ---------- */
+      if (action === 'a') {
+        let searchResult;
+        try {
+          searchResult = await chainSearch(session.title);
+        } catch (err: any) {
+          await ctx.reply(
+            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        await ctx.reply('⏳ All (1/5): Metadata...');
+        const metaYaml = buildMetadataYaml({
+          media: searchResult.media,
+          malId: searchResult.malId ?? session.mal_id,
+          kitsuId: searchResult.kitsuId ?? session.kitsu_id,
+        });
+
+        await ctx.reply('⏳ All (2/5): Characters...');
+        const charsRes = await safeFetch(() => chainCharacters(chainCtx), 25000);
+        const charsYaml =
+          charsRes.data?.data && charsRes.data.data.length > 0
+            ? buildCharactersYaml(charsRes.data.data)
+            : fallbackSection(
+                'characters',
+                charsRes.data?.errors ?? [charsRes.error ?? 'unknown']
+              );
+
+        await ctx.reply('⏳ All (3/5): Episodes...');
+        const epsRes = await safeFetch(() => chainEpisodes(chainCtx), 30000);
+        const epsYaml =
+          epsRes.data?.data && epsRes.data.data.length > 0
+            ? buildEpisodesYaml(epsRes.data.data)
+            : fallbackSection(
+                'episodes',
+                epsRes.data?.errors ?? [epsRes.error ?? 'unknown']
+              );
+
+        await ctx.reply('⏳ All (4/5): Franchises...');
+        const relsRes = await safeFetch(() => chainRelations(chainCtx), 25000);
+        const relsYaml =
+          relsRes.data?.data && relsRes.data.data.length > 0
+            ? buildFranchisesYaml(relsRes.data.data)
+            : fallbackSection(
+                'franchises',
+                relsRes.data?.errors ?? [relsRes.error ?? 'unknown']
+              );
+
+        await ctx.reply('⏳ All (5/5): Summary...');
+        const raw = getSynopsisRaw(searchResult.media);
+        const aiRes = await safeFetch(
+          () => rewriteSynopsis(env, session.title, raw),
+          AI_TIMEOUT_MS
+        );
+        const summary =
+          '<!--\n' +
+          '  ⚠️ Sinopsis di-generate AI. Tinjau ulang sebelum commit.\n' +
+          '-->\n\n' +
+          (aiRes.data || raw || 'Tulis sinopsis manual...');
+
+        const full = buildAllMarkdown({
+          metadata: metaYaml,
+          characters: charsYaml,
+          episodes: epsYaml,
+          franchises: relsYaml,
+          summary,
+        });
+
+        await sendLongMessage(ctx, `All — ${session.title}`, full);
+        await deleteSession(env.DB, sessionId);
+        return;
+      }
+    } catch (err: any) {
+      console.error('[DBA] callback error:', err);
+      const msg = err?.message ?? 'unknown';
+
+      let hint = '';
+      if (msg.includes('aborted') || msg.includes('timeout')) {
+        hint = '\n\n<i>API lambat. Coba lagi dalam 30 detik.</i>';
+      } else if (msg.includes('429')) {
+        hint = '\n\n<i>Rate limit. Tunggu 1 menit.</i>';
+      } else if (msg.includes('HTTP 5')) {
+        hint = '\n\n<i>Server down. Coba lagi nanti.</i>';
+      }
+
+      await ctx.reply(
+        `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  });
+}
+
+===== END FILE =====
+
 ===== FILE: ./src/commands/decode.ts =====
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
@@ -2551,18 +3264,25 @@ import { animeCommand } from './anime';
 import { aiCommand } from './ai';
 import { clearcacheCommand } from './clearcache';
 import { decodeCommand, listCommand, deleteCommand } from './decode';
+import {
+  databaseAnimeCommand,
+  dbaShortCommand,
+} from './database-anime';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
   helpCommand,
   statusCommand,
   animeCommand,
+  databaseAnimeCommand,
+  dbaShortCommand,
   aiCommand,
   clearcacheCommand,
   decodeCommand,
   listCommand,
   deleteCommand,
 ];
+
 ===== END FILE =====
 
 ===== FILE: ./src/commands/ping.ts =====
@@ -4220,6 +4940,7 @@ import { handleDocumentAuto } from './commands/decode';
 import { setupAnimeCallbacks } from './commands/anime';
 import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
+import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
@@ -4239,6 +4960,7 @@ function createBot(env: Env): Bot {
   registerCommands(bot, env);
   setupBusinessHandler(bot, env);
   setupAnimeCallbacks(bot, env);
+  setupDatabaseAnimeCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
@@ -4377,6 +5099,7 @@ export default {
     }
   },
 };
+
 ===== END FILE =====
 
 ===== FILE: ./src/lib/cache.ts =====
@@ -4684,6 +5407,130 @@ export async function getAnimeMapping(
 }
 ===== END FILE =====
 
+===== FILE: ./src/services/jikan-extras.ts =====
+// src/services/jikan-extras.ts
+import { fetchWithRetry } from '../lib/http';
+
+const JIKAN_BASE = 'https://api.jikan.moe/v4';
+const FETCH_TIMEOUT = 1000;
+const MAX_EPISODES = 100;
+
+export interface JikanCharacterEntry {
+  character: {
+    mal_id: number;
+    name: string;
+    images: {
+      jpg: { image_url: string };
+      webp?: { image_url: string };
+    };
+  };
+  role: string;
+  voice_actors: {
+    person: {
+      mal_id: number;
+      name: string;
+      images: { jpg: { image_url: string } };
+    };
+    language: string;
+  }[];
+}
+
+export interface JikanEpisodeEntry {
+  mal_id: number;
+  title: string;
+  aired: string | null;
+  filler: boolean;
+  recap: boolean;
+  duration: number | null;
+}
+
+export interface JikanRelationEntry {
+  relation: string;
+  entry: {
+    mal_id: number;
+    type: string;
+    name: string;
+    url: string;
+  }[];
+}
+
+async function jikanGet<T>(path: string): Promise<T> {
+  const url = `${JIKAN_BASE}${path}`;
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 0, baseDelay: 0, timeout: FETCH_TIMEOUT }
+  );
+
+  if (!res.ok) {
+    throw new Error(`Jikan HTTP ${res.status}: ${path}`);
+  }
+
+  return (await res.json()) as T;
+}
+
+export async function getCharacters(
+  malId: number
+): Promise<JikanCharacterEntry[]> {
+  const json = await jikanGet<{ data: JikanCharacterEntry[] }>(
+    `/anime/${malId}/characters`
+  );
+  return json.data ?? [];
+}
+
+export async function getEpisodesPage(
+  malId: number,
+  page = 1
+): Promise<{
+  episodes: JikanEpisodeEntry[];
+  hasNextPage: boolean;
+}> {
+  const json = await jikanGet<{
+    data: JikanEpisodeEntry[];
+    pagination: { has_next_page: boolean; last_visible_page: number };
+  }>(`/anime/${malId}/episodes?page=${page}`);
+
+  return {
+    episodes: json.data ?? [],
+    hasNextPage: json.pagination?.has_next_page ?? false,
+  };
+}
+
+export async function getAllEpisodes(
+  malId: number,
+  maxTotal = MAX_EPISODES
+): Promise<JikanEpisodeEntry[]> {
+  const all: JikanEpisodeEntry[] = [];
+  let page = 1;
+  let hasNext = true;
+
+  while (hasNext && all.length < maxTotal && page <= 20) {
+    const result = await getEpisodesPage(malId, page);
+    all.push(...result.episodes);
+    hasNext = result.hasNextPage;
+    page++;
+  }
+
+  return all.slice(0, maxTotal);
+}
+
+export async function getRelations(
+  malId: number
+): Promise<JikanRelationEntry[]> {
+  const json = await jikanGet<{ data: JikanRelationEntry[] }>(
+    `/anime/${malId}/relations`
+  );
+  return json.data ?? [];
+}
+
+===== END FILE =====
+
 ===== FILE: ./src/services/jikan.ts =====
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from '../types/anime';
@@ -4937,6 +5784,1110 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
     },
   };
 }
+===== END FILE =====
+
+===== FILE: ./src/services/qimochi-chain-extras.ts =====
+// src/services/qimochi-chain-extras.ts
+import { fetchWithRetry } from '../lib/http';
+import { searchJikan } from './jikan';
+import {
+  getCharacters as getJikanCharacters,
+  getAllEpisodes as getJikanEpisodes,
+  getRelations as getJikanRelations,
+} from './jikan-extras';
+
+/* ============================================================
+   UNIFIED TYPES
+   ============================================================ */
+
+export interface UnifiedCharacter {
+  name: string;
+  image?: string;
+  role: 'main' | 'supporting' | 'background';
+  voiceActors: {
+    name: string;
+    image?: string;
+    language?: string;
+  }[];
+}
+
+export interface UnifiedEpisode {
+  number: number;
+  title: string;
+  aired?: string;
+  duration?: number;
+}
+
+export interface UnifiedRelation {
+  relation: string;
+  slug: string;
+  title: string;
+}
+
+export interface ChainContext {
+  malId: number | null;
+  kitsuId: string | null;
+  title: string;
+}
+
+export interface ChainResult<T> {
+  data: T[] | null;
+  source: string;
+  errors: string[];
+}
+
+const PER_SOURCE_TIMEOUT = 8000;
+const MAX_ITEMS = 30;
+const MAX_EPISODES = 100;
+
+/* ============================================================
+   UTILITIES
+   ============================================================ */
+
+async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+async function resolveMalId(
+  malId: number | null,
+  title: string
+): Promise<number | null> {
+  if (malId) return malId;
+  if (!title) return null;
+  const search = await withTimeout(() => searchJikan(title), 6000);
+  return search?.mal_id ?? null;
+}
+
+/* ============================================================
+   KITSU — CHARACTERS
+   ============================================================ */
+
+interface KitsuIncluded {
+  id: string;
+  type: string;
+  attributes?: {
+    name?: string;
+    canonicalName?: string;
+    image?: { original?: string; large?: string } | null;
+  };
+}
+
+interface KitsuRoleEntry {
+  id: string;
+  type: string;
+  attributes?: { role?: string };
+  relationships?: {
+    character?: { data?: { id: string; type: string } | null };
+    voiceActor?: { data?: { id: string; type: string } | null };
+  };
+}
+
+async function getKitsuCharacters(
+  kitsuId: string
+): Promise<UnifiedCharacter[] | null> {
+  const url = `https://kitsu.io/api/edge/anime/${kitsuId}/characters?include=character,voiceActor&page[limit]=40`;
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: 'application/vnd.api+json',
+        'Content-Type': 'application/vnd.api+json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
+  );
+
+  if (!res.ok) return null;
+
+  const json = (await res.json()) as {
+    data?: KitsuRoleEntry[];
+    included?: KitsuIncluded[];
+  };
+
+  const data = json.data ?? [];
+  const included = json.included ?? [];
+
+  const indexed = new Map<string, KitsuIncluded>();
+  for (const item of included) {
+    indexed.set(`${item.type}:${item.id}`, item);
+  }
+
+  const out: UnifiedCharacter[] = [];
+  const seen = new Set<string>();
+
+  for (const role of data) {
+    const charRef = role.relationships?.character?.data;
+    const vaRef = role.relationships?.voiceActor?.data;
+    if (!charRef) continue;
+
+    const charItem = indexed.get(`characters:${charRef.id}`);
+    if (!charItem) continue;
+
+    const charName =
+      charItem.attributes?.canonicalName ?? charItem.attributes?.name;
+    if (!charName || seen.has(charName)) continue;
+    seen.add(charName);
+
+    const roleRaw = (role.attributes?.role ?? 'supporting').toLowerCase();
+    const roleNorm: UnifiedCharacter['role'] =
+      roleRaw === 'main'
+        ? 'main'
+        : roleRaw === 'supporting'
+          ? 'supporting'
+          : 'background';
+
+    const vas: UnifiedCharacter['voiceActors'] = [];
+    if (vaRef) {
+      const vaItem = indexed.get(`people:${vaRef.id}`);
+      if (vaItem?.attributes?.name) {
+        vas.push({
+          name: vaItem.attributes.name,
+          image: vaItem.attributes.image?.original ?? undefined,
+          language: 'Japanese',
+        });
+      }
+    }
+
+    out.push({
+      name: charName,
+      image: charItem.attributes?.image?.original ?? undefined,
+      role: roleNorm,
+      voiceActors: vas,
+    });
+
+    if (out.length >= MAX_ITEMS) break;
+  }
+
+  return out.length > 0 ? out : null;
+}
+
+/* ============================================================
+   KITSU — EPISODES
+   ============================================================ */
+
+interface KitsuEpisodeItem {
+  id: string;
+  attributes?: {
+    number?: number;
+    canonicalTitle?: string;
+    titles?: { en?: string; en_jp?: string; ja_jp?: string };
+    airdate?: string | null;
+    length?: number | null;
+  };
+}
+
+async function getKitsuEpisodes(
+  kitsuId: string
+): Promise<UnifiedEpisode[] | null> {
+  const url = `https://kitsu.io/api/edge/anime/${kitsuId}/episodes?page[limit]=100&sort=number`;
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: 'application/vnd.api+json',
+        'Content-Type': 'application/vnd.api+json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
+  );
+
+  if (!res.ok) return null;
+
+  const json = (await res.json()) as { data?: KitsuEpisodeItem[] };
+  const data = json.data ?? [];
+  if (data.length === 0) return null;
+
+  const out: UnifiedEpisode[] = [];
+
+  for (const ep of data) {
+    const attr = ep.attributes ?? {};
+    const number = attr.number ?? out.length + 1;
+    const title =
+      attr.titles?.en ??
+      attr.titles?.en_jp ??
+      attr.canonicalTitle ??
+      `Episode ${number}`;
+    const aired = attr.airdate ? attr.airdate.split('T')[0] : undefined;
+    const duration =
+      attr.length && attr.length > 0 ? Math.round(attr.length / 60) : undefined;
+
+    out.push({ number, title, aired, duration });
+    if (out.length >= MAX_EPISODES) break;
+  }
+
+  return out;
+}
+
+/* ============================================================
+   SHIKIMORI — CHARACTERS
+   ============================================================ */
+
+interface ShikimoriRole {
+  id: number;
+  name: string;
+  russian?: string;
+  image?: { original?: string; preview?: string } | null;
+  roles?: string[];
+  roles_russian?: string[];
+  person?: {
+    id?: number;
+    name?: string;
+    russian?: string;
+    image?: { original?: string; preview?: string } | null;
+  } | null;
+}
+
+function shikimoriImage(
+  img?: { original?: string; preview?: string } | null
+): string | undefined {
+  if (!img) return undefined;
+  const raw = img.original ?? img.preview;
+  if (!raw) return undefined;
+  if (raw.startsWith('http')) return raw;
+  return `https://shikimori.one${raw}`;
+}
+
+async function getShikimoriCharacters(
+  malId: number
+): Promise<UnifiedCharacter[] | null> {
+  const url = `https://shikimori.one/api/animes/${malId}/roles`;
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
+  );
+
+  if (!res.ok) return null;
+
+  const data = (await res.json()) as ShikimoriRole[];
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  const out: UnifiedCharacter[] = [];
+  const seen = new Set<string>();
+
+  for (const role of data) {
+    if (!role.name || seen.has(role.name)) continue;
+    seen.add(role.name);
+
+    const roles = role.roles ?? [];
+    const isMain = roles.some((r) => r.toLowerCase() === 'main');
+    const isSupporting = roles.some((r) => r.toLowerCase() === 'supporting');
+    const roleNorm: UnifiedCharacter['role'] = isMain
+      ? 'main'
+      : isSupporting
+        ? 'supporting'
+        : 'background';
+
+    const vas: UnifiedCharacter['voiceActors'] = [];
+    if (role.person?.name) {
+      vas.push({
+        name: role.person.name,
+        image: shikimoriImage(role.person.image),
+        language: 'Japanese',
+      });
+    }
+
+    out.push({
+      name: role.name,
+      image: shikimoriImage(role.image),
+      role: roleNorm,
+      voiceActors: vas,
+    });
+
+    if (out.length >= MAX_ITEMS) break;
+  }
+
+  return out.length > 0 ? out : null;
+}
+
+/* ============================================================
+   SHIKIMORI — RELATIONS
+   ============================================================ */
+
+interface ShikimoriAnimeFull {
+  id: number;
+  name: string;
+  related?: {
+    id: number;
+    name: string;
+    kind?: string;
+    relation?: string;
+  }[];
+}
+
+function mapShikimoriRelation(raw: string | undefined): string {
+  if (!raw) return 'other';
+  const lower = raw.toLowerCase();
+  if (lower.includes('sequel')) return 'sequel';
+  if (lower.includes('prequel')) return 'prequel';
+  if (lower.includes('spin')) return 'spin_off';
+  if (lower.includes('side')) return 'side_story';
+  if (lower.includes('alternative')) return 'alternative';
+  if (lower.includes('adaptation')) return 'adaptation';
+  if (lower.includes('summary')) return 'summary';
+  return 'other';
+}
+
+async function getShikimoriRelations(
+  malId: number
+): Promise<UnifiedRelation[] | null> {
+  const url = `https://shikimori.one/api/animes/${malId}`;
+
+  const res = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'yukio-bot/1.0',
+      },
+    },
+    { retries: 0, timeout: PER_SOURCE_TIMEOUT }
+  );
+
+  if (!res.ok) return null;
+
+  const data = (await res.json()) as ShikimoriAnimeFull;
+  const related = data?.related ?? [];
+  if (related.length === 0) return null;
+
+  const out: UnifiedRelation[] = [];
+  for (const rel of related) {
+    if (!rel.name) continue;
+    out.push({
+      relation: mapShikimoriRelation(rel.relation),
+      slug: slugify(rel.name),
+      title: rel.name,
+    });
+  }
+
+  return out.length > 0 ? out : null;
+}
+
+/* ============================================================
+   JIKAN NORMALIZERS
+   ============================================================ */
+
+interface JikanCharRaw {
+  character: {
+    name: string;
+    images?: { jpg?: { image_url?: string } };
+  };
+  role: string;
+  voice_actors?: {
+    person: {
+      name: string;
+      images?: { jpg?: { image_url?: string } };
+    };
+    language: string;
+  }[];
+}
+
+function normalizeJikanCharacters(raw: unknown): UnifiedCharacter[] {
+  const arr = raw as JikanCharRaw[];
+  if (!Array.isArray(arr)) return [];
+
+  const out: UnifiedCharacter[] = [];
+  for (const entry of arr) {
+    if (!entry.character?.name) continue;
+    const roleRaw = (entry.role ?? 'supporting').toLowerCase();
+    const role: UnifiedCharacter['role'] =
+      roleRaw === 'main'
+        ? 'main'
+        : roleRaw === 'supporting'
+          ? 'supporting'
+          : 'background';
+
+    const vas: UnifiedCharacter['voiceActors'] = [];
+    for (const v of entry.voice_actors ?? []) {
+      if (v.person?.name) {
+        vas.push({
+          name: v.person.name,
+          image: v.person.images?.jpg?.image_url,
+          language: v.language ?? 'Japanese',
+        });
+      }
+    }
+
+    out.push({
+      name: entry.character.name,
+      image: entry.character.images?.jpg?.image_url,
+      role,
+      voiceActors: vas,
+    });
+
+    if (out.length >= MAX_ITEMS) break;
+  }
+
+  return out;
+}
+
+interface JikanEpRaw {
+  mal_id: number;
+  title?: string;
+  aired?: string | null;
+  duration?: number | null;
+}
+
+function normalizeJikanEpisodes(raw: unknown): UnifiedEpisode[] {
+  const arr = raw as JikanEpRaw[];
+  if (!Array.isArray(arr)) return [];
+
+  const out: UnifiedEpisode[] = [];
+  for (const ep of arr) {
+    out.push({
+      number: ep.mal_id ?? 0,
+      title: ep.title ?? `Episode ${ep.mal_id}`,
+      aired: ep.aired ? ep.aired.split('T')[0] : undefined,
+      duration: ep.duration ?? undefined,
+    });
+    if (out.length >= MAX_EPISODES) break;
+  }
+
+  return out;
+}
+
+interface JikanRelRaw {
+  relation: string;
+  entry: { mal_id: number; type: string; name: string; url: string }[];
+}
+
+function mapJikanRelation(raw: string): string {
+  const map: Record<string, string> = {
+    Sequel: 'sequel',
+    Prequel: 'prequel',
+    'Side Story': 'side_story',
+    'Parent Story': 'parent_story',
+    Alternative: 'alternative',
+    'Alternative Version': 'alternative',
+    'Spin-Off': 'spin_off',
+    Summary: 'summary',
+    'Full Story': 'full_story',
+    Character: 'character',
+    Other: 'other',
+    Adaptation: 'adaptation',
+  };
+  return map[raw] ?? 'other';
+}
+
+function normalizeJikanRelations(raw: unknown): UnifiedRelation[] {
+  const arr = raw as JikanRelRaw[];
+  if (!Array.isArray(arr)) return [];
+
+  const out: UnifiedRelation[] = [];
+  for (const rel of arr) {
+    const relationKey = mapJikanRelation(rel.relation);
+    for (const entry of rel.entry ?? []) {
+      if (!entry.name) continue;
+      out.push({
+        relation: relationKey,
+        slug: slugify(entry.name),
+        title: entry.name,
+      });
+    }
+  }
+
+  return out;
+}
+
+/* ============================================================
+   CHAIN RESOLVERS
+   ============================================================ */
+
+export async function chainCharacters(
+  ctx: ChainContext
+): Promise<ChainResult<UnifiedCharacter>> {
+  const errors: string[] = [];
+  const malId = await resolveMalId(ctx.malId, ctx.title);
+
+  if (malId) {
+    const jikan = await withTimeout(
+      () => getJikanCharacters(malId),
+      PER_SOURCE_TIMEOUT
+    );
+    if (jikan && jikan.length > 0) {
+      return {
+        data: normalizeJikanCharacters(jikan),
+        source: 'Jikan',
+        errors,
+      };
+    }
+    errors.push('Jikan: gagal atau kosong');
+  } else {
+    errors.push('Jikan: tidak ada MAL ID');
+  }
+
+  if (ctx.kitsuId) {
+    const kitsu = await withTimeout(
+      () => getKitsuCharacters(ctx.kitsuId!),
+      PER_SOURCE_TIMEOUT
+    );
+    if (kitsu && kitsu.length > 0) {
+      return { data: kitsu, source: 'Kitsu', errors };
+    }
+    errors.push('Kitsu: gagal atau kosong');
+  } else {
+    errors.push('Kitsu: tidak ada Kitsu ID');
+  }
+
+  if (malId) {
+    const shiki = await withTimeout(
+      () => getShikimoriCharacters(malId),
+      PER_SOURCE_TIMEOUT
+    );
+    if (shiki && shiki.length > 0) {
+      return { data: shiki, source: 'Shikimori', errors };
+    }
+    errors.push('Shikimori: gagal atau kosong');
+  }
+
+  return { data: null, source: 'none', errors };
+}
+
+export async function chainEpisodes(
+  ctx: ChainContext
+): Promise<ChainResult<UnifiedEpisode>> {
+  const errors: string[] = [];
+  const malId = await resolveMalId(ctx.malId, ctx.title);
+
+  if (malId) {
+    const jikan = await withTimeout(
+      () => getJikanEpisodes(malId, MAX_EPISODES),
+      PER_SOURCE_TIMEOUT * 2
+    );
+    if (jikan && jikan.length > 0) {
+      return {
+        data: normalizeJikanEpisodes(jikan),
+        source: 'Jikan',
+        errors,
+      };
+    }
+    errors.push('Jikan: gagal atau kosong');
+  } else {
+    errors.push('Jikan: tidak ada MAL ID');
+  }
+
+  if (ctx.kitsuId) {
+    const kitsu = await withTimeout(
+      () => getKitsuEpisodes(ctx.kitsuId!),
+      PER_SOURCE_TIMEOUT
+    );
+    if (kitsu && kitsu.length > 0) {
+      return { data: kitsu, source: 'Kitsu', errors };
+    }
+    errors.push('Kitsu: gagal atau kosong');
+  } else {
+    errors.push('Kitsu: tidak ada Kitsu ID');
+  }
+
+  return { data: null, source: 'none', errors };
+}
+
+export async function chainRelations(
+  ctx: ChainContext
+): Promise<ChainResult<UnifiedRelation>> {
+  const errors: string[] = [];
+  const malId = await resolveMalId(ctx.malId, ctx.title);
+
+  if (malId) {
+    const jikan = await withTimeout(
+      () => getJikanRelations(malId),
+      PER_SOURCE_TIMEOUT
+    );
+    if (jikan && jikan.length > 0) {
+      return {
+        data: normalizeJikanRelations(jikan),
+        source: 'Jikan',
+        errors,
+      };
+    }
+    errors.push('Jikan: gagal atau kosong');
+  } else {
+    errors.push('Jikan: tidak ada MAL ID');
+  }
+
+  if (malId) {
+    const shiki = await withTimeout(
+      () => getShikimoriRelations(malId),
+      PER_SOURCE_TIMEOUT
+    );
+    if (shiki && shiki.length > 0) {
+      return { data: shiki, source: 'Shikimori', errors };
+    }
+    errors.push('Shikimori: gagal atau kosong');
+  }
+
+  return { data: null, source: 'none', errors };
+}
+
+===== END FILE =====
+
+===== FILE: ./src/services/qimochi-chain.ts =====
+// src/services/qimochi-chain.ts
+import type { AniListMedia } from '../types/anime';
+import { searchJikan, jikanToAniList } from './jikan';
+import { searchKitsu, kitsuToAniList } from './kitsu';
+import { searchShikimori, shikimoriToAniList } from './shikimori';
+
+const TIMEOUT_PER_SOURCE = 7000;
+
+export interface ChainSearchResult {
+  media: AniListMedia;
+  malId: number | null;
+  kitsuId: string | null;
+  source: string;
+  tried: string[];
+  errors: string[];
+}
+
+async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cari anime dari 3 sumber secara berurutan:
+ * Jikan → Kitsu → Shikimori
+ *
+ * Return data dari sumber pertama yang berhasil.
+ * Kalau semua gagal, throw error.
+ */
+export async function chainSearch(query: string): Promise<ChainSearchResult> {
+  const tried: string[] = [];
+  const errors: string[] = [];
+
+  // === 1. JIKAN ===
+  tried.push('Jikan');
+  const jikan = await withTimeout(() => searchJikan(query), TIMEOUT_PER_SOURCE);
+
+  if (jikan) {
+    return {
+      media: jikanToAniList(jikan),
+      malId: jikan.mal_id,
+      kitsuId: null,
+      source: 'Jikan (MAL)',
+      tried,
+      errors,
+    };
+  }
+  errors.push('Jikan: timeout atau gagal');
+
+  // === 2. KITSU ===
+  tried.push('Kitsu');
+  const kitsuResult = await withTimeout(
+    () => searchKitsu(query),
+    TIMEOUT_PER_SOURCE
+  );
+
+  if (kitsuResult) {
+    const media = kitsuToAniList(kitsuResult);
+    return {
+      media,
+      malId: null,
+      kitsuId: kitsuResult.anime.id,
+      source: 'Kitsu',
+      tried,
+      errors,
+    };
+  }
+  errors.push('Kitsu: timeout atau gagal');
+
+  // === 3. SHIKIMORI ===
+  tried.push('Shikimori');
+  const shikimori = await withTimeout(
+    () => searchShikimori(query),
+    TIMEOUT_PER_SOURCE
+  );
+
+  if (shikimori) {
+    return {
+      media: shikimoriToAniList(shikimori),
+      malId: null,
+      kitsuId: null,
+      source: 'Shikimori',
+      tried,
+      errors,
+    };
+  }
+  errors.push('Shikimori: timeout atau gagal');
+
+  // === SEMUA GAGAL ===
+  throw new Error(
+    `Semua sumber gagal.\n\n` +
+      `Sudah dicoba:\n` +
+      errors.map((e) => `• ${e}`).join('\n')
+  );
+}
+
+/**
+ * Chain untuk search by title — kalau kita cuma tahu title
+ * dan butuh malId/kitsuId (untuk fetch characters/episodes).
+ */
+export async function resolveAnimeIds(
+  query: string
+): Promise<{
+  malId: number | null;
+  kitsuId: string | null;
+  title: string;
+  source: string;
+}> {
+  const result = await chainSearch(query);
+  return {
+    malId: result.malId,
+    kitsuId: result.kitsuId,
+    title: result.media.title.romaji || 'Unknown',
+    source: result.source,
+  };
+}
+
+===== END FILE =====
+
+===== FILE: ./src/services/qimochi-yaml.ts =====
+// src/services/qimochi-yaml.ts
+import type { AniListMedia } from '../types/anime';
+import type {
+  UnifiedCharacter,
+  UnifiedEpisode,
+  UnifiedRelation,
+} from './qimochi-chain-extras';
+
+const MAX_CHARACTERS = 20;
+
+const FORMAT_MAP: Record<string, string> = {
+  TV: 'TV',
+  TV_SHORT: 'TV',
+  MOVIE: 'Movie',
+  SPECIAL: 'Special',
+  OVA: 'OVA',
+  ONA: 'ONA',
+  MUSIC: 'Music',
+  UNKNOWN: 'Unknown',
+};
+
+const STATUS_MAP: Record<string, string> = {
+  FINISHED: 'finished',
+  RELEASING: 'airing',
+  NOT_YET_RELEASED: 'upcoming',
+  CANCELLED: 'cancelled',
+  HIATUS: 'hiatus',
+};
+
+const ROLE_MAP: Record<string, string> = {
+  main: 'main',
+  supporting: 'supporting',
+  background: 'background',
+};
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function yamlString(s: string): string {
+  const cleaned = s.replace(/\n/g, ' ').trim();
+  const needsQuote =
+    /[:#&*!|>'"%@`{}\[\],]/.test(cleaned) ||
+    cleaned === '' ||
+    /^\d/.test(cleaned);
+  if (!needsQuote) return cleaned;
+  return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function formatDate(
+  year: number | null,
+  month: number | null,
+  day: number | null
+): string | null {
+  if (!year || !month || !day) return null;
+  const m = String(month).padStart(2, '0');
+  const d = String(day).padStart(2, '0');
+  return `${year}-${m}-${d}`;
+}
+
+function cleanSynopsisRaw(raw: string | null | undefined): string {
+  if (!raw) return '';
+  return raw
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function guessSeason(month: number | null): string | null {
+  if (!month) return null;
+  if (month >= 1 && month <= 3) return 'winter';
+  if (month >= 4 && month <= 6) return 'spring';
+  if (month >= 7 && month <= 9) return 'summer';
+  if (month >= 10 && month <= 12) return 'fall';
+  return null;
+}
+
+/* ============================================================
+   METADATA
+   ============================================================ */
+
+export interface MetadataInput {
+  media: AniListMedia;
+  malId: number | null;
+  kitsuId: string | null;
+}
+
+export function buildMetadataYaml(input: MetadataInput): string {
+  const { media, malId, kitsuId } = input;
+  const lines: string[] = [];
+
+  lines.push('---');
+  lines.push(`title: ${yamlString(media.title.romaji || 'Unknown')}`);
+  if (media.title.english) {
+    lines.push(`titleEnglish: ${yamlString(media.title.english)}`);
+  }
+  if (media.title.native) {
+    lines.push(`titleNative: ${yamlString(media.title.native)}`);
+  }
+  lines.push('');
+
+  if (malId) lines.push(`malId: ${malId}`);
+  if (kitsuId) lines.push(`kitsuId: ${yamlString(kitsuId)}`);
+  lines.push('');
+
+  lines.push(`type: ${FORMAT_MAP[media.format] ?? 'Unknown'}`);
+  lines.push(`status: ${STATUS_MAP[media.status] ?? 'finished'}`);
+
+  const season = guessSeason(media.startDate.month);
+  if (season) lines.push(`season: ${season}`);
+  if (media.seasonYear) lines.push(`year: ${media.seasonYear}`);
+  if (media.episodes) lines.push(`episodes: ${media.episodes}`);
+  lines.push('');
+
+  const airedFrom = formatDate(
+    media.startDate.year,
+    media.startDate.month,
+    media.startDate.day
+  );
+  if (airedFrom) {
+    lines.push('aired:');
+    lines.push(`  from: "${airedFrom}"`);
+    lines.push('  to: null');
+    lines.push('');
+  }
+
+  if (media.averageScore && media.averageScore > 0) {
+    lines.push('stats:');
+    lines.push(`  score: ${(media.averageScore / 10).toFixed(1)}`);
+    lines.push('');
+  }
+
+  const genres = (media.genres ?? []).map(slugify).filter(Boolean);
+  if (genres.length > 0) {
+    lines.push('genres:');
+    for (const g of genres) lines.push(`  - ${g}`);
+    lines.push('');
+  }
+
+  const studios = (media.studios?.nodes ?? [])
+    .map((s) => slugify(s.name))
+    .filter(Boolean);
+  if (studios.length > 0) {
+    lines.push('studios:');
+    for (const s of studios) lines.push(`  - ${s}`);
+    lines.push('');
+  }
+
+  if (media.coverImage.extraLarge) {
+    lines.push(`image: "${media.coverImage.extraLarge}"`);
+  }
+  lines.push('');
+  lines.push('draft: false');
+  lines.push('---');
+
+  return lines.join('\n');
+}
+
+/* ============================================================
+   CHARACTERS
+   ============================================================ */
+
+export function buildCharactersYaml(chars: UnifiedCharacter[]): string {
+  if (!chars || chars.length === 0) {
+    return '# ⚠️ Tidak ada data karakter. Isi manual.\ncharacters: []';
+  }
+
+  const main = chars.filter((c) => c.role === 'main');
+  const supporting = chars.filter((c) => c.role === 'supporting');
+  const sorted = [...main, ...supporting].slice(0, MAX_CHARACTERS);
+
+  if (sorted.length === 0) {
+    return '# ⚠️ Tidak ada karakter main/supporting. Isi manual.\ncharacters: []';
+  }
+
+  const lines: string[] = [];
+  lines.push('characters:');
+
+  for (const char of sorted) {
+    lines.push(`  - name: ${yamlString(char.name)}`);
+    if (char.image) {
+      lines.push(`    image: "${char.image}"`);
+    }
+    lines.push(`    role: ${ROLE_MAP[char.role] ?? 'supporting'}`);
+
+    const jpVA = (char.voiceActors ?? []).find(
+      (va) => (va.language ?? '').toLowerCase().includes('japan')
+    );
+    const va = jpVA ?? char.voiceActors?.[0];
+
+    if (va) {
+      lines.push('    voiceActors:');
+      lines.push(`      - name: ${yamlString(va.name)}`);
+      if (va.image) {
+        lines.push(`        image: "${va.image}"`);
+      }
+      lines.push(`        language: ${va.language ?? 'Japanese'}`);
+    }
+  }
+
+  if (chars.length > MAX_CHARACTERS) {
+    lines.push('');
+    lines.push(
+      `# ⚠️ Di-truncate dari ${chars.length} ke ${MAX_CHARACTERS}. Tambah manual kalau perlu.`
+    );
+  }
+
+  return lines.join('\n');
+}
+
+/* ============================================================
+   EPISODES
+   ============================================================ */
+
+export function buildEpisodesYaml(episodes: UnifiedEpisode[]): string {
+  if (!episodes || episodes.length === 0) {
+    return '# ⚠️ Tidak ada data episode. Isi manual.\nepisodeList: []';
+  }
+
+  const lines: string[] = [];
+  lines.push('episodeList:');
+
+  for (const ep of episodes) {
+    lines.push(`  - number: ${ep.number}`);
+    lines.push(`    title: ${yamlString(ep.title)}`);
+    if (ep.aired) lines.push(`    aired: "${ep.aired}"`);
+  }
+
+  if (episodes.length >= 100) {
+    lines.push('');
+    lines.push('# ⚠️ Di-truncate 100 episode. Tambah manual kalau perlu.');
+  }
+
+  return lines.join('\n');
+}
+
+/* ============================================================
+   FRANCHISES
+   ============================================================ */
+
+export function buildFranchisesYaml(relations: UnifiedRelation[]): string {
+  if (!relations || relations.length === 0) {
+    return '# ⚠️ Tidak ada data franchise/relation. Isi manual.\nfranchises: []';
+  }
+
+  const lines: string[] = [];
+  lines.push('franchises:');
+
+  for (const rel of relations) {
+    lines.push(`  - relation: ${rel.relation}`);
+    lines.push(`    slug: ${yamlString(rel.slug)}`);
+    lines.push(`    title: ${yamlString(rel.title)}`);
+  }
+
+  lines.push('');
+  lines.push('# ⚠️ Verifikasi slug di atas cocok dengan file .md yang ada.');
+
+  return lines.join('\n');
+}
+
+/* ============================================================
+   SUMMARY
+   ============================================================ */
+
+export function getSynopsisRaw(media: AniListMedia): string {
+  return cleanSynopsisRaw(media.description);
+}
+
+/* ============================================================
+   ALL
+   ============================================================ */
+
+export interface AllInput {
+  metadata: string;
+  characters: string;
+  episodes: string;
+  franchises: string;
+  summary: string;
+}
+
+export function buildAllMarkdown(input: AllInput): string {
+  const parts: string[] = [];
+  parts.push(input.metadata);
+  parts.push('');
+  parts.push(input.characters);
+  parts.push('');
+  parts.push(input.episodes);
+  parts.push('');
+  parts.push(input.franchises);
+  parts.push('');
+  parts.push(input.summary);
+  return parts.join('\n');
+}
+
 ===== END FILE =====
 
 ===== FILE: ./src/services/shikimori.ts =====
