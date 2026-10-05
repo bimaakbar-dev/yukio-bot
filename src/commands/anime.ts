@@ -327,6 +327,8 @@ export const animeCommand: CommandDefinition = {
             releaseDate: media.startDate?.year
               ? `${media.startDate.year}-01-01`
               : null,
+            // Kirim raw description — AI akan rewrite (Russian → Indonesia, dll)
+            originalSynopsis: media.description,
           },
           need
         );
