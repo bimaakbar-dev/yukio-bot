@@ -13,18 +13,22 @@ import {
 } from '../services/qimochi-chain-extras';
 import {
   buildMetadataYaml,
-  buildCharactersYaml,
-  buildEpisodesYaml,
-  buildFranchisesYaml,
-  buildAllMarkdown,
   getSynopsisRaw,
 } from '../services/qimochi-yaml';
+import {
+  buildCharactersJson,
+  buildEpisodesJson,
+  buildFranchisesJson,
+  buildVoiceActorsJson,
+  chunkArray,
+  chunkRangeLabel,
+} from '../services/qimochi-json';
 import { askAI } from '../services/ai';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3500;
 const AI_TIMEOUT_MS = 12000;
-const FILE_THRESHOLD = 3500;
+const CHUNK_SIZE = 200;
 
 /* ============================================================
    DB: SESSION
@@ -174,7 +178,7 @@ function escapeHtml(s: string): string {
     .replace(/>/g, '&gt;');
 }
 
-function splitMessage(text: string, max: number): string[] {
+function splitInline(text: string, max: number): string[] {
   if (text.length <= max) return [text];
 
   const parts: string[] = [];
@@ -211,109 +215,15 @@ function splitMessage(text: string, max: number): string[] {
 }
 
 /**
- * Kirim document via Telegram Bot API manual (fetch).
+ * Kirim section (YAML / JSON) inline via <pre>.
+ * Kalau panjang, split per MSG_LIMIT dengan label [N/M].
  */
-async function sendDocumentViaApi(
-  botToken: string,
-  chatId: number,
-  filename: string,
-  content: string,
-  caption: string
-): Promise<void> {
-  const boundary =
-    '----YukioBot' + Math.random().toString(36).slice(2, 12);
-
-  const encoder = new TextEncoder();
-  const CRLF = '\r\n';
-  const chunks: Uint8Array[] = [];
-
-  const pushStr = (s: string) => {
-    chunks.push(encoder.encode(s));
-  };
-
-  pushStr(`--${boundary}${CRLF}`);
-  pushStr(`Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}`);
-  pushStr(`${chatId}${CRLF}`);
-
-  pushStr(`--${boundary}${CRLF}`);
-  pushStr(`Content-Disposition: form-data; name="caption"${CRLF}${CRLF}`);
-  pushStr(`${caption}${CRLF}`);
-
-  pushStr(`--${boundary}${CRLF}`);
-  pushStr(`Content-Disposition: form-data; name="parse_mode"${CRLF}${CRLF}`);
-  pushStr(`HTML${CRLF}`);
-
-  pushStr(`--${boundary}${CRLF}`);
-  pushStr(
-    `Content-Disposition: form-data; name="document"; filename="${filename}"${CRLF}`
-  );
-  pushStr(`Content-Type: text/yaml; charset=utf-8${CRLF}${CRLF}`);
-  chunks.push(encoder.encode(content));
-  pushStr(`${CRLF}`);
-
-  pushStr(`--${boundary}--${CRLF}`);
-
-  let totalLen = 0;
-  for (const c of chunks) totalLen += c.length;
-  const body = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const c of chunks) {
-    body.set(c, offset);
-    offset += c.length;
-  }
-
-  const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-    },
-    body,
-  });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(
-      `sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`
-    );
-  }
-}
-
-/**
- * Kirim YAML — pakai env.TELEGRAM_BOT_TOKEN untuk file attachment.
- */
-async function sendYamlMessage(
+async function sendSection(
   ctx: Context,
-  env: Env,
   label: string,
-  yaml: string
+  content: string
 ): Promise<void> {
-  // === FILE ATTACHMENT (threshold rendah, hampir semua YAML → file) ===
-  if (yaml.length > FILE_THRESHOLD) {
-    try {
-      const filename = `qimochi-${Date.now()}.yaml`;
-      const caption =
-        `📋 <b>${escapeHtml(label)}</b>\n\n` +
-        `<i>${yaml.length.toLocaleString()} char — dikirim sebagai file.</i>`;
-
-      await sendDocumentViaApi(
-        env.TELEGRAM_BOT_TOKEN,
-        ctx.chat!.id,
-        filename,
-        yaml,
-        caption
-      );
-
-      console.log(`[DBA] file attachment sent (${yaml.length} char)`);
-      return;
-    } catch (err: any) {
-      console.error(`[DBA] sendDocument failed: ${err?.message ?? err}`);
-      // Fallback text
-    }
-  }
-
-  // === TEXT SPLIT (fallback untuk YAML kecil atau kalau file gagal) ===
-  const parts = splitMessage(yaml, MSG_LIMIT);
+  const parts = splitInline(content, MSG_LIMIT);
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i] ?? '';
@@ -329,13 +239,13 @@ async function sendYamlMessage(
       });
     } catch (err: any) {
       console.error(
-        `[DBA] sendMessage part ${i + 1}/${parts.length} failed: ${err?.message ?? err}`
+        `[DBA] sendSection part ${i + 1}/${parts.length} failed: ${err?.message ?? err}`
       );
       throw err;
     }
 
     if (i < parts.length - 1) {
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 400));
     }
   }
 }
@@ -349,7 +259,6 @@ function buildKeyboard(sessionId: string): InlineKeyboard {
     .text('🔗 Franchises', `qd:f:${sessionId}`)
     .row()
     .text('📝 Summary', `qd:s:${sessionId}`)
-    .text('📦 All', `qd:a:${sessionId}`)
     .row()
     .text('❌ Batal', `qd:x:${sessionId}`);
 }
@@ -385,57 +294,11 @@ function safeFetch<T>(
   ]);
 }
 
-/* ============================================================
-   COMMENT HEADERS
-   ============================================================ */
-
-function headerMetadata(title: string): string {
-  return (
-    `# ============================================\n` +
-    `# QimochiDB — Metadata Frontmatter\n` +
-    `# Title: ${title}\n` +
-    `# Copy-paste ke bagian atas file .md\n` +
-    `# ============================================\n`
-  );
-}
-
-function headerCharacters(title: string): string {
-  return (
-    `# ============================================\n` +
-    `# QimochiDB — Characters\n` +
-    `# Title: ${title}\n` +
-    `# Ganti "characters: []" di frontmatter dengan ini\n` +
-    `# ============================================\n`
-  );
-}
-
-function headerEpisodes(title: string): string {
-  return (
-    `# ============================================\n` +
-    `# QimochiDB — Episode List\n` +
-    `# Title: ${title}\n` +
-    `# Ganti "episodeList: []" di frontmatter dengan ini\n` +
-    `# ============================================\n`
-  );
-}
-
-function headerFranchises(title: string): string {
-  return (
-    `# ============================================\n` +
-    `# QimochiDB — Franchises\n` +
-    `# Title: ${title}\n` +
-    `# Ganti "franchises: []" di frontmatter dengan ini\n` +
-    `# ============================================\n`
-  );
-}
-
-function headerSummary(title: string): string {
-  return (
-    `# ============================================\n` +
-    `# QimochiDB — Body (Sinopsis)\n` +
-    `# Title: ${title}\n` +
-    `# Copy-paste di bawah frontmatter (setelah "---")\n` +
-    `# ============================================\n`
+function fallbackJson(errors: string[]): string {
+  return JSON.stringify(
+    { error: true, message: 'Semua sumber gagal', errors },
+    null,
+    2
   );
 }
 
@@ -476,17 +339,6 @@ async function rewriteSynopsis(
   }
 }
 
-function fallbackSection(section: string, errors: string[]): string {
-  const header =
-    `# ⚠️ Semua sumber gagal.\n` +
-    errors.map((e) => `# - ${e}`).join('\n') +
-    `\n# Isi manual di bawah.\n`;
-  if (section === 'characters') return `${header}characters: []`;
-  if (section === 'episodes') return `${header}episodeList: []`;
-  if (section === 'franchises') return `${header}franchises: []`;
-  return header;
-}
-
 /* ============================================================
    COMMAND HANDLER
    ============================================================ */
@@ -496,7 +348,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
 
   if (!query) {
     await ctx.reply(
-      '<b>📚 Database Anime (QimochiDB)</b>\n\n' +
+      '<b>📚 Database Anime (Yukionime)</b>\n\n' +
         '<b>Contoh:</b>\n' +
         '<code>/dba nama anime</code>\n\n' +
         '<i>Bot akan cari data, lalu tampil tombol untuk pilih section.</i>',
@@ -576,7 +428,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
 
 export const databaseAnimeCommand: CommandDefinition = {
   name: 'database-anime',
-  description: 'Generate YAML untuk QimochiDB',
+  description: 'Generate data untuk Yukionime',
   usage: '/dba <judul>',
   adminOnly: true,
   handler: handleCommand,
@@ -603,7 +455,7 @@ function buildChainContext(session: SessionRow): ChainContext {
 }
 
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
-  bot.callbackQuery(/^qd:([mcefsax]):(q_[a-f0-9]+)$/, async (ctx) => {
+  bot.callbackQuery(/^qd:([mcefsx]):(q_[a-f0-9]+)$/, async (ctx) => {
     const match = ctx.match as RegExpMatchArray;
     const action = match[1];
     const sessionId = match[2];
@@ -671,85 +523,129 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           malId: result.malId ?? session.mal_id,
           kitsuId: result.kitsuId ?? session.kitsu_id,
         });
-        const header = headerMetadata(session.title);
-        await sendYamlMessage(
-          ctx,
-          env,
-          `Metadata — ${session.title}`,
-          header + yaml
-        );
+        await sendSection(ctx, `Metadata — ${session.title}`, yaml);
         return;
       }
 
-      /* ---------- CHARACTERS ---------- */
+      /* ---------- CHARACTERS (+ VA) ---------- */
       if (action === 'c') {
-        const { data: chars, error } = await safeFetch(
+        const { data: result, error } = await safeFetch(
           () => chainCharacters(chainCtx),
           25000
         );
 
-        let yaml: string;
-        let label: string;
-
-        if (!chars || !chars.data || chars.data.length === 0) {
-          const errs = chars?.errors ?? [error ?? 'unknown'];
-          yaml = fallbackSection('characters', errs);
-          label = `Characters — ${session.title} [FAILED]`;
-        } else {
-          yaml = buildCharactersYaml(chars.data);
-          label = `Characters — ${session.title} [${chars.source}]`;
+        if (!result || !result.data || result.data.length === 0) {
+          const errs = result?.errors ?? [error ?? 'unknown'];
+          await sendSection(
+            ctx,
+            `Characters — ${session.title} [FAILED]`,
+            fallbackJson(errs)
+          );
+          return;
         }
 
-        const header = headerCharacters(session.title);
-        await sendYamlMessage(ctx, env, label, header + yaml);
+        const chars = result.data;
+        const vas = result.voiceActors;
+        const source = result.source;
+        const chunks = chunkArray(chars, CHUNK_SIZE);
+
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i]!;
+          const range = chunkRangeLabel(i, CHUNK_SIZE, chars.length);
+          const json = buildCharactersJson(chunk);
+
+          await sendSection(
+            ctx,
+            `Characters ${range} — ${session.title} [${source}] [${i + 1}/${chunks.length}]`,
+            json
+          );
+
+          if (i < chunks.length - 1) {
+            await new Promise((r) => setTimeout(r, 400));
+          }
+        }
+
+        if (vas.length > 0) {
+          const vaJson = buildVoiceActorsJson(vas);
+          await sendSection(
+            ctx,
+            `Voice Actors (${vas.length}) — ${session.title} [append ke voice-actors.json]`,
+            vaJson
+          );
+        } else {
+          await ctx.reply(
+            'ℹ️ <i>Tidak ada data voice actor dari sumber.</i>',
+            { parse_mode: 'HTML' }
+          );
+        }
+
         return;
       }
 
       /* ---------- EPISODES ---------- */
       if (action === 'e') {
-        const { data: eps, error } = await safeFetch(
+        const { data: result, error } = await safeFetch(
           () => chainEpisodes(chainCtx),
           30000
         );
 
-        let yaml: string;
-        let label: string;
-
-        if (!eps || !eps.data || eps.data.length === 0) {
-          const errs = eps?.errors ?? [error ?? 'unknown'];
-          yaml = fallbackSection('episodes', errs);
-          label = `Episodes — ${session.title} [FAILED]`;
-        } else {
-          yaml = buildEpisodesYaml(eps.data);
-          label = `Episodes — ${session.title} [${eps.source}]`;
+        if (!result || !result.data || result.data.length === 0) {
+          const errs = result?.errors ?? [error ?? 'unknown'];
+          await sendSection(
+            ctx,
+            `Episodes — ${session.title} [FAILED]`,
+            fallbackJson(errs)
+          );
+          return;
         }
 
-        const header = headerEpisodes(session.title);
-        await sendYamlMessage(ctx, env, label, header + yaml);
+        const eps = result.data;
+        const chunks = chunkArray(eps, CHUNK_SIZE);
+
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i]!;
+          const range = chunkRangeLabel(i, CHUNK_SIZE, eps.length);
+          const json = buildEpisodesJson(chunk);
+          const truncated = result.truncated && i === chunks.length - 1;
+          const truncNote = truncated ? ' [⚠️ truncated]' : '';
+
+          await sendSection(
+            ctx,
+            `Episodes ${range} — ${session.title} [${result.source}]${truncNote} [${i + 1}/${chunks.length}]`,
+            json
+          );
+
+          if (i < chunks.length - 1) {
+            await new Promise((r) => setTimeout(r, 400));
+          }
+        }
+
         return;
       }
 
       /* ---------- FRANCHISES ---------- */
       if (action === 'f') {
-        const { data: rels, error } = await safeFetch(
+        const { data: result, error } = await safeFetch(
           () => chainRelations(chainCtx),
           25000
         );
 
-        let yaml: string;
-        let label: string;
-
-        if (!rels || !rels.data || rels.data.length === 0) {
-          const errs = rels?.errors ?? [error ?? 'unknown'];
-          yaml = fallbackSection('franchises', errs);
-          label = `Franchises — ${session.title} [FAILED]`;
-        } else {
-          yaml = buildFranchisesYaml(rels.data);
-          label = `Franchises — ${session.title} [${rels.source}]`;
+        if (!result || !result.data || result.data.length === 0) {
+          const errs = result?.errors ?? [error ?? 'unknown'];
+          await sendSection(
+            ctx,
+            `Franchises — ${session.title} [FAILED]`,
+            fallbackJson(errs)
+          );
+          return;
         }
 
-        const header = headerFranchises(session.title);
-        await sendYamlMessage(ctx, env, label, header + yaml);
+        const json = buildFranchisesJson(result.data);
+        await sendSection(
+          ctx,
+          `Franchises — ${session.title} [${result.source}]`,
+          json
+        );
         return;
       }
 
@@ -772,104 +668,11 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           AI_TIMEOUT_MS
         );
 
-        let body: string;
-        if (ai) {
-          body =
-            '<!--\n' +
-            '  ⚠️ Sinopsis ini di-generate AI. Tinjau ulang sebelum commit.\n' +
-            '  Kalau tidak sesuai, edit manual.\n' +
-            '-->\n\n' +
-            ai;
-        } else {
-          body =
-            '<!--\n' +
-            '  ⚠️ AI gagal generate sinopsis. Tulis manual di sini.\n' +
-            '-->\n\n' +
-            (raw || 'Tulis sinopsis manual...');
-        }
+        const body = ai
+          ? ai
+          : raw || 'Tulis sinopsis manual...';
 
-        const header = headerSummary(session.title);
-        await sendYamlMessage(
-          ctx,
-          env,
-          `Summary — ${session.title}`,
-          header + body
-        );
-        return;
-      }
-
-      /* ---------- ALL ---------- */
-      if (action === 'a') {
-        let searchResult;
-        try {
-          searchResult = await chainSearch(session.title);
-        } catch (err: any) {
-          await ctx.reply(
-            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
-            { parse_mode: 'HTML' }
-          );
-          return;
-        }
-
-        await ctx.reply('⏳ All (1/5): Metadata...');
-        const metaYaml = buildMetadataYaml({
-          media: searchResult.media,
-          malId: searchResult.malId ?? session.mal_id,
-          kitsuId: searchResult.kitsuId ?? session.kitsu_id,
-        });
-
-        await ctx.reply('⏳ All (2/5): Characters...');
-        const charsRes = await safeFetch(() => chainCharacters(chainCtx), 25000);
-        const charsYaml =
-          charsRes.data?.data && charsRes.data.data.length > 0
-            ? buildCharactersYaml(charsRes.data.data)
-            : fallbackSection(
-                'characters',
-                charsRes.data?.errors ?? [charsRes.error ?? 'unknown']
-              );
-
-        await ctx.reply('⏳ All (3/5): Episodes...');
-        const epsRes = await safeFetch(() => chainEpisodes(chainCtx), 30000);
-        const epsYaml =
-          epsRes.data?.data && epsRes.data.data.length > 0
-            ? buildEpisodesYaml(epsRes.data.data)
-            : fallbackSection(
-                'episodes',
-                epsRes.data?.errors ?? [epsRes.error ?? 'unknown']
-              );
-
-        await ctx.reply('⏳ All (4/5): Franchises...');
-        const relsRes = await safeFetch(() => chainRelations(chainCtx), 25000);
-        const relsYaml =
-          relsRes.data?.data && relsRes.data.data.length > 0
-            ? buildFranchisesYaml(relsRes.data.data)
-            : fallbackSection(
-                'franchises',
-                relsRes.data?.errors ?? [relsRes.error ?? 'unknown']
-              );
-
-        await ctx.reply('⏳ All (5/5): Summary...');
-        const raw = getSynopsisRaw(searchResult.media);
-        const aiRes = await safeFetch(
-          () => rewriteSynopsis(env, session.title, raw),
-          AI_TIMEOUT_MS
-        );
-        const summary =
-          '<!--\n' +
-          '  ⚠️ Sinopsis di-generate AI. Tinjau ulang sebelum commit.\n' +
-          '-->\n\n' +
-          (aiRes.data || raw || 'Tulis sinopsis manual...');
-
-        const full = buildAllMarkdown({
-          metadata: headerMetadata(session.title) + metaYaml,
-          characters: headerCharacters(session.title) + charsYaml,
-          episodes: headerEpisodes(session.title) + epsYaml,
-          franchises: headerFranchises(session.title) + relsYaml,
-          summary: headerSummary(session.title) + summary,
-        });
-
-        await sendYamlMessage(ctx, env, `All — ${session.title}`, full);
-        await deleteSession(env.DB, sessionId);
+        await sendSection(ctx, `Summary — ${session.title}`, body);
         return;
       }
     } catch (err: any) {
