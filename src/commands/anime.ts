@@ -1,39 +1,24 @@
+// src/commands/anime.ts
 import type { CommandDefinition } from './registry';
 import type { Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../types/anime';
-import { searchJikan, jikanToAniList } from '../services/jikan';
-import { searchKitsu, kitsuToAniList } from '../services/kitsu';
-import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
-import { getCache, setCache } from '../lib/cache';
-import { chatAI } from '../services/ai';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import { getCache, setCache } from '../lib/cache';
+import {
+  searchAnime,
+  detectMissing,
+  enrichWithAITimeout,
+  buildQimochiHubResult,
+  pickTitle,
+  isValidHttpUrl,
+  stripHtml,
+  type Enriched,
+} from '../services/anime-core';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const AI_TIMEOUT_MS = 3000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
-
-type AnimeStatus = 'Ongoing' | 'Completed' | 'Hiatus';
-type AnimeType = 'TV' | 'Movie' | 'OVA' | 'ONA' | 'Special';
-
-const FORMAT_MAP: Record<string, AnimeType> = {
-  TV: 'TV',
-  TV_SHORT: 'TV',
-  MOVIE: 'Movie',
-  SPECIAL: 'Special',
-  OVA: 'OVA',
-  ONA: 'ONA',
-  MUSIC: 'Special',
-};
-
-const STATUS_MAP: Record<string, AnimeStatus> = {
-  FINISHED: 'Completed',
-  RELEASING: 'Ongoing',
-  NOT_YET_RELEASED: 'Ongoing',
-  CANCELLED: 'Hiatus',
-  HIATUS: 'Hiatus',
-};
 
 /* ═══════════════════════════════════════════════
    DB: TEMP SESSIONS
@@ -175,367 +160,6 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function pickTitle(media: AniListMedia): string {
-  return (
-    media.title.romaji ||
-    media.title.english ||
-    media.title.native ||
-    'Unknown'
-  );
-}
-
-function yamlString(s: string): string {
-  const cleaned = s.replace(/\n/g, ' ').trim();
-  const needsQuote = /[:#&*!|>'"%@`{}\[\],]/.test(cleaned);
-  if (!needsQuote) return cleaned;
-  return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-}
-
-function isValidHttpUrl(s: string): boolean {
-  try {
-    const u = new URL(s);
-    return u.protocol === 'http:' || u.protocol === 'https:';
-  } catch {
-    return false;
-  }
-}
-
-function stripHtml(s: string): string {
-  return s
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#0?39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function pick<T>(...values: (T | null | undefined)[]): T | null {
-  for (const v of values) {
-    if (v === null || v === undefined) continue;
-    if (typeof v === 'string' && v.trim() === '') continue;
-    if (Array.isArray(v) && v.length === 0) continue;
-    return v;
-  }
-  return null;
-}
-
-function normalizeStudioName(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) return trimmed;
-
-  const lower = trimmed.toLowerCase();
-
-  const knownKeep = [
-    'studio',
-    'animation',
-    'production',
-    'pictures',
-    'works',
-    'toei',
-    'mappa',
-    'ufotable',
-    'bones',
-    'wit ',
-    'kyoto',
-    'ghibli',
-    'gibli',
-    'shaft',
-    'trigger',
-    'sunrise',
-    'gainax',
-    'madhouse',
-    'a-1',
-    'pierrot',
-    'j.c.staff',
-    'jc staff',
-    'cloverworks',
-  ];
-
-  if (knownKeep.some((k) => lower.includes(k))) {
-    return trimmed;
-  }
-
-  return `Studio ${trimmed}`;
-}
-
-/* ═══════════════════════════════════════════════
-   AI ENRICHMENT
-   ═══════════════════════════════════════════════ */
-
-interface Enriched {
-  studio?: string | null;
-  rating?: number | null;
-  synopsis?: string | null;
-  genre?: string[] | null;
-  releaseDate?: string | null;
-}
-
-function extractJson(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced?.[1] ?? text;
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(candidate.slice(start, end + 1));
-  } catch {
-    return null;
-  }
-}
-
-async function enrichWithAI(
-  env: Env,
-  title: string,
-  existing: {
-    studio?: string | null;
-    rating?: number | null;
-    genre?: string[] | null;
-    releaseDate?: string | null;
-  },
-  need: string[]
-): Promise<Enriched | null> {
-  if (need.length === 0) return null;
-
-  const known: string[] = [];
-  if (existing.studio) known.push(`studio: ${existing.studio}`);
-  if (existing.rating) known.push(`rating: ${existing.rating}`);
-  if (existing.genre?.length) known.push(`genre: ${existing.genre.join(', ')}`);
-  if (existing.releaseDate) known.push(`releaseDate: ${existing.releaseDate}`);
-
-  const prompt =
-    `You are a FACTUAL anime database expert. Return STRICT JSON only.\n` +
-    `CRITICAL: If you don't know a fact with HIGH CONFIDENCE, return null for that field. NEVER GUESS or HALLUCINATE.\n\n` +
-    `Anime title: ${title}\n\n` +
-    (known.length > 0
-      ? `Known data (DO NOT change these):\n${known.join('\n')}\n\n`
-      : '') +
-    `Fill in ONLY these missing fields: ${need.join(', ')}\n\n` +
-    `Output JSON format:\n` +
-    `{\n` +
-    `  "studio": "exact animation studio name or null",\n` +
-    `  "rating": 7.5,\n` +
-    `  "genre": ["Action", "Adventure"],\n` +
-    `  "releaseDate": "YYYY-MM-DD",\n` +
-    `  "synopsis": "factual Indonesian synopsis, no spoilers"\n` +
-    `}\n\n` +
-    `STRICT RULES:\n` +
-    `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
-    `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
-    `- studio: full official name with "Studio" prefix if applicable (e.g., "Studio Pierrot", "MAPPA")\n` +
-    `- synopsis: factual summary in Indonesian, NOT creative writing\n` +
-    `- Output valid JSON only, no markdown, no explanation`;
-
-  console.log(
-    `[Anime] AI enrich — need: [${need.join(', ')}], prompt len: ${prompt.length}`
-  );
-
-  try {
-    const raw = await chatAI(
-      env,
-      [{ role: 'user', content: prompt }],
-      { maxTokens: 900, temperature: 0.1, smart: true }
-    );
-
-    console.log(`[Anime] AI raw response len: ${raw?.length ?? 0}`);
-
-    if (!raw || raw.length === 0) {
-      console.warn('[Anime] AI returned empty — STOP (no retry)');
-      return null;
-    }
-
-    const parsed = extractJson(raw);
-    if (!parsed || typeof parsed !== 'object') {
-      console.warn('[Anime] AI parse failed — STOP (no retry)');
-      return null;
-    }
-
-    console.log('[Anime] AI parsed:', JSON.stringify(parsed).slice(0, 300));
-
-    const obj = parsed as Record<string, unknown>;
-    const out: Enriched = {};
-
-    if (typeof obj.studio === 'string') out.studio = obj.studio;
-    if (typeof obj.rating === 'number') out.rating = obj.rating;
-    if (Array.isArray(obj.genre)) {
-      out.genre = obj.genre.filter((g): g is string => typeof g === 'string');
-    }
-    if (typeof obj.releaseDate === 'string') out.releaseDate = obj.releaseDate;
-    if (typeof obj.synopsis === 'string') out.synopsis = obj.synopsis;
-
-    return out;
-  } catch (err) {
-    console.error('[Anime] AI enrich failed — STOP (no retry):', err);
-    return null;
-  }
-}
-
-async function enrichWithAITimeout(
-  env: Env,
-  title: string,
-  existing: {
-    studio?: string | null;
-    rating?: number | null;
-    genre?: string[] | null;
-    releaseDate?: string | null;
-  },
-  need: string[]
-): Promise<Enriched | null> {
-  if (need.length === 0) return null;
-
-  console.log('[Anime] AI enrich starting (single attempt)...');
-
-  return Promise.race([
-    enrichWithAI(env, title, existing, need),
-    new Promise<Enriched | null>((resolve) => {
-      setTimeout(() => {
-        console.warn(`[Anime] AI timeout after ${AI_TIMEOUT_MS}ms — STOP`);
-        resolve(null);
-      }, AI_TIMEOUT_MS);
-    }),
-  ]).then((result) => {
-    console.log(
-      '[Anime] AI enrich result:',
-      result ? 'got data' : 'null (fail, no retry)'
-    );
-    return result;
-  });
-}
-
-/* ═══════════════════════════════════════════════
-   BUILD YAML + BODY
-   ═══════════════════════════════════════════════ */
-
-interface BuildResult {
-  yaml: string;
-  body: string;
-  missing: string[];
-  aiUsed: string[];
-}
-
-function buildResult(
-  media: AniListMedia,
-  enriched: Enriched | null
-): BuildResult {
-  const missing: string[] = [];
-  const aiUsed: string[] = [];
-
-  const title = pickTitle(media);
-  if (!title || title === 'Unknown') missing.push('title');
-
-  let cover = media.coverImage.extraLarge || media.coverImage.large || '';
-  if (!cover || !isValidHttpUrl(cover)) {
-    cover = 'https://placehold.co/400x600?text=No+Cover';
-    missing.push('cover');
-  }
-
-  let status: AnimeStatus = 'Ongoing';
-  const mappedStatus = STATUS_MAP[media.status];
-  if (mappedStatus) status = mappedStatus;
-  else missing.push('status');
-
-  let type: AnimeType = 'TV';
-  const mappedType = FORMAT_MAP[media.format];
-  if (mappedType) type = mappedType;
-  else missing.push('type');
-
-  let genres = (media.genres ?? []).filter((g) => g && g.trim());
-  if (genres.length === 0 && enriched?.genre?.length) {
-    genres = enriched.genre;
-    aiUsed.push('genre');
-  }
-  if (genres.length === 0) {
-    genres = ['Unknown'];
-    missing.push('genre');
-  }
-  const genreYaml = `[${genres.map((g) => yamlString(g)).join(', ')}]`;
-
-  let studio = media.studios?.nodes?.[0]?.name ?? '';
-  if (!studio || studio === 'Unknown') {
-    if (enriched?.studio) {
-      studio = normalizeStudioName(enriched.studio);
-      aiUsed.push('studio');
-    } else {
-      studio = 'Unknown';
-      missing.push('studio');
-    }
-  }
-
-  const y = media.startDate?.year ?? media.seasonYear;
-  const mo = media.startDate?.month;
-  const d = media.startDate?.day;
-  let releaseDate: string;
-
-  if (y && mo && d) {
-    releaseDate = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  } else if (
-    enriched?.releaseDate &&
-    /^\d{4}-\d{2}-\d{2}$/.test(enriched.releaseDate)
-  ) {
-    releaseDate = enriched.releaseDate;
-    aiUsed.push('releaseDate');
-  } else if (y) {
-    releaseDate = `${y}-01-01`;
-    missing.push('releaseDate (default 01-01)');
-  } else {
-    releaseDate = new Date().toISOString().split('T')[0] ?? '2020-01-01';
-    missing.push('releaseDate');
-  }
-
-  const addedAt = new Date().toISOString().split('T')[0] ?? '2026-01-01';
-
-  let rating: string;
-  if (typeof media.averageScore === 'number' && media.averageScore > 0) {
-    rating = (media.averageScore / 10).toFixed(1);
-  } else if (typeof enriched?.rating === 'number' && enriched.rating > 0) {
-    rating = enriched.rating.toFixed(1);
-    aiUsed.push('rating');
-  } else {
-    rating = '0.0';
-    missing.push('rating');
-  }
-
-  const lines: string[] = [];
-  lines.push('---');
-  lines.push(`title: ${yamlString(title)}`);
-  lines.push(`cover: ${cover}`);
-  lines.push(`status: ${status}`);
-  lines.push(`type: ${type}`);
-  lines.push(`genre: ${genreYaml}`);
-  lines.push(`studio: ${yamlString(studio)}`);
-  lines.push(`releaseDate: ${releaseDate}`);
-  lines.push(`addedAt: ${addedAt}`);
-  lines.push(`rating: ${rating}`);
-  lines.push('episodes: []');
-  lines.push('---');
-  const yaml = lines.join('\n');
-
-  let synopsisRaw = media.description ?? null;
-  if (synopsisRaw) synopsisRaw = stripHtml(synopsisRaw);
-
-  let synopsis = synopsisRaw;
-  const isTooShort = !synopsis || synopsis.length < 50;
-
-  if (isTooShort && enriched?.synopsis && enriched.synopsis.length > 50) {
-    synopsis = enriched.synopsis;
-    aiUsed.push('synopsis');
-  }
-
-  if (!synopsis || synopsis.length < 30) {
-    synopsis =
-      '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.\n\n' +
-      `${title} adalah anime yang...`;
-    missing.push('synopsis (body)');
-  }
-
-  return { yaml, body: synopsis, missing, aiUsed };
-}
-
 function buildInfoMessage(media: AniListMedia): string {
   const title = pickTitle(media);
   const year = media.startDate?.year ?? media.seasonYear ?? '-';
@@ -544,6 +168,25 @@ function buildInfoMessage(media: AniListMedia): string {
   const rating = media.averageScore
     ? (media.averageScore / 10).toFixed(1)
     : '-';
+
+  const FORMAT_MAP: Record<string, string> = {
+    TV: 'TV',
+    TV_SHORT: 'TV',
+    MOVIE: 'Movie',
+    SPECIAL: 'Special',
+    OVA: 'OVA',
+    ONA: 'ONA',
+    MUSIC: 'Special',
+  };
+
+  const STATUS_MAP: Record<string, string> = {
+    FINISHED: 'Completed',
+    RELEASING: 'Ongoing',
+    NOT_YET_RELEASED: 'Ongoing',
+    CANCELLED: 'Hiatus',
+    HIATUS: 'Hiatus',
+  };
+
   const status = STATUS_MAP[media.status] ?? media.status;
   const type = FORMAT_MAP[media.format] ?? media.format;
 
@@ -569,190 +212,6 @@ function extractTitleFromMALUrl(url: string): string | null {
   const slug = m[1];
   if (!slug) return null;
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
-}
-
-/* ═══════════════════════════════════════════════
-   PARALLEL FETCH + MERGE
-   Chain: Jikan + Kitsu + Shikimori (tanpa AniList)
-   ═══════════════════════════════════════════════ */
-
-async function fetchAndMerge(query: string): Promise<{
-  media: AniListMedia;
-  sources: string[];
-} | null> {
-  const t0 = Date.now();
-
-  const [jikanR, kitsuR, shikimoriR] = await Promise.allSettled([
-    searchJikan(query),
-    searchKitsu(query),
-    searchShikimori(query),
-  ]);
-
-  const logStatus = (
-    name: string,
-    r: PromiseSettledResult<unknown>
-  ): boolean => {
-    if (r.status === 'fulfilled') {
-      const hasData = r.value !== null && r.value !== undefined;
-      console.log(`[Anime] ${name}: ${hasData ? 'OK' : 'empty result'}`);
-      return hasData;
-    }
-    const err = r.reason;
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[Anime] ${name}: FAILED — ${msg}`);
-    return false;
-  };
-
-  const hasJikan = logStatus('Jikan', jikanR);
-  const hasKitsu = logStatus('Kitsu', kitsuR);
-  const hasShikimori = logStatus('Shikimori', shikimoriR);
-
-  const jikan = hasJikan
-    ? jikanToAniList((jikanR as PromiseFulfilledResult<any>).value)
-    : null;
-  const kitsu = hasKitsu
-    ? kitsuToAniList((kitsuR as PromiseFulfilledResult<any>).value)
-    : null;
-  const shikimori = hasShikimori
-    ? shikimoriToAniList((shikimoriR as PromiseFulfilledResult<any>).value)
-    : null;
-
-  const sources: string[] = [];
-  if (jikan) sources.push('Jikan (MAL)');
-  if (kitsu) sources.push('Kitsu');
-  if (shikimori) sources.push('Shikimori');
-
-  console.log(
-    `[Anime] parallel fetch done in ${Date.now() - t0}ms — sources: [${
-      sources.join(', ') || 'none'
-    }]`
-  );
-
-  if (sources.length === 0) return null;
-
-  const studioLog = [
-    `Jikan=${jikan?.studios?.nodes?.[0]?.name ?? '-'}`,
-    `Kitsu=${kitsu?.studios?.nodes?.[0]?.name ?? '-'}`,
-    `Shikimori=${shikimori?.studios?.nodes?.[0]?.name ?? '-'}`,
-  ].join(' | ');
-  console.log(`[Anime] studio per source: ${studioLog}`);
-
-  const merged: AniListMedia = {
-    id: jikan?.id ?? kitsu?.id ?? shikimori?.id ?? 0,
-
-    title: {
-      romaji:
-        pick(
-          jikan?.title.romaji,
-          kitsu?.title.romaji,
-          shikimori?.title.romaji
-        ) ?? 'Unknown',
-      english: pick(
-        jikan?.title.english,
-        kitsu?.title.english,
-        shikimori?.title.english
-      ),
-      native: pick(
-        jikan?.title.native,
-        kitsu?.title.native,
-        shikimori?.title.native
-      ),
-    },
-
-    coverImage: {
-      extraLarge:
-        pick(
-          kitsu?.coverImage.extraLarge,
-          jikan?.coverImage.extraLarge,
-          shikimori?.coverImage.extraLarge
-        ) ?? '',
-      large:
-        pick(
-          kitsu?.coverImage.large,
-          jikan?.coverImage.large,
-          shikimori?.coverImage.large
-        ) ?? '',
-    },
-
-    description: pick(jikan?.description, kitsu?.description),
-
-    format: pick(jikan?.format, kitsu?.format, shikimori?.format) ?? 'TV',
-
-    status:
-      pick(jikan?.status, kitsu?.status, shikimori?.status) ?? 'RELEASING',
-
-    seasonYear: pick(
-      jikan?.seasonYear,
-      kitsu?.seasonYear,
-      shikimori?.seasonYear
-    ),
-
-    episodes: pick(jikan?.episodes, kitsu?.episodes, shikimori?.episodes),
-
-    genres: pick(jikan?.genres, shikimori?.genres, kitsu?.genres) ?? [],
-
-    averageScore: pick(
-      jikan?.averageScore,
-      shikimori?.averageScore,
-      kitsu?.averageScore
-    ),
-
-    studios: {
-      nodes:
-        pick(
-          jikan?.studios.nodes,
-          shikimori?.studios.nodes,
-          kitsu?.studios.nodes
-        ) ?? [],
-    },
-
-    startDate: {
-      year: pick(
-        jikan?.startDate.year,
-        kitsu?.startDate.year,
-        shikimori?.startDate.year
-      ),
-      month: pick(
-        jikan?.startDate.month,
-        kitsu?.startDate.month,
-        shikimori?.startDate.month
-      ),
-      day: pick(
-        jikan?.startDate.day,
-        kitsu?.startDate.day,
-        shikimori?.startDate.day
-      ),
-    },
-  };
-
-  return { media: merged, sources };
-}
-
-/* ═══════════════════════════════════════════════
-   DETECT MISSING
-   ═══════════════════════════════════════════════ */
-
-function detectMissing(media: AniListMedia): string[] {
-  const need: string[] = [];
-
-  const studio = media.studios?.nodes?.[0]?.name;
-  if (!studio || studio === 'Unknown') need.push('studio');
-
-  if (typeof media.averageScore !== 'number' || media.averageScore <= 0) {
-    need.push('rating');
-  }
-
-  if (!media.genres || media.genres.length === 0) need.push('genre');
-
-  if (!media.startDate?.year && !media.seasonYear) need.push('releaseDate');
-
-  const desc = media.description ?? '';
-  const cleanDesc = stripHtml(desc);
-  if (!cleanDesc || cleanDesc.length < 50) {
-    need.push('synopsis');
-  }
-
-  return need;
 }
 
 /* ═══════════════════════════════════════════════
@@ -804,10 +263,10 @@ export const animeCommand: CommandDefinition = {
         sourceLabel = '⚡ Dari cache';
         console.log(`[Anime] cache hit at ${Date.now() - T0}ms`);
       } else {
-        const result = await fetchAndMerge(searchQuery);
-        if (result) {
+        try {
+          const result = await searchAnime(searchQuery);
           media = result.media;
-          sourceLabel = `📡 Sumber: ${result.sources.join(' + ')}`;
+          sourceLabel = `📡 Sumber: ${result.source}`;
 
           const hasStudio =
             media.studios?.nodes?.[0]?.name &&
@@ -819,6 +278,8 @@ export const animeCommand: CommandDefinition = {
           } else {
             console.log('[Anime] NOT cached (studio missing)');
           }
+        } catch (err) {
+          console.warn('[Anime] search failed:', err);
         }
         console.log(`[Anime] fetch stage done at ${Date.now() - T0}ms`);
       }
@@ -899,15 +360,17 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
-      const { yaml, body, missing, aiUsed } = buildResult(media, enriched);
+      const { yaml, body, missing, aiUsed } = buildQimochiHubResult(
+        media,
+        enriched
+      );
 
       const sessionId = await saveSession(env.DB, ctx.from!.id, {
         yaml,
         body,
         missing,
         aiUsed,
-        cover:
-          media.coverImage.extraLarge || media.coverImage.large || null,
+        cover: media.coverImage.extraLarge || media.coverImage.large || null,
         sourceLabel: sourceLabel || null,
       });
 
@@ -940,9 +403,9 @@ export const animeCommand: CommandDefinition = {
           { parse_mode: 'HTML' }
         );
       } catch {
-        await ctx.reply(
-          `❌ Gagal: ${escapeHtml(err?.message ?? 'unknown')}`
-        ).catch(() => {});
+        await ctx
+          .reply(`❌ Gagal: ${escapeHtml(err?.message ?? 'unknown')}`)
+          .catch(() => {});
       }
     }
   },
