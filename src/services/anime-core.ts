@@ -40,6 +40,14 @@ export interface Enriched {
   releaseDate?: string | null;
 }
 
+export interface ExistingData {
+  studio?: string | null;
+  rating?: number | null;
+  genre?: string[] | null;
+  releaseDate?: string | null;
+  originalSynopsis?: string | null;
+}
+
 export interface BuildResult {
   yaml: string;
   body: string;
@@ -98,6 +106,14 @@ export function stripHtml(s: string): string {
     .replace(/&#0?39;/g, "'")
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Deteksi apakah string mengandung karakter Cyrillic (Rusia).
+ * Shikimori API sering return description dalam bahasa Rusia.
+ */
+export function hasCyrillic(s: string): boolean {
+  return /[\u0400-\u04FF\u0500-\u052F]/.test(s);
 }
 
 export function pick<T>(...values: (T | null | undefined)[]): T | null {
@@ -185,7 +201,15 @@ export function detectMissing(media: AniListMedia): string[] {
 
   const desc = media.description ?? '';
   const cleanDesc = stripHtml(desc);
-  if (!cleanDesc || cleanDesc.length < 50) {
+
+  // Flag synopsis kalau:
+  // - kosong / terlalu pendek
+  // - mengandung Cyrillic (Russian) → perlu rewrite ke Indonesia
+  if (
+    !cleanDesc ||
+    cleanDesc.length < 50 ||
+    hasCyrillic(cleanDesc)
+  ) {
     need.push('synopsis');
   }
 
@@ -212,12 +236,7 @@ function extractJson(text: string): unknown {
 async function enrichWithAI(
   env: Env,
   title: string,
-  existing: {
-    studio?: string | null;
-    rating?: number | null;
-    genre?: string[] | null;
-    releaseDate?: string | null;
-  },
+  existing: ExistingData,
   need: string[]
 ): Promise<Enriched | null> {
   if (need.length === 0) return null;
@@ -228,6 +247,11 @@ async function enrichWithAI(
   if (existing.genre?.length) known.push(`genre: ${existing.genre.join(', ')}`);
   if (existing.releaseDate) known.push(`releaseDate: ${existing.releaseDate}`);
 
+  // Blok original synopsis — dipakai AI untuk rewrite (bisa Russian/English/Japanese)
+  const originalBlock = existing.originalSynopsis
+    ? `\nOriginal synopsis (may be in English, Russian, or Japanese — REWRITE it into Indonesian):\n"""\n${existing.originalSynopsis.slice(0, 2000)}\n"""\n\n`
+    : '';
+
   const prompt =
     `You are a FACTUAL anime database expert. Return STRICT JSON only.\n` +
     `CRITICAL: If you don't know a fact with HIGH CONFIDENCE, return null for that field. NEVER GUESS or HALLUCINATE.\n\n` +
@@ -235,6 +259,7 @@ async function enrichWithAI(
     (known.length > 0
       ? `Known data (DO NOT change these):\n${known.join('\n')}\n\n`
       : '') +
+    originalBlock +
     `Fill in ONLY these missing fields: ${need.join(', ')}\n\n` +
     `Output JSON format:\n` +
     `{\n` +
@@ -248,7 +273,7 @@ async function enrichWithAI(
     `- If NOT 100% sure about a field, use null. Hallucination is WORSE than null.\n` +
     `- rating: actual MAL/AniList score (0-10, one decimal)\n` +
     `- studio: full official name with "Studio" prefix if applicable (e.g., "Studio Pierrot", "MAPPA")\n` +
-    `- synopsis: factual summary in Indonesian, NOT creative writing\n` +
+    `- synopsis: If original synopsis is provided above, REWRITE it into natural Indonesian (do NOT translate literally). If no original, write factual summary in Indonesian.\n` +
     `- Output valid JSON only, no markdown, no explanation`;
 
   console.log(
@@ -296,12 +321,7 @@ async function enrichWithAI(
 export async function enrichWithAITimeout(
   env: Env,
   title: string,
-  existing: {
-    studio?: string | null;
-    rating?: number | null;
-    genre?: string[] | null;
-    releaseDate?: string | null;
-  },
+  existing: ExistingData,
   need: string[]
 ): Promise<Enriched | null> {
   if (need.length === 0) return null;
@@ -425,13 +445,18 @@ export function buildQimochiHubResult(
 
   let synopsis = synopsisRaw;
   const isTooShort = !synopsis || synopsis.length < 50;
+  const isCyrillic = synopsis ? hasCyrillic(synopsis) : false;
 
-  if (isTooShort && enriched?.synopsis && enriched.synopsis.length > 50) {
+  if (
+    (isTooShort || isCyrillic) &&
+    enriched?.synopsis &&
+    enriched.synopsis.length > 50
+  ) {
     synopsis = enriched.synopsis;
     aiUsed.push('synopsis');
   }
 
-  if (!synopsis || synopsis.length < 30) {
+  if (!synopsis || synopsis.length < 30 || hasCyrillic(synopsis)) {
     synopsis =
       '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.\n\n' +
       `${title} adalah anime yang...`;
