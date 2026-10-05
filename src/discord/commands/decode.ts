@@ -1,3 +1,4 @@
+// src/discord/commands/decode.ts
 import type { Env } from '../../types/env';
 import type { DiscordInteraction } from '../handler';
 
@@ -7,6 +8,7 @@ const MAX_LAYERS = 5;
 const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
 const DISCORD_MSG_LIMIT = 1900;
+const JSON_INLINE_THRESHOLD = 1800;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -43,6 +45,10 @@ interface ResolvedEntry {
   resolution: string | null;
   server: string | null;
 }
+
+/* ============================================================
+   DECODE HELPERS (shared dengan Telegram logic)
+   ============================================================ */
 
 function normalizeBase64(input: string): string | null {
   let b64 = input.trim().replace(/\s+/g, '');
@@ -132,6 +138,57 @@ function resolutionRank(r: string | null): number {
   const n = parseInt(r.replace(/p$/i, ''), 10);
   return isNaN(n) ? -1 : n;
 }
+
+/* ============================================================
+   EPISODE NUMBER DETECTION
+   ============================================================ */
+
+function parseEpisodeNumber(
+  filename: string | null,
+  labels: (string | null)[]
+): number {
+  const RESOLUTIONS = new Set([
+    144, 240, 360, 480, 540, 720, 1080, 1440, 2160,
+  ]);
+
+  const isValid = (n: number): boolean =>
+    n > 0 && n < 10000 && !RESOLUTIONS.has(n);
+
+  // Pass 1: filename
+  if (filename) {
+    const m = filename.match(/\b(?:ep|eps|episode|e)\s*[-_.]?\s*0*(\d+)\b/i);
+    if (m && m[1]) {
+      const n = parseInt(m[1], 10);
+      if (isValid(n)) return n;
+    }
+  }
+
+  // Pass 2: label "Episode N"
+  for (const label of labels) {
+    if (!label) continue;
+    const m = label.match(/\b(?:episode|eps|ep)\s*0*(\d+)\b/i);
+    if (m && m[1]) {
+      const n = parseInt(m[1], 10);
+      if (isValid(n)) return n;
+    }
+  }
+
+  // Pass 3: label murni angka
+  for (const label of labels) {
+    if (!label) continue;
+    const m = label.trim().match(/^0*(\d+)$/);
+    if (m && m[1]) {
+      const n = parseInt(m[1], 10);
+      if (isValid(n)) return n;
+    }
+  }
+
+  return 1;
+}
+
+/* ============================================================
+   URL EXTRACTION
+   ============================================================ */
 
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
@@ -266,13 +323,20 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   const resolved = new Map<string, { resolution: string | null; server: string | null }>();
   const unresolved = new Map<string, { resolution: string | null; server: string | null }>();
 
-  function resolve(url: string, resolution: string | null, server: string | null, depth: number, seen: Set<string>): void {
+  function resolve(
+    url: string,
+    resolution: string | null,
+    server: string | null,
+    depth: number,
+    seen: Set<string>
+  ): void {
     if (depth > 4 || seen.has(url)) return;
     seen.add(url);
     const children = expandUrlParams(url).filter((u) => u !== url);
     if (isWrapper(url)) {
       if (children.length === 0) {
-        if (!resolved.has(url) && !unresolved.has(url)) unresolved.set(url, { resolution, server });
+        if (!resolved.has(url) && !unresolved.has(url))
+          unresolved.set(url, { resolution, server });
       } else {
         for (const c of children) resolve(c, resolution, server, depth + 1, seen);
       }
@@ -306,28 +370,41 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   return final;
 }
 
-function buildYaml(items: ResolvedEntry[]): string {
+/* ============================================================
+   BUILD OUTPUT — JSON
+   ============================================================ */
+
+function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
   const byQuality = new Map<string, { name: string; url: string }[]>();
+
   for (const item of items) {
     const q = item.resolution ?? 'Unknown';
     if (!byQuality.has(q)) byQuality.set(q, []);
-    byQuality.get(q)!.push({ name: item.server ?? 'unknown', url: item.url });
+    byQuality.get(q)!.push({
+      name: item.server ?? 'unknown',
+      url: item.url,
+    });
   }
-  const qualities = [...byQuality.keys()].sort((a, b) => resolutionRank(b) - resolutionRank(a));
 
-  const lines: string[] = [];
-  lines.push('episodes:');
-  lines.push('  - number: 1');
-  lines.push('    streams:');
-  for (const q of qualities) {
-    lines.push(`      - quality: "${q}"`);
-    lines.push('        servers:');
-    for (const s of byQuality.get(q)!) {
-      lines.push(`          - name: "${s.name}"`);
-      lines.push(`            url: "${s.url}"`);
-    }
-  }
-  return lines.join('\n');
+  const qualities = [...byQuality.keys()].sort(
+    (a, b) => resolutionRank(b) - resolutionRank(a)
+  );
+
+  const streams = qualities.map((q) => ({
+    quality: q,
+    servers: byQuality.get(q)!,
+  }));
+
+  const payload = {
+    episodes: [
+      {
+        number: episodeNumber,
+        streams,
+      },
+    ],
+  };
+
+  return JSON.stringify(payload, null, 2) + '\n';
 }
 
 function buildUrlList(items: ResolvedEntry[]): string {
@@ -369,6 +446,10 @@ function splitMessage(s: string, max: number): string[] {
   if (current) parts.push(current);
   return parts;
 }
+
+/* ============================================================
+   DISCORD API
+   ============================================================ */
 
 const DISCORD_API = 'https://discord.com/api/v10';
 
@@ -423,7 +504,7 @@ async function sendFollowupFile(
     `${payload}\r\n` +
     `--${boundary}\r\n` +
     `Content-Disposition: form-data; name="files[0]"; filename="${filename}"\r\n` +
-    `Content-Type: text/plain\r\n\r\n` +
+    `Content-Type: application/json\r\n\r\n` +
     `${content}\r\n` +
     `--${boundary}--\r\n`;
 
@@ -438,6 +519,10 @@ async function sendFollowupFile(
     console.error('[Discord/Decode] file upload failed:', res.status, err.slice(0, 200));
   }
 }
+
+/* ============================================================
+   PUBLIC HANDLERS
+   ============================================================ */
 
 export function handleDecode(
   interaction: DiscordInteraction,
@@ -461,6 +546,7 @@ async function processDecode(
   const inputOpt = interaction.data?.options?.find((o) => o.name === 'input');
 
   let text = '';
+  let sourceFilename: string | null = null;
 
   if (fileOpt) {
     const attachmentId = fileOpt.value as string;
@@ -485,7 +571,8 @@ async function processDecode(
       const res = await fetch(attachment.url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       text = await res.text();
-      console.log(`[Discord/Decode] downloaded ${text.length} chars`);
+      sourceFilename = attachment.filename;
+      console.log(`[Discord/Decode] downloaded ${text.length} chars from ${attachment.filename}`);
     } catch (err: any) {
       await editOriginal(appId, token, {
         content: `❌ Gagal download file: ${(err?.message ?? 'unknown').slice(0, 200)}`,
@@ -515,9 +602,10 @@ async function processDecode(
   const sourceType: 'base64' | 'html' = looksLikeHtml(text) ? 'html' : 'base64';
 
   try {
-    const entries = sourceType === 'html'
-      ? extractEntries(text)
-      : [{ base64: text, label: null }];
+    const entries =
+      sourceType === 'html'
+        ? extractEntries(text)
+        : [{ base64: text, label: null }];
 
     if (entries.length === 0) {
       await editOriginal(appId, token, {
@@ -539,6 +627,7 @@ async function processDecode(
       content: `✅ Ditemukan **${videos.length}** URL video. Mengirim hasil...`,
     });
 
+    // URL list (split kalau panjang)
     const urlList = buildUrlList(videos);
     const urlParts = splitMessage(urlList, DISCORD_MSG_LIMIT);
 
@@ -547,13 +636,36 @@ async function processDecode(
       await sendFollowup(appId, token, { content: header + urlParts[i] });
     }
 
-    const yaml = buildYaml(videos);
-    if (yaml.length <= 1700) {
+    // Detect episode number
+    const labels = entries.map((e) => e.label);
+    const episodeNumber = parseEpisodeNumber(sourceFilename, labels);
+
+    // Build JSON
+    const json = buildJson(videos, episodeNumber);
+
+    console.log(
+      `[Discord/Decode] episode number detected: ${episodeNumber} (json len: ${json.length})`
+    );
+
+    // Kecil → inline code block
+    if (json.length <= JSON_INLINE_THRESHOLD) {
       await sendFollowup(appId, token, {
-        content: `📋 **YAML**\n\n\`\`\`yaml\n${yaml}\n\`\`\``,
+        content:
+          `📋 **JSON — Episode ${episodeNumber}**\n` +
+          `_Copy ke \`src/data/anime/episodes/{slug}.json\`_\n\n` +
+          '```json\n' + json + '\n```',
       });
     } else {
-      await sendFollowupFile(appId, token, 'streams.yaml', yaml, '📋 **YAML Streams**');
+      // Besar → file attachment
+      const filename = sourceFilename
+        ? sourceFilename.replace(/\.(html?|txt)$/i, '.json')
+        : `episode-${episodeNumber}.json`;
+
+      const caption =
+        `📋 **JSON — Episode ${episodeNumber}**\n` +
+        `_Copy ke \`src/data/anime/episodes/{slug}.json\`_`;
+
+      await sendFollowupFile(appId, token, filename, json, caption);
     }
   } catch (err: any) {
     console.error('[Discord/Decode] error:', err);
