@@ -1,3 +1,4 @@
+// src/services/kitsu.ts
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from '../types/anime';
 
@@ -16,11 +17,19 @@ interface KitsuAnime {
       large?: string;
       original?: string;
     };
+    coverImage?: {
+      large?: string;
+      original?: string;
+    } | null;
     subtype?: string;
     status?: string;
     startDate?: string | null;
+    endDate?: string | null;
     episodeCount?: number | null;
+    episodeLength?: number | null;
     averageRating?: string | null;
+    ageRating?: string | null;
+    youtubeVideoId?: string | null;
     synopsis?: string | null;
   };
   relationships?: {
@@ -50,9 +59,15 @@ interface KitsuSearchResult {
 export async function searchKitsu(
   title: string
 ): Promise<KitsuSearchResult | null> {
-  const url = `${KITSU_URL}?filter[text]=${encodeURIComponent(
-    title
-  )}&include=categories&page[limit]=1`;
+  // URLSearchParams otomatis encode [ ] jadi %5B %5D
+  const params = new URLSearchParams();
+  params.set('filter[text]', title);
+  params.set('include', 'categories');
+  params.set('page[limit]', '1');
+
+  const url = `${KITSU_URL}?${params.toString()}`;
+
+  console.log(`[Kitsu] URL: ${url}`);
 
   const res = await fetchWithRetry(url, {
     headers: {
