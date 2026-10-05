@@ -7,6 +7,7 @@ import type {
 } from './qimochi-chain-extras';
 
 const MAX_CHARACTERS = 20;
+const MAX_EPISODES_WARN = 200;
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
@@ -142,7 +143,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // aired
   const airedFrom = formatDate(
     media.startDate.year,
     media.startDate.month,
@@ -167,7 +167,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // stats
   lines.push('stats:');
   if (media.averageScore && media.averageScore > 0) {
     lines.push(`  score: ${(media.averageScore / 10).toFixed(1)}`);
@@ -177,7 +176,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   lines.push('  # scoredBy: # edit manual');
   lines.push('');
 
-  // genres
   const genres = (media.genres ?? []).map(slugify).filter(Boolean);
   if (genres.length > 0) {
     lines.push('genres:');
@@ -187,7 +185,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // studios
   const studios = (media.studios?.nodes ?? [])
     .map((s) => slugify(s.name))
     .filter(Boolean);
@@ -199,11 +196,9 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // franchises — diisi dari Section Franchises (copy-paste manual)
   lines.push('franchises: []');
   lines.push('');
 
-  // image / banner / trailer
   if (media.coverImage.extraLarge) {
     lines.push(`image: "${media.coverImage.extraLarge}"`);
   } else {
@@ -223,7 +218,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
   }
   lines.push('');
 
-  // placeholder section lain (diisi dari section terpisah)
   lines.push('episodeList: []');
   lines.push('characters: []');
   lines.push('');
@@ -301,9 +295,11 @@ export function buildEpisodesYaml(episodes: UnifiedEpisode[]): string {
     }
   }
 
-  if (episodes.length >= 100) {
+  if (episodes.length >= MAX_EPISODES_WARN) {
     lines.push('');
-    lines.push('# ⚠️ Di-truncate 100 episode. Tambah manual kalau perlu.');
+    lines.push(
+      `# ⚠️ Di-truncate ${MAX_EPISODES_WARN} episode (time budget). Sisanya isi manual.`
+    );
   }
 
   return lines.join('\n');
@@ -342,7 +338,7 @@ export function getSynopsisRaw(media: AniListMedia): string {
 }
 
 /* ============================================================
-   ALL (legacy — tidak dipakai lagi, dipertahankan biar tidak error import)
+   ALL (legacy)
    ============================================================ */
 
 export interface AllInput {
