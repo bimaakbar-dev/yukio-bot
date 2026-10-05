@@ -13,7 +13,6 @@ import {
   buildQimochiHubResult,
   pickTitle,
   isValidHttpUrl,
-  stripHtml,
   type Enriched,
 } from '../services/anime-core';
 
