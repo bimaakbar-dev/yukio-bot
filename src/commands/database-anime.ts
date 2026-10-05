@@ -4,9 +4,7 @@ import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
-import {
-  chainSearch,
-} from '../services/qimochi-chain';
+import { chainSearch } from '../services/qimochi-chain';
 import {
   chainCharacters,
   chainEpisodes,
@@ -195,12 +193,16 @@ function splitMessage(text: string, max: number): string[] {
   return parts;
 }
 
-async function sendLongMessage(
+/**
+ * Kirim YAML panjang dengan komentar di atas <pre>.
+ * Kalau panjang, di-split per bagian dengan header [i/n].
+ */
+async function sendYamlMessage(
   ctx: Context,
   label: string,
-  content: string
+  yaml: string
 ): Promise<void> {
-  const parts = splitMessage(content, MSG_LIMIT);
+  const parts = splitMessage(yaml, MSG_LIMIT);
 
   if (parts.length === 1) {
     await ctx.reply(
@@ -265,6 +267,60 @@ function safeFetch<T>(
 }
 
 /* ============================================================
+   COMMENT HEADERS
+   ============================================================ */
+
+function headerMetadata(title: string): string {
+  return (
+    `# ============================================\n` +
+    `# QimochiDB — Metadata Frontmatter\n` +
+    `# Title: ${title}\n` +
+    `# Copy-paste ke bagian atas file .md\n` +
+    `# ============================================\n`
+  );
+}
+
+function headerCharacters(title: string): string {
+  return (
+    `# ============================================\n` +
+    `# QimochiDB — Characters\n` +
+    `# Title: ${title}\n` +
+    `# Ganti "characters: []" di frontmatter dengan ini\n` +
+    `# ============================================\n`
+  );
+}
+
+function headerEpisodes(title: string): string {
+  return (
+    `# ============================================\n` +
+    `# QimochiDB — Episode List\n` +
+    `# Title: ${title}\n` +
+    `# Ganti "episodeList: []" di frontmatter dengan ini\n` +
+    `# ============================================\n`
+  );
+}
+
+function headerFranchises(title: string): string {
+  return (
+    `# ============================================\n` +
+    `# QimochiDB — Franchises\n` +
+    `# Title: ${title}\n` +
+    `# Ganti "franchises: []" di frontmatter dengan ini\n` +
+    `# ============================================\n`
+  );
+}
+
+function headerSummary(title: string): string {
+  return (
+    `# ============================================\n` +
+    `# QimochiDB — Body (Sinopsis)\n` +
+    `# Title: ${title}\n` +
+    `# Copy-paste di bawah frontmatter (setelah "---")\n` +
+    `# ============================================\n`
+  );
+}
+
+/* ============================================================
    AI SYNOPSIS
    ============================================================ */
 
@@ -321,7 +377,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
 
   if (!query) {
     await ctx.reply(
-      '<b>📚 Database Anime</b>\n\n' +
+      '<b>📚 Database Anime (QimochiDB)</b>\n\n' +
         '<b>Contoh:</b>\n' +
         '<code>/dba nama anime</code>\n\n' +
         '<i>Bot akan cari data, lalu tampil tombol untuk pilih section.</i>',
@@ -330,7 +386,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
     return;
   }
 
-  const loading = await ctx.reply('🔍 Mencari (Jikan → Kitsu → Shikimori)...');
+  const loading = await ctx.reply('🔍 Mencari (Shikimori → Kitsu)...');
 
   try {
     let result;
@@ -496,7 +552,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           malId: result.malId ?? session.mal_id,
           kitsuId: result.kitsuId ?? session.kitsu_id,
         });
-        await sendLongMessage(ctx, `Metadata — ${session.title}`, yaml);
+        const header = headerMetadata(session.title);
+        await sendYamlMessage(ctx, `Metadata — ${session.title}`, header + yaml);
         return;
       }
 
@@ -507,19 +564,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           25000
         );
 
+        let yaml: string;
+        let label: string;
+
         if (!chars || !chars.data || chars.data.length === 0) {
           const errs = chars?.errors ?? [error ?? 'unknown'];
-          await sendLongMessage(
-            ctx,
-            `Characters — ${session.title}`,
-            fallbackSection('characters', errs)
-          );
-          return;
+          yaml = fallbackSection('characters', errs);
+          label = `Characters — ${session.title} [FAILED]`;
+        } else {
+          yaml = buildCharactersYaml(chars.data);
+          label = `Characters — ${session.title} [${chars.source}]`;
         }
 
-        const yaml = buildCharactersYaml(chars.data);
-        const label = `Characters — ${session.title} [${chars.source}]`;
-        await sendLongMessage(ctx, label, yaml);
+        const header = headerCharacters(session.title);
+        await sendYamlMessage(ctx, label, header + yaml);
         return;
       }
 
@@ -530,19 +588,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           30000
         );
 
+        let yaml: string;
+        let label: string;
+
         if (!eps || !eps.data || eps.data.length === 0) {
           const errs = eps?.errors ?? [error ?? 'unknown'];
-          await sendLongMessage(
-            ctx,
-            `Episodes — ${session.title}`,
-            fallbackSection('episodes', errs)
-          );
-          return;
+          yaml = fallbackSection('episodes', errs);
+          label = `Episodes — ${session.title} [FAILED]`;
+        } else {
+          yaml = buildEpisodesYaml(eps.data);
+          label = `Episodes — ${session.title} [${eps.source}]`;
         }
 
-        const yaml = buildEpisodesYaml(eps.data);
-        const label = `Episodes — ${session.title} [${eps.source}]`;
-        await sendLongMessage(ctx, label, yaml);
+        const header = headerEpisodes(session.title);
+        await sendYamlMessage(ctx, label, header + yaml);
         return;
       }
 
@@ -553,19 +612,20 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           25000
         );
 
+        let yaml: string;
+        let label: string;
+
         if (!rels || !rels.data || rels.data.length === 0) {
           const errs = rels?.errors ?? [error ?? 'unknown'];
-          await sendLongMessage(
-            ctx,
-            `Franchises — ${session.title}`,
-            fallbackSection('franchises', errs)
-          );
-          return;
+          yaml = fallbackSection('franchises', errs);
+          label = `Franchises — ${session.title} [FAILED]`;
+        } else {
+          yaml = buildFranchisesYaml(rels.data);
+          label = `Franchises — ${session.title} [${rels.source}]`;
         }
 
-        const yaml = buildFranchisesYaml(rels.data);
-        const label = `Franchises — ${session.title} [${rels.source}]`;
-        await sendLongMessage(ctx, label, yaml);
+        const header = headerFranchises(session.title);
+        await sendYamlMessage(ctx, label, header + yaml);
         return;
       }
 
@@ -604,7 +664,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             (raw || 'Tulis sinopsis manual...');
         }
 
-        await sendLongMessage(ctx, `Summary — ${session.title}`, body);
+        const header = headerSummary(session.title);
+        await sendYamlMessage(ctx, `Summary — ${session.title}`, header + body);
         return;
       }
 
@@ -671,14 +732,14 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           (aiRes.data || raw || 'Tulis sinopsis manual...');
 
         const full = buildAllMarkdown({
-          metadata: metaYaml,
-          characters: charsYaml,
-          episodes: epsYaml,
-          franchises: relsYaml,
-          summary,
+          metadata: headerMetadata(session.title) + metaYaml,
+          characters: headerCharacters(session.title) + charsYaml,
+          episodes: headerEpisodes(session.title) + epsYaml,
+          franchises: headerFranchises(session.title) + relsYaml,
+          summary: headerSummary(session.title) + summary,
         });
 
-        await sendLongMessage(ctx, `All — ${session.title}`, full);
+        await sendYamlMessage(ctx, `All — ${session.title}`, full);
         await deleteSession(env.DB, sessionId);
         return;
       }
