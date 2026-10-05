@@ -24,7 +24,7 @@ import { askAI } from '../services/ai';
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3500;
 const AI_TIMEOUT_MS = 12000;
-const FILE_THRESHOLD = 500;
+const FILE_THRESHOLD = 3500;
 
 /* ============================================================
    DB: SESSION
