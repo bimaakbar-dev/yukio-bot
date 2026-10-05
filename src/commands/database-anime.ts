@@ -341,14 +341,22 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       });
     }
   } catch (err: any) {
-    console.error('[DBA] error:', err);
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`
-      )
-      .catch(() => {});
+    console.error('[DBA] callback error:', err);
+    const msg = err?.message ?? 'unknown';
+  
+    let hint = '';
+    if (msg.includes('aborted') || msg.includes('timeout')) {
+      hint = '\n\n<i>Jikan API lambat. Coba lagi dalam 30 detik.</i>';
+    } else if (msg.includes('429')) {
+      hint = '\n\n<i>Rate limit Jikan. Tunggu 1 menit.</i>';
+    } else if (msg.includes('HTTP 5')) {
+      hint = '\n\n<i>Jikan sedang down. Coba lagi nanti.</i>';
+    }
+  
+    await ctx.reply(
+      `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
+      { parse_mode: 'HTML' }
+    );
   }
 }
 
