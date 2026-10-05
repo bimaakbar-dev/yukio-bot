@@ -121,6 +121,49 @@ export default {
       }
     }
 
+    if (url.pathname === '/debug/anilist') {
+      const t0 = Date.now();
+      try {
+        const res = await fetch('https://graphql.anilist.co', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'User-Agent': 'yukio-bot/1.0',
+          },
+          body: JSON.stringify({
+            query:
+              'query ($idMal: Int) { Media(idMal: $idMal, type: ANIME) { id title { romaji } characters(page: 1, perPage: 3) { edges { role node { name { full } } voiceActors(language: JAPANESE) { id name { full } languageV2 } } } } }',
+            variables: { idMal: 40748 },
+          }),
+        });
+        const text = await res.text();
+        return new Response(
+          JSON.stringify(
+            {
+              ok: res.ok,
+              status: res.status,
+              elapsed: Date.now() - t0,
+              headers: Object.fromEntries(res.headers.entries()),
+              bodyPreview: text.slice(0, 1500),
+            },
+            null,
+            2
+          ),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            elapsed: Date.now() - t0,
+            error: err?.message ?? String(err),
+          }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
     if (url.pathname === '/discord/register') {
       return registerDiscordCommands(env);
     }
