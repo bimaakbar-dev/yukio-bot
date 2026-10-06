@@ -109,10 +109,6 @@ export async function searchShikimori(
   return basic;
 }
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
 function pickString(
   v: string | string[] | null | undefined
 ): string | null {
@@ -121,11 +117,6 @@ function pickString(
   return v;
 }
 
-/**
- * Map rating Shikimori → enum QimochiDB.
- * Shikimori: g, pg, pg_13, r, r_plus, rx
- * QimochiDB: G, PG, PG-13, R, R+, Rx
- */
 function mapShikimoriRating(raw: string | undefined): string | null {
   if (!raw) return null;
   const lower = raw.toLowerCase().trim();
@@ -159,27 +150,42 @@ function parseShikimoriDate(dateStr: string | null | undefined): {
   };
 }
 
+function extractYoutubeId(url: string | null | undefined): string | null {
+  if (!url) return null;
+
+  const patterns = [
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/v\/([a-zA-Z0-9_-]{11})/,
+  ];
+
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m && m[1]) return m[1];
+  }
+
+  return null;
+}
+
 function pickTrailer(videos: ShikimoriVideo[] | undefined): string | null {
   if (!Array.isArray(videos) || videos.length === 0) return null;
 
-  // Prioritas: youtube hosting, kind: pv
   const youtube = videos.find(
     (v) => v.hosting === 'youtube' && v.url && v.kind === 'pv'
   );
-  if (youtube?.url) return youtube.url;
+  const idFromYoutube = extractYoutubeId(youtube?.url);
+  if (idFromYoutube) return idFromYoutube;
 
   const anyYoutube = videos.find(
     (v) => v.hosting === 'youtube' && v.url
   );
-  if (anyYoutube?.url) return anyYoutube.url;
+  const idFromAny = extractYoutubeId(anyYoutube?.url);
+  if (idFromAny) return idFromAny;
 
   const first = videos.find((v) => v.url);
-  return first?.url ?? null;
+  return extractYoutubeId(first?.url);
 }
-
-/* ============================================================
-   MAPPER
-   ============================================================ */
 
 export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
   let status = 'RELEASING';
@@ -223,7 +229,7 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
 
   const studios: { name: string }[] = Array.isArray(s.studios)
     ? s.studios
-        .filter((st): boolean => !!(st && st.real && st.name))
+        .filter((st): boolean => !!(st && st.name))
         .map((st): { name: string } => ({ name: st.name }))
         .slice(0, 3)
     : [];
@@ -253,7 +259,6 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
       day: airedDate?.day ?? null,
     },
 
-    /* === Extended === */
     duration: s.duration && s.duration > 0 ? s.duration : null,
     rating: mapShikimoriRating(s.rating),
     endDate: releasedDate
@@ -266,6 +271,5 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
     trailer: pickTrailer(s.videos),
     franchise: s.franchise ?? null,
     myanimelistId: s.myanimelist_id ?? s.id,
-    // banner & source tidak ada di Shikimori
   };
 }
