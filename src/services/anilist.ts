@@ -2,10 +2,23 @@
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from '../types/anime';
 
-const ANILIST_URL = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
+/**
+ * AniList GraphQL diblokir dari CF Workers IP.
+ * Pakai Val Town proxy sebagai relay.
+ * Limit: 100K runs/day, reset 24 jam.
+ */
+const ANILIST_URL =
+  'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
+
 const TIMEOUT = 8000;
 const PER_PAGE = 25;
-const MAX_PAGES = 8;
+const MAX_PAGES = 40; // hard cap 1000 karakter
+const PARALLEL_BATCH = 5;
+const FETCH_TIME_BUDGET_MS = 12000; // 12s max fetch
+
+/* ============================================================
+   TYPES
+   ============================================================ */
 
 export interface AniListVoiceActor {
   anilistId: number;
@@ -23,7 +36,26 @@ export interface AniListCharacter {
   voiceActors: AniListVoiceActor[];
 }
 
-interface AniListResponse {
+/* ============================================================
+   CHARACTERS — Fetch page
+   ============================================================ */
+
+interface AniListCharEdge {
+  role: string;
+  node: {
+    id: number;
+    name: { full?: string; native?: string };
+    image?: { large?: string };
+  };
+  voiceActors: {
+    id: number;
+    name: { full?: string; native?: string };
+    languageV2?: string;
+    image?: { large?: string };
+  }[];
+}
+
+interface CharPageResponse {
   data?: {
     Media?: {
       characters?: {
@@ -33,27 +65,14 @@ interface AniListResponse {
           lastPage: number;
           total: number;
         };
-        edges: {
-          role: string;
-          node: {
-            id: number;
-            name: { full?: string; native?: string };
-            image?: { large?: string };
-          };
-          voiceActors: {
-            id: number;
-            name: { full?: string; native?: string };
-            languageV2?: string;
-            image?: { large?: string };
-          }[];
-        }[];
+        edges: AniListCharEdge[];
       };
     };
   };
   errors?: { message: string }[];
 }
 
-const QUERY = `
+const CHARACTERS_QUERY = `
   query ($idMal: Int, $page: Int) {
     Media(idMal: $idMal, type: ANIME) {
       characters(page: $page, perPage: ${PER_PAGE}, sort: [ROLE, RELEVANCE]) {
@@ -77,110 +96,183 @@ const QUERY = `
   }
 `;
 
-async function fetchPage(
+async function fetchCharactersPage(
   idMal: number,
   page: number
-): Promise<AniListResponse['data'] | null> {
-  const res = await fetchWithRetry(
-    ANILIST_URL,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': 'yukio-bot/1.0',
+): Promise<{ edges: AniListCharEdge[]; lastPage: number; total: number } | null> {
+  try {
+    const res = await fetchWithRetry(
+      ANILIST_URL,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': 'yukio-bot/1.0',
+        },
+        body: JSON.stringify({
+          query: CHARACTERS_QUERY,
+          variables: { idMal, page },
+        }),
       },
-      body: JSON.stringify({
-        query: QUERY,
-        variables: { idMal, page },
-      }),
-    },
-    { retries: 0, timeout: TIMEOUT }
-  );
-
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error(
-      `AniList HTTP ${res.status}: ${errBody.slice(0, 150)}`
+      { retries: 0, timeout: TIMEOUT }
     );
+
+    if (!res.ok) {
+      console.warn(`[AniList] chars page ${page} HTTP ${res.status}`);
+      return null;
+    }
+
+    const json = (await res.json()) as CharPageResponse;
+
+    if (json.errors?.length) {
+      console.warn(`[AniList] chars page ${page} error: ${json.errors[0]?.message}`);
+      return null;
+    }
+
+    const chars = json.data?.Media?.characters;
+    if (!chars) return null;
+
+    return {
+      edges: chars.edges ?? [],
+      lastPage: chars.pageInfo?.lastPage ?? 1,
+      total: chars.pageInfo?.total ?? 0,
+    };
+  } catch (err) {
+    console.warn(`[AniList] chars page ${page} failed:`, err);
+    return null;
   }
-
-  const json = (await res.json()) as AniListResponse;
-
-  if (json.errors?.length) {
-    throw new Error(`AniList: ${json.errors[0]?.message ?? 'unknown'}`);
-  }
-
-  return json.data ?? null;
 }
 
+/* ============================================================
+   CHARACTERS — Fetch ALL (paralel)
+   ============================================================ */
+
+/**
+ * Fetch SEMUA characters dari AniList (paralel).
+ *
+ * Alur:
+ *   1. Fetch page 1 → dapat `lastPage`
+ *   2. Fetch page 2..lastPage secara paralel (5 per batch)
+ *   3. Aggregate semua edges
+ *
+ * Time budget: FETCH_TIME_BUDGET_MS. Kalau lewat, stop dan return partial.
+ */
 export async function getCharactersFromAniList(
   idMal: number
 ): Promise<AniListCharacter[] | null> {
-  const all: AniListCharacter[] = [];
-  const seen = new Set<string>();
+  const startTime = Date.now();
 
   console.log(`[AniList] characters start — idMal: ${idMal}`);
 
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    let data: AniListResponse['data'] | null = null;
-    try {
-      data = await fetchPage(idMal, page);
-    } catch (err) {
-      console.warn(`[AniList] page ${page} error:`, err);
-      break;
-    }
+  // === 1. Fetch page 1 ===
+  const first = await fetchCharactersPage(idMal, 1);
+  if (!first) {
+    console.warn('[AniList] page 1 failed');
+    return null;
+  }
 
-    const chars = data?.Media?.characters;
-    if (!chars) break;
+  const lastPage = Math.min(first.lastPage, MAX_PAGES);
+  const totalFromSource = first.total;
 
-    const edges = chars.edges ?? [];
+  console.log(
+    `[AniList] page 1/${lastPage} — ${first.edges.length} edges (total source: ${totalFromSource})`
+  );
 
-    for (const edge of edges) {
-      const roleRaw = (edge.role ?? '').toUpperCase();
-      if (roleRaw !== 'MAIN' && roleRaw !== 'SUPPORTING') continue;
+  const allEdges: AniListCharEdge[] = [...first.edges];
+  let truncated = false;
 
-      const name = edge.node.name?.full?.trim();
-      if (!name) continue;
-      if (seen.has(name)) continue;
-      seen.add(name);
-
-      const vas: AniListVoiceActor[] = [];
-
-      for (const va of edge.voiceActors ?? []) {
-        const vaName = va.name?.full?.trim();
-        if (!vaName) continue;
-
-        vas.push({
-          anilistId: va.id,
-          name: vaName,
-          nameNative: va.name?.native?.trim() || undefined,
-          image: va.image?.large || undefined,
-          language: va.languageV2 || 'Japanese',
-        });
+  // === 2. Fetch sisa page (paralel) ===
+  if (lastPage > 1) {
+    for (let batchStart = 2; batchStart <= lastPage; batchStart += PARALLEL_BATCH) {
+      // Time budget check
+      const elapsed = Date.now() - startTime;
+      if (elapsed > FETCH_TIME_BUDGET_MS) {
+        console.warn(
+          `[AniList] time budget exceeded (${elapsed}ms) — stop at page ${batchStart}`
+        );
+        truncated = true;
+        break;
       }
 
-      all.push({
-        name,
-        nameNative: edge.node.name?.native?.trim() || undefined,
-        image: edge.node.image?.large || undefined,
-        role: roleRaw.toLowerCase() as 'main' | 'supporting',
-        voiceActors: vas,
+      const pages: number[] = [];
+      for (let i = 0; i < PARALLEL_BATCH && batchStart + i <= lastPage; i++) {
+        pages.push(batchStart + i);
+      }
+
+      console.log(
+        `[AniList] batch fetch pages ${pages.join(',')} (elapsed: ${elapsed}ms)`
+      );
+
+      const results = await Promise.allSettled(
+        pages.map((p) => fetchCharactersPage(idMal, p))
+      );
+
+      let batchHadError = false;
+      for (const r of results) {
+        if (r.status !== 'fulfilled' || !r.value) {
+          batchHadError = true;
+          continue;
+        }
+        allEdges.push(...r.value.edges);
+      }
+
+      if (batchHadError) {
+        console.warn(`[AniList] batch ${batchStart} had errors — continue`);
+      }
+    }
+  }
+
+  if (allEdges.length === 0) return null;
+
+  // === 3. Transform ===
+  const all: AniListCharacter[] = [];
+  const seen = new Set<string>();
+
+  for (const edge of allEdges) {
+    const roleRaw = (edge.role ?? '').toUpperCase();
+    if (roleRaw !== 'MAIN' && roleRaw !== 'SUPPORTING') continue;
+
+    const name = edge.node.name?.full?.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+
+    const vas: AniListVoiceActor[] = [];
+
+    for (const va of edge.voiceActors ?? []) {
+      const vaName = va.name?.full?.trim();
+      if (!vaName) continue;
+
+      vas.push({
+        anilistId: va.id,
+        name: vaName,
+        nameNative: va.name?.native?.trim() || undefined,
+        image: va.image?.large || undefined,
+        language: va.languageV2 || 'Japanese',
       });
     }
 
-    const pageInfo = chars.pageInfo;
-    console.log(
-      `[AniList] page ${page}/${pageInfo?.lastPage ?? '?'} — got ${edges.length} chars (total so far: ${all.length})`
-    );
-
-    if (!pageInfo?.hasNextPage) break;
+    all.push({
+      name,
+      nameNative: edge.node.name?.native?.trim() || undefined,
+      image: edge.node.image?.large || undefined,
+      role: roleRaw.toLowerCase() as 'main' | 'supporting',
+      voiceActors: vas,
+    });
   }
 
-  console.log(`[AniList] characters done — ${all.length} chars`);
+  console.log(
+    `[AniList] characters done — ${all.length} chars ` +
+      `(source total: ${totalFromSource}, truncated: ${truncated}, ` +
+      `time: ${Date.now() - startTime}ms)`
+  );
 
   return all.length > 0 ? all : null;
 }
+
+/* ============================================================
+   METADATA
+   ============================================================ */
 
 function mapAniListSource(raw: string | null | undefined): string | null {
   if (!raw) return null;
@@ -212,9 +304,6 @@ function mapAniListSource(raw: string | null | undefined): string | null {
   return map[lower] ?? null;
 }
 
-/**
- * Map format AniList → format schema kita.
- */
 function mapAniListFormat(raw: string | null | undefined): string {
   if (!raw) return 'TV';
   const upper = raw.toUpperCase();
@@ -232,9 +321,6 @@ function mapAniListFormat(raw: string | null | undefined): string {
   return map[upper] ?? 'TV';
 }
 
-/**
- * Map status AniList → status schema kita.
- */
 function mapAniListStatus(raw: string | null | undefined): string {
   if (!raw) return 'RELEASING';
   const upper = raw.toUpperCase();
