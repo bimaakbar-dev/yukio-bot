@@ -8,6 +8,8 @@ import type { D1Database } from '@cloudflare/workers-types';
 import {
   searchYukionime,
   getYukionimeDetail,
+  isYukionimeComplete,
+  yukionimeToAniListMedia,
   type YukionimeAnime,
 } from '../services/yukionime';
 import { getCache, setCache } from '../lib/cache';
@@ -24,6 +26,10 @@ import {
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
+/* ============================================================
+   SLUGIFY
+   ============================================================ */
+
 function slugify(str: string): string {
   return str
     .toLowerCase()
@@ -34,6 +40,10 @@ function slugify(str: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
 }
+
+/* ============================================================
+   DB: TEMP SESSIONS
+   ============================================================ */
 
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
@@ -64,7 +74,9 @@ async function ensureDb(db: D1Database): Promise<void> {
 
       try {
         await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
-      } catch {}
+      } catch {
+        // ignore: kolom sudah ada
+      }
 
       dbReady = true;
     } catch (err) {
@@ -172,6 +184,10 @@ async function deleteSession(
   }
 }
 
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -230,9 +246,14 @@ function extractTitleFromMALUrl(url: string): string | null {
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
 
+/* ============================================================
+   YUKIONIME HELPERS
+   ============================================================ */
+
 interface YukionimeCheckResult {
   match: YukionimeAnime | null;
   synopsis: string | null;
+  complete: boolean;
 }
 
 async function checkYukionime(
@@ -240,21 +261,31 @@ async function checkYukionime(
 ): Promise<YukionimeCheckResult> {
   try {
     const match = await searchYukionime(query);
-    if (!match) return { match: null, synopsis: null };
+    if (!match) return { match: null, synopsis: null, complete: false };
 
     const detail = await getYukionimeDetail(match.id);
     const synopsis = detail?.synopsis ?? null;
 
-    return { match, synopsis };
+    // Merge: pakai detail (lebih lengkap) + synopsis dari scrape
+    const merged: YukionimeAnime = {
+      ...match,
+      ...(detail ?? {}),
+      synopsis,
+    };
+
+    const complete = isYukionimeComplete(merged);
+
+    return { match: merged, synopsis, complete };
   } catch (err) {
     console.warn('[Anime] yukionime check failed:', err);
-    return { match: null, synopsis: null };
+    return { match: null, synopsis: null, complete: false };
   }
 }
 
 function buildYukionimeWarning(
   match: YukionimeAnime,
-  synopsis: string | null
+  synopsis: string | null,
+  isComplete: boolean
 ): string {
   const lines: string[] = [];
   lines.push('⚠️ <b>Sudah ada di database Yukionime!</b>');
@@ -267,12 +298,20 @@ function buildYukionimeWarning(
   if (match.status) lines.push(`📊 <b>Status:</b> ${escapeHtml(match.status)}`);
 
   if (synopsis) {
-    const preview = synopsis.slice(0, 200) + (synopsis.length > 200 ? '…' : '');
+    const preview =
+      synopsis.slice(0, 200) + (synopsis.length > 200 ? '…' : '');
     lines.push('');
     lines.push('📝 <b>Sinopsis:</b>');
     lines.push(`<i>${escapeHtml(preview)}</i>`);
-    lines.push('');
-    lines.push('✅ <i>Sinopsis akan dipakai otomatis (skip AI).</i>');
+  }
+
+  lines.push('');
+  if (isComplete) {
+    lines.push('✅ <i>Data lengkap. Langsung dipakai (skip AniList).</i>');
+  } else {
+    lines.push(
+      '⚠️ <i>Data tidak lengkap. Lanjut cari di AniList untuk melengkapi.</i>'
+    );
   }
 
   lines.push('');
@@ -282,6 +321,10 @@ function buildYukionimeWarning(
 
   return lines.join('\n');
 }
+
+/* ============================================================
+   COMMAND
+   ============================================================ */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
@@ -312,8 +355,6 @@ export const animeCommand: CommandDefinition = {
     const loading = await ctx.reply('🔍 Mencari...');
 
     try {
-      let media: AniListMedia | null = null;
-      let sourceLabel = '';
       let searchQuery = query;
 
       if (isMALUrl(query)) {
@@ -321,17 +362,93 @@ export const animeCommand: CommandDefinition = {
         if (t) searchQuery = t;
       }
 
+      /* ========================================================
+         STEP 1: CEK YUKIONIME
+         ======================================================== */
       const yukionime = await checkYukionime(searchQuery);
 
+      if (yukionime.match && yukionime.complete) {
+        // === DATA LENGKAP → LANGSUNG PAKAI ===
+        console.log(
+          '[Anime] yukionime complete — skip AniList'
+        );
+
+        // Hapus loading
+        await ctx.api
+          .deleteMessage(ctx.chat!.id, loading.message_id)
+          .catch(() => {});
+
+        // Kirim warning + info
+        await ctx.reply(
+          buildYukionimeWarning(
+            yukionime.match,
+            yukionime.synopsis,
+            true
+          ),
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          }
+        );
+
+        // Convert yukionime → AniListMedia
+        const media = yukionimeToAniListMedia({
+          ...yukionime.match,
+          synopsis: yukionime.synopsis,
+        });
+
+        // Build result TANPA AI enrichment
+        const result = buildQimochiHubResult(media, null);
+        const slug = yukionime.match.id;
+
+        const sessionId = await saveSession(env.DB, ctx.from!.id, {
+          yaml: result.yaml,
+          body: result.body,
+          missing: result.missing,
+          aiUsed: result.aiUsed,
+          cover: yukionime.match.image ?? null,
+          sourceLabel: '📚 Dari Yukionime (database)',
+          slug,
+        });
+
+        const keyboard = new InlineKeyboard()
+          .text('📋 Convert ke YAML', `an:y:${sessionId}`)
+          .text('❌ Batal', `an:x:${sessionId}`);
+
+        await ctx.reply(
+          '✅ <b>Data siap!</b> (dari database Yukionime)\n\n' +
+            'Klik tombol di bawah untuk convert ke <b>YAML</b> + sinopsis.',
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: keyboard,
+          }
+        );
+
+        console.log(`[Anime] total: ${Date.now() - T0}ms (yukionime)`);
+        return;
+      }
+
+      // Yukionime ada tapi tidak lengkap → warning, lanjut AniList
       if (yukionime.match) {
         await ctx.reply(
-          buildYukionimeWarning(yukionime.match, yukionime.synopsis),
+          buildYukionimeWarning(
+            yukionime.match,
+            yukionime.synopsis,
+            false
+          ),
           {
             parse_mode: 'HTML',
             link_preview_options: { is_disabled: true },
           }
         );
       }
+
+      /* ========================================================
+         STEP 2: FETCH ANILIST
+         ======================================================== */
+      let media: AniListMedia | null = null;
+      let sourceLabel = '';
 
       const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
       media = await getCache<AniListMedia>(env.DB, cacheKey);
@@ -382,17 +499,23 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
+      /* ========================================================
+         STEP 3: DETECT MISSING (+ skip synopsis kalau ada yukionime)
+         ======================================================== */
       let need = detectMissing(media);
 
       if (yukionime.synopsis) {
         need = need.filter((n) => n !== 'synopsis');
-        console.log('[Anime] skip AI synopsis (pakai dari yukionime)');
+        console.log('[Anime] skip AI synopsis (yukionime punya)');
       }
 
       console.log(
         `[Anime] missing after merge: [${need.join(', ') || 'none'}]`
       );
 
+      /* ========================================================
+         STEP 4: AI ENRICH
+         ======================================================== */
       let enriched: Enriched | null = null;
 
       if (need.length > 0) {
@@ -444,19 +567,25 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
+      /* ========================================================
+         STEP 5: INJECT SYNOPSIS YUKIONIME
+         ======================================================== */
       if (yukionime.synopsis) {
         enriched = { ...(enriched ?? {}), synopsis: yukionime.synopsis };
       }
 
+      /* ========================================================
+         STEP 6: BUILD RESULT
+         ======================================================== */
       const result = buildQimochiHubResult(media, enriched);
-      let { yaml, body, missing, aiUsed } = result;
+      const { yaml, body, missing } = result;
+      let aiUsed = result.aiUsed;
 
+      // Ganti label AI → "dari Yukionime" kalau pakai synopsis yukionime
       if (yukionime.synopsis) {
         aiUsed = aiUsed.map((f) =>
           f === 'synopsis' ? 'synopsis (dari Yukionime)' : f
         );
-        if (!aiUsed.includes('synopsis (dari Yukionime)')) {
-        }
       }
 
       const slug = slugify(pickTitle(media));
@@ -508,6 +637,10 @@ export const animeCommand: CommandDefinition = {
   },
 };
 
+/* ============================================================
+   CALLBACK HANDLERS
+   ============================================================ */
+
 export function setupAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^an:y:([a-f0-9]+)$/, async (ctx) => {
     const [, sessionId] = ctx.match as RegExpMatchArray;
@@ -550,7 +683,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       warnLines.push('');
     }
     if (aiUsed.length > 0) {
-      warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang):</b>');
+      warnLines.push('🤖 <b>Diisi AI / dari sumber (VERIFIKASI):</b>');
       for (const f of aiUsed)
         warnLines.push(`• <code>${escapeHtml(f)}</code>`);
     }
