@@ -1,14 +1,11 @@
 // src/services/anilist.ts
 import { fetchWithRetry } from '../lib/http';
+import type { AniListMedia } from '../types/anime';
 
 const ANILIST_URL = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
 const TIMEOUT = 8000;
 const PER_PAGE = 25;
-const MAX_PAGES = 8; // max 200 karakter
-
-/* ============================================================
-   TYPES
-   ============================================================ */
+const MAX_PAGES = 8;
 
 export interface AniListVoiceActor {
   anilistId: number;
@@ -55,10 +52,6 @@ interface AniListResponse {
   };
   errors?: { message: string }[];
 }
-
-/* ============================================================
-   FETCH PAGE
-   ============================================================ */
 
 const QUERY = `
   query ($idMal: Int, $page: Int) {
@@ -121,17 +114,6 @@ async function fetchPage(
   return json.data ?? null;
 }
 
-/* ============================================================
-   PUBLIC API
-   ============================================================ */
-
-/**
- * Ambil characters + VA (Japanese) dari AniList.
- * Filter: role MAIN + SUPPORTING (BACKGROUND di-skip).
- * Pagination max MAX_PAGES halaman.
- *
- * Return null kalau tidak ada data.
- */
 export async function getCharactersFromAniList(
   idMal: number
 ): Promise<AniListCharacter[] | null> {
@@ -198,4 +180,233 @@ export async function getCharactersFromAniList(
   console.log(`[AniList] characters done — ${all.length} chars`);
 
   return all.length > 0 ? all : null;
+}
+
+function mapAniListSource(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  const map: Record<string, string> = {
+    original: 'original',
+    manga: 'manga',
+    light_novel: 'light_novel',
+    visual_novel: 'visual_novel',
+    video_game: 'game',
+    game: 'game',
+    novel: 'novel',
+    doujinshi: 'manga',
+    anime: 'original',
+    web_novel: 'web_novel',
+    live_action: 'other',
+    comic: 'manga',
+    multimedia_project: 'other',
+    picture_book: 'picture_book',
+    radio: 'radio',
+    music: 'music',
+    card_game: 'card_game',
+    '4_koma_manga': '4_koma_manga',
+    book: 'book',
+    other: 'other',
+  };
+
+  return map[lower] ?? null;
+}
+
+/**
+ * Map format AniList → format schema kita.
+ */
+function mapAniListFormat(raw: string | null | undefined): string {
+  if (!raw) return 'TV';
+  const upper = raw.toUpperCase();
+
+  const map: Record<string, string> = {
+    TV: 'TV',
+    TV_SHORT: 'TV',
+    MOVIE: 'MOVIE',
+    SPECIAL: 'SPECIAL',
+    OVA: 'OVA',
+    ONA: 'ONA',
+    MUSIC: 'MUSIC',
+  };
+
+  return map[upper] ?? 'TV';
+}
+
+/**
+ * Map status AniList → status schema kita.
+ */
+function mapAniListStatus(raw: string | null | undefined): string {
+  if (!raw) return 'RELEASING';
+  const upper = raw.toUpperCase();
+
+  const map: Record<string, string> = {
+    FINISHED: 'FINISHED',
+    RELEASING: 'RELEASING',
+    NOT_YET_RELEASED: 'NOT_YET_RELEASED',
+    CANCELLED: 'CANCELLED',
+    HIATUS: 'HIATUS',
+  };
+
+  return map[upper] ?? 'RELEASING';
+}
+
+/**
+ * Map rating AniList → rating schema kita.
+ */
+function mapAniListRating(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const upper = raw.toUpperCase();
+
+  const map: Record<string, string> = {
+    G: 'G',
+    PG: 'PG',
+    'PG-13': 'PG-13',
+    R: 'R',
+    'R+': 'R+',
+    RX: 'Rx',
+  };
+
+  return map[upper] ?? null;
+}
+
+const METADATA_QUERY = `
+  query ($search: String) {
+    Media(search: $search, type: ANIME) {
+      id
+      idMal
+      title { romaji english native }
+      coverImage { extraLarge large }
+      bannerImage
+      description
+      genres
+      studios(isMain: true) { nodes { name } }
+      episodes
+      duration
+      status
+      format
+      season
+      seasonYear
+      startDate { year month day }
+      endDate { year month day }
+      averageScore
+      trailer { id site }
+      source
+    }
+  }
+`;
+
+interface AniListMetadataResponse {
+  data?: {
+    Media?: {
+      id: number;
+      idMal: number | null;
+      title: { romaji?: string; english?: string; native?: string };
+      coverImage: { extraLarge?: string; large?: string };
+      bannerImage: string | null;
+      description: string | null;
+      genres: string[];
+      studios: { nodes: { name: string }[] };
+      episodes: number | null;
+      duration: number | null;
+      status: string;
+      format: string;
+      season: string | null;
+      seasonYear: number | null;
+      startDate: { year: number | null; month: number | null; day: number | null };
+      endDate: { year: number | null; month: number | null; day: number | null };
+      averageScore: number | null;
+      trailer: { id: string; site: string } | null;
+      source: string | null;
+    };
+  };
+  errors?: { message: string }[];
+}
+
+export async function getMetadataFromAniList(
+  query: string
+): Promise<AniListMedia | null> {
+  try {
+    const res = await fetchWithRetry(
+      ANILIST_URL,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': 'yukio-bot/1.0',
+        },
+        body: JSON.stringify({
+          query: METADATA_QUERY,
+          variables: { search: query },
+        }),
+      },
+      { retries: 0, timeout: TIMEOUT }
+    );
+
+    if (!res.ok) {
+      console.warn(`[AniList] metadata HTTP ${res.status}`);
+      return null;
+    }
+
+    const json = (await res.json()) as AniListMetadataResponse;
+
+    if (json.errors?.length) {
+      console.warn(`[AniList] metadata error: ${json.errors[0]?.message}`);
+      return null;
+    }
+
+    const m = json.data?.Media;
+    if (!m) return null;
+
+    let trailer: string | null = null;
+    if (m.trailer?.site === 'youtube' && m.trailer.id) {
+      trailer = m.trailer.id;
+    }
+
+    const studios = (m.studios?.nodes ?? [])
+      .map((s) => ({ name: s.name }))
+      .slice(0, 3);
+
+    return {
+      id: m.id,
+      title: {
+        romaji: m.title.romaji ?? 'Unknown',
+        english: m.title.english ?? null,
+        native: m.title.native ?? null,
+      },
+      coverImage: {
+        extraLarge: m.coverImage.extraLarge ?? '',
+        large: m.coverImage.large ?? '',
+      },
+      description: m.description ?? null,
+      format: mapAniListFormat(m.format),
+      status: mapAniListStatus(m.status),
+      seasonYear: m.seasonYear ?? null,
+      episodes: m.episodes ?? null,
+      genres: Array.isArray(m.genres) ? m.genres : [],
+      averageScore: m.averageScore ?? null,
+      studios: { nodes: studios },
+      startDate: {
+        year: m.startDate?.year ?? null,
+        month: m.startDate?.month ?? null,
+        day: m.startDate?.day ?? null,
+      },
+      duration: m.duration ?? null,
+      rating: mapAniListRating(m.source === null ? null : null),  // AniList tidak punya ageRating di metadata
+      endDate: m.endDate?.year
+        ? {
+            year: m.endDate.year,
+            month: m.endDate.month ?? null,
+            day: m.endDate.day ?? null,
+          }
+        : null,
+      banner: m.bannerImage ?? null,
+      trailer,
+      myanimelistId: m.idMal ?? null,
+      source: mapAniListSource(m.source),
+    };
+  } catch (err) {
+    console.warn('[AniList] metadata failed:', err);
+    return null;
+  }
 }
