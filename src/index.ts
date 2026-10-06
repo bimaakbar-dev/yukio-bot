@@ -6,6 +6,7 @@ import { cleanupCache } from './lib/cache';
 import { isAdmin } from './lib/permissions';
 import { handleDocumentAuto } from './commands/decode';
 import { setupAnimeCallbacks } from './commands/anime';
+import { setupVaCallbacks } from './commands/va';
 import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
 import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
@@ -29,6 +30,7 @@ function createBot(env: Env): Bot {
   setupBusinessHandler(bot, env);
   setupAnimeCallbacks(bot, env);
   setupDatabaseAnimeCallbacks(bot, env);
+  setupVaCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
