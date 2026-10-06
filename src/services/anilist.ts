@@ -250,9 +250,6 @@ function mapAniListStatus(raw: string | null | undefined): string {
   return map[upper] ?? 'RELEASING';
 }
 
-/**
- * Map rating AniList → rating schema kita.
- */
 function mapAniListRating(raw: string | null | undefined): string | null {
   if (!raw) return null;
   const upper = raw.toUpperCase();
