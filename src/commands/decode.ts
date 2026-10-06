@@ -1,6 +1,8 @@
 // src/commands/decode.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
+import { InlineKeyboard } from 'grammy';
+import { saveBatchSession } from './publish';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 
@@ -1134,14 +1136,14 @@ async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void>
   }
 }
 
-// =================================================================
-// BATCH
-// =================================================================
+function extractSlugHint(url: string): string | null {
+  const m = url.match(/\/tonton\/([^/]+)/i);
+  return m?.[1] ?? null;
+}
 
 function buildBatchUrls(input: string, start: number, end: number): string[] {
   const urls: string[] = [];
 
-  // 1. Template dengan {n}
   if (input.includes('{n}')) {
     for (let n = start; n <= end; n++) {
       urls.push(input.replace(/\{n\}/g, String(n)));
@@ -1149,7 +1151,6 @@ function buildBatchUrls(input: string, start: number, end: number): string[] {
     return urls;
   }
 
-  // 2. URL yang sudah ada "episode-N" → ganti dengan pattern baru
   const epMatch = input.match(/(episode|eps?|e)[-_]?0*\d+/i);
   if (epMatch && epMatch.index !== undefined) {
     const prefix = input.slice(0, epMatch.index);
@@ -1160,7 +1161,6 @@ function buildBatchUrls(input: string, start: number, end: number): string[] {
     return urls;
   }
 
-  // 3. Base URL → append episode-{n}-sub-indo
   const base = input.replace(/\/+$/, '');
   for (let n = start; n <= end; n++) {
     urls.push(`${base}/episode-${n}-sub-indo`);
@@ -1230,7 +1230,6 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
     const n = start + i;
     const url = urls[i]!;
 
-    // Update progress
     try {
       await ctx.api.editMessageText(
         ctx.chat!.id,
@@ -1290,15 +1289,44 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
   const caption = captionLines.join('\n');
 
   try {
-    await sendDocumentViaApi(
-      env.TELEGRAM_BOT_TOKEN,
-      ctx.chat!.id,
-      filename,
-      combinedJson,
-      caption
+  await sendDocumentViaApi(
+    env.TELEGRAM_BOT_TOKEN,
+    ctx.chat!.id,
+    filename,
+    combinedJson,
+    caption
+  );
+  await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+  if (ctx.from?.id) {
+    const slugHint = extractSlugHint(input);
+    const sessionId = await saveBatchSession(env.DB, ctx.from.id, {
+      slugHint,
+      startEp: start,
+      endEp: end,
+      jsonData: combinedJson,
+      totalUrls,
+      errors: errors.map((e) => `Ep ${e.number}: ${e.error}`),
+    });
+
+    const kb = new InlineKeyboard()
+      .text('📤 Publish ke Web', `pub:ba:${sessionId}`)
+      .text('❌ Batal', `pub:bax:${sessionId}`);
+
+    await ctx.reply(
+      `📦 <b>Batch siap di-publish!</b>\n\n` +
+        `📊 ${results.length}/${total} episode\n` +
+        `🎬 ${totalUrls} URL\n` +
+        (slugHint ? `🔗 Slug hint: <code>${escapeHtml(slugHint)}</code>\n` : '') +
+        `🆔 Session: <code>${sessionId}</code>\n\n` +
+        `<i>Klik tombol di bawah untuk publish ke repo web.</i>`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
     );
-    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-  } catch (err: any) {
+  }
+} catch (err: any) {
     console.error('[Batch] sendDocument failed:', err);
     await ctx.api
       .editMessageText(
