@@ -10,9 +10,12 @@ import { setupVaCallbacks } from './commands/va';
 import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
 import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
+import { setupPublishCallbacks } from './commands/publish';
+import { COMMANDS } from './commands/list';
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
+let menuSetForToken: string | null = null;
 
 function createBot(env: Env): Bot {
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
@@ -31,6 +34,7 @@ function createBot(env: Env): Bot {
   setupAnimeCallbacks(bot, env);
   setupDatabaseAnimeCallbacks(bot, env);
   setupVaCallbacks(bot, env);
+  setupPublishCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
@@ -56,6 +60,24 @@ function createBot(env: Env): Bot {
   return bot;
 }
 
+async function setupBotMenu(bot: Bot, token: string): Promise<void> {
+  // Skip kalau sudah di-set untuk token ini (per isolate)
+  if (menuSetForToken === token) return;
+
+  try {
+    const commands = COMMANDS.map((c) => ({
+      command: c.name,
+      description: (c.description || c.name).slice(0, 256),
+    }));
+
+    await bot.api.setMyCommands(commands);
+    menuSetForToken = token;
+    console.log(`[Bot] setMyCommands: ${commands.length} commands registered`);
+  } catch (err) {
+    console.error('[Bot] setMyCommands failed:', err);
+  }
+}
+
 async function getBot(env: Env): Promise<Bot> {
   if (!cachedBot) {
     console.log('[Bot] creating new instance');
@@ -66,8 +88,10 @@ async function getBot(env: Env): Promise<Bot> {
     const t0 = Date.now();
     initPromise = cachedBot
       .init()
-      .then(() => {
+      .then(async () => {
         console.log(`[Bot] init OK in ${Date.now() - t0}ms`);
+        // Set command menu sekali (best effort)
+        await setupBotMenu(cachedBot!, env.TELEGRAM_BOT_TOKEN);
       })
       .catch((err) => {
         console.error(`[Bot] init FAILED in ${Date.now() - t0}ms:`, err);
@@ -96,6 +120,33 @@ export default {
       );
     }
 
+    // Endpoint manual untuk set command menu
+    if (url.pathname === '/setup-commands') {
+      try {
+        const bot = await getBot(env);
+        const commands = COMMANDS.map((c) => ({
+          command: c.name,
+          description: (c.description || c.name).slice(0, 256),
+        }));
+        await bot.api.setMyCommands(commands);
+        menuSetForToken = env.TELEGRAM_BOT_TOKEN;
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            count: commands.length,
+            commands: commands.map((c) => `/${c.command}`),
+          }, null, 2),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({ ok: false, error: err?.message ?? String(err) }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
@@ -122,70 +173,70 @@ export default {
         );
       }
     }
-    
-    if (url.pathname === '/debug/anilist') {
-  const t0 = Date.now();
-  const proxyUrl = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
 
-  const query = `
-    query ($idMal: Int) {
-      Media(idMal: $idMal, type: ANIME) {
-        id
-        title { romaji }
-        characters(page: 1, perPage: 3) {
-          edges {
-            role
-            node { name { full } }
-            voiceActors(language: JAPANESE) {
-              id
-              name { full }
-              languageV2
+    if (url.pathname === '/debug/anilist') {
+      const t0 = Date.now();
+      const proxyUrl = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
+
+      const query = `
+        query ($idMal: Int) {
+          Media(idMal: $idMal, type: ANIME) {
+            id
+            title { romaji }
+            characters(page: 1, perPage: 3) {
+              edges {
+                role
+                node { name { full } }
+                voiceActors(language: JAPANESE) {
+                  id
+                  name { full }
+                  languageV2
+                }
+              }
             }
           }
         }
+      `;
+
+      try {
+        const res = await fetch(proxyUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            query,
+            variables: { idMal: 40748 },
+          }),
+        });
+
+        const text = await res.text();
+
+        return new Response(
+          JSON.stringify(
+            {
+              ok: res.ok,
+              status: res.status,
+              elapsed: Date.now() - t0,
+              bodyPreview: text.slice(0, 2000),
+            },
+            null,
+            2
+          ),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            elapsed: Date.now() - t0,
+            error: err?.message ?? String(err),
+          }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
       }
     }
-  `;
-
-  try {
-    const res = await fetch(proxyUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        query,
-        variables: { idMal: 40748 },
-      }),
-    });
-
-    const text = await res.text();
-
-    return new Response(
-      JSON.stringify(
-        {
-          ok: res.ok,
-          status: res.status,
-          elapsed: Date.now() - t0,
-          bodyPreview: text.slice(0, 2000),
-        },
-        null,
-        2
-      ),
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-  } catch (err: any) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        elapsed: Date.now() - t0,
-        error: err?.message ?? String(err),
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-}
 
     if (url.pathname === '/discord/register') {
       return registerDiscordCommands(env);
