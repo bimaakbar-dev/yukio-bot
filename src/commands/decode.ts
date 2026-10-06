@@ -40,6 +40,7 @@ const VIDEO_HOSTS = [
   'krakenfiles',
   'gofile',
   'acefile',
+  'animekuid',
 ];
 
 const WRAPPER_HOSTS = ['animesail.xyz', '154999000.xyz'];
