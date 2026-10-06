@@ -4,6 +4,7 @@ import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import type { AniListMedia } from '../types/anime';
 import { chainSearch } from '../services/qimochi-chain';
 import {
   chainCharacters,
@@ -15,6 +16,9 @@ import {
   buildMetadataYaml,
   getSynopsisRaw,
 } from '../services/qimochi-yaml';
+import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
+import { searchKitsu, kitsuToAniList } from '../services/kitsu';
+import { getMetadataFromAniList } from '../services/anilist';
 import { askAI } from '../services/ai';
 import {
   escapeHtml,
@@ -30,9 +34,10 @@ import { showVaMenu } from './va';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const AI_TIMEOUT_MS = 12000;
+const SOURCE_TIMEOUT_MS = 8000;
 
 /* ============================================================
-   DB: INIT (sessions + voice_actors)
+   DB: INIT
    ============================================================ */
 
 let dbReady = false;
@@ -57,11 +62,24 @@ async function ensureDb(db: D1Database): Promise<void> {
             type         TEXT,
             studio       TEXT,
             source       TEXT,
+            metadata     TEXT,
+            fetched_sources TEXT,
             created_at   INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL
           )`
         )
         .run();
+
+      // Migration: tambah kolom baru kalau belum ada (untuk table existing)
+      for (const col of ['metadata', 'fetched_sources']) {
+        try {
+          await db
+            .prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
+            .run();
+        } catch {
+          // Kolom sudah ada, ignore
+        }
+      }
 
       await db
         .prepare(
@@ -90,7 +108,7 @@ async function ensureDb(db: D1Database): Promise<void> {
 }
 
 /* ============================================================
-   DB: SESSION
+   SESSION TYPES
    ============================================================ */
 
 interface SessionRow {
@@ -104,6 +122,8 @@ interface SessionRow {
   type: string | null;
   studio: string | null;
   source: string | null;
+  metadata: string | null;
+  fetched_sources: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -120,6 +140,8 @@ async function saveSession(
     type: string | null;
     studio: string | null;
     source: string | null;
+    metadata?: AniListMedia | null;
+    fetchedSources?: string[];
   }
 ): Promise<string> {
   await ensureDb(db);
@@ -130,8 +152,8 @@ async function saveSession(
   await db
     .prepare(
       `INSERT INTO qimochi_sessions
-        (session_id, user_id, mal_id, kitsu_id, title, cover, year, type, studio, source, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (session_id, user_id, mal_id, kitsu_id, title, cover, year, type, studio, source, metadata, fetched_sources, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
@@ -144,12 +166,37 @@ async function saveSession(
       data.type,
       data.studio,
       data.source,
+      data.metadata ? JSON.stringify(data.metadata) : null,
+      data.fetchedSources ? JSON.stringify(data.fetchedSources) : null,
       now,
       now + SESSION_TTL_MS
     )
     .run();
 
   return sessionId;
+}
+
+async function updateSessionMetadata(
+  db: D1Database,
+  sessionId: string,
+  metadata: AniListMedia,
+  fetchedSources: string[]
+): Promise<void> {
+  await ensureDb(db);
+  await db
+    .prepare(
+      `UPDATE qimochi_sessions
+       SET metadata = ?, fetched_sources = ?, title = ?, cover = ?
+       WHERE session_id = ?`
+    )
+    .bind(
+      JSON.stringify(metadata),
+      JSON.stringify(fetchedSources),
+      metadata.title.romaji,
+      metadata.coverImage.extraLarge,
+      sessionId
+    )
+    .run();
 }
 
 async function getSession(
@@ -183,7 +230,7 @@ async function getLatestSessionByUser(
 ): Promise<SessionRow | null> {
   await ensureDb(db);
 
-  const row = await db
+  return db
     .prepare(
       `SELECT * FROM qimochi_sessions
        WHERE user_id = ? AND expires_at > ?
@@ -191,8 +238,6 @@ async function getLatestSessionByUser(
     )
     .bind(userId, Date.now())
     .first<SessionRow>();
-
-  return row;
 }
 
 async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
@@ -207,7 +252,148 @@ async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
 }
 
 /* ============================================================
-   VOICE ACTORS STORE (untuk disimpan silent saat klik Characters)
+   METADATA: DETECT MISSING + MERGE
+   ============================================================ */
+
+interface MissingInfo {
+  fields: string[];
+  canShikimori: boolean;
+  canKitsu: boolean;
+}
+
+const SHIKIMORI_CAN_FILL = new Set([
+  'titleEnglish', 'titleNative', 'malId', 'source',
+  'duration', 'rating', 'aired.to', 'genres', 'studios',
+  'banner', 'trailer', 'stats.score',
+]);
+
+const KITSU_CAN_FILL = new Set([
+  'titleEnglish', 'titleNative', 'kitsuId',
+  'duration', 'banner', 'aired.to', 'genres', 'stats.score',
+]);
+
+function detectMissing(
+  media: AniListMedia,
+  fetchedSources: string[]
+): MissingInfo {
+  const fields: string[] = [];
+
+  if (!media.title.english) fields.push('titleEnglish');
+  if (!media.title.native) fields.push('titleNative');
+  if (!media.myanimelistId) fields.push('malId');
+  if (!media.source) fields.push('source');
+  if (!media.duration) fields.push('duration');
+  if (!media.rating) fields.push('rating');
+  if (!media.endDate) fields.push('aired.to');
+  if (!media.genres || media.genres.length === 0) fields.push('genres');
+  if (!media.studios?.nodes?.length) fields.push('studios');
+  if (!media.banner) fields.push('banner');
+  if (!media.trailer) fields.push('trailer');
+  if (!media.averageScore) fields.push('stats.score');
+
+  const hasShiki = fetchedSources.includes('shikimori');
+  const hasKitsu = fetchedSources.includes('kitsu');
+
+  const canShikimori =
+    !hasShiki && fields.some((f) => SHIKIMORI_CAN_FILL.has(f));
+  const canKitsu =
+    !hasKitsu && fields.some((f) => KITSU_CAN_FILL.has(f));
+
+  return { fields, canShikimori, canKitsu };
+}
+
+interface MergeResult {
+  merged: AniListMedia;
+  filled: string[];
+}
+
+function mergeMetadata(
+  base: AniListMedia,
+  incoming: AniListMedia,
+  sourceName: string
+): MergeResult {
+  const merged: AniListMedia = JSON.parse(JSON.stringify(base));
+  const filled: string[] = [];
+
+  // title.english
+  if (!merged.title.english && incoming.title.english) {
+    merged.title.english = incoming.title.english;
+    filled.push('titleEnglish');
+  }
+  // title.native
+  if (!merged.title.native && incoming.title.native) {
+    merged.title.native = incoming.title.native;
+    filled.push('titleNative');
+  }
+  // malId
+  if (!merged.myanimelistId && incoming.myanimelistId) {
+    merged.myanimelistId = incoming.myanimelistId;
+    filled.push('malId');
+  }
+  // source
+  if (!merged.source && incoming.source) {
+    merged.source = incoming.source;
+    filled.push('source');
+  }
+  // duration
+  if (!merged.duration && incoming.duration) {
+    merged.duration = incoming.duration;
+    filled.push('duration');
+  }
+  // rating
+  if (!merged.rating && incoming.rating) {
+    merged.rating = incoming.rating;
+    filled.push('rating');
+  }
+  // end date
+  if (!merged.endDate && incoming.endDate) {
+    merged.endDate = incoming.endDate;
+    filled.push('aired.to');
+  }
+  // genres
+  if (
+    (!merged.genres || merged.genres.length === 0) &&
+    incoming.genres?.length
+  ) {
+    merged.genres = incoming.genres;
+    filled.push('genres');
+  }
+  // studios
+  if (!merged.studios?.nodes?.length && incoming.studios?.nodes?.length) {
+    merged.studios = incoming.studios;
+    filled.push('studios');
+  }
+  // banner
+  if (!merged.banner && incoming.banner) {
+    merged.banner = incoming.banner;
+    filled.push('banner');
+  }
+  // trailer
+  if (!merged.trailer && incoming.trailer) {
+    merged.trailer = incoming.trailer;
+    filled.push('trailer');
+  }
+  // score
+  if (!merged.averageScore && incoming.averageScore) {
+    merged.averageScore = incoming.averageScore;
+    filled.push('stats.score');
+  }
+  // cover (fallback kalau AniList kosong — jarang)
+  if (!merged.coverImage.extraLarge && incoming.coverImage.extraLarge) {
+    merged.coverImage.extraLarge = incoming.coverImage.extraLarge;
+    merged.coverImage.large = incoming.coverImage.large;
+    filled.push('image');
+  }
+
+  console.log(
+    `[Merge] ${sourceName} filled: ${filled.length > 0 ? filled.join(', ') : 'nothing'}`
+  );
+
+  return { merged, filled };
+}
+
+/* ============================================================
+   VOICE ACTORS STORE
    ============================================================ */
 
 interface VoiceActorInput {
@@ -223,7 +409,6 @@ async function saveVoiceActors(
   vas: VoiceActorInput[]
 ): Promise<void> {
   if (vas.length === 0) return;
-
   await ensureDb(db);
 
   const ids = vas.map((v) => v.id);
@@ -260,7 +445,6 @@ async function saveVoiceActors(
   );
 
   await db.batch(stmts);
-
   console.log(
     `[DBA] VA: ${newVAs.length} baru disimpan, ${vas.length - newVAs.length} sudah ada`
   );
@@ -269,6 +453,98 @@ async function saveVoiceActors(
 /* ============================================================
    HELPERS
    ============================================================ */
+
+function getFetchedSources(session: SessionRow): string[] {
+  if (!session.fetched_sources) return [];
+  try {
+    const arr = JSON.parse(session.fetched_sources);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function getSessionMetadata(session: SessionRow): AniListMedia | null {
+  if (!session.metadata) return null;
+  try {
+    return JSON.parse(session.metadata) as AniListMedia;
+  } catch {
+    return null;
+  }
+}
+
+function buildMetadataKeyboard(
+  sessionId: string,
+  missing: MissingInfo
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  let hasRow = false;
+
+  if (missing.canShikimori) {
+    kb.text('📡 Cari Shikimori', `qd:ms:${sessionId}`);
+    hasRow = true;
+  }
+  if (missing.canKitsu) {
+    if (hasRow) kb.row();
+    kb.text('📡 Cari Kitsu', `qd:mk:${sessionId}`);
+    hasRow = true;
+  }
+  if (hasRow) kb.row();
+  kb.text('✅ Selesai', `qd:mo:${sessionId}`);
+
+  return kb;
+}
+
+function buildMetadataView(
+  session: SessionRow,
+  media: AniListMedia,
+  missing: MissingInfo,
+  sources: string[]
+): string {
+  const yaml = buildMetadataYaml({
+    media,
+    malId: media.myanimelistId ?? session.mal_id,
+    kitsuId: session.kitsu_id,
+  });
+
+  const sourceLabel = sources.length > 0
+    ? sources.map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' + ')
+    : '—';
+
+  const lines: string[] = [];
+  lines.push(`📋 <b>Metadata — ${escapeHtml(media.title.romaji)}</b>`);
+  lines.push(`<i>Sumber: ${escapeHtml(sourceLabel)}</i>`);
+
+  if (missing.fields.length > 0) {
+    lines.push('');
+    lines.push(
+      `⚠️ <b>Field kosong (${missing.fields.length}):</b> ` +
+        `<code>${escapeHtml(missing.fields.join(', '))}</code>`
+    );
+  } else {
+    lines.push('');
+    lines.push('✅ <b>Semua field lengkap!</b>');
+  }
+
+  lines.push('');
+  lines.push(`<pre>${escapeHtml(yaml)}</pre>`);
+
+  return lines.join('\n');
+}
+
+async function fetchWithTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+    ]);
+  } catch {
+    return null;
+  }
+}
 
 function buildKeyboard(sessionId: string): InlineKeyboard {
   return new InlineKeyboard()
@@ -378,7 +654,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
     return;
   }
 
-  const loading = await ctx.reply('🔍 Mencari (Shikimori → Kitsu)...');
+  const loading = await ctx.reply('🔍 Mencari (AniList → Shikimori → Kitsu)...');
 
   try {
     let result;
@@ -407,6 +683,8 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       type: media.format,
       studio,
       source: result.source,
+      metadata: media,
+      fetchedSources: ['anilist'],
     });
 
     const session = await getSession(env.DB, sessionId);
@@ -419,16 +697,12 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       return;
     }
 
-    // Track pesan user
     if (ctx.message?.message_id) {
       await trackMessage(env.DB, sessionId, ctx.message.message_id);
     }
-
-    // Track loading message, lalu hapus
     await trackMessage(env.DB, sessionId, loading.message_id);
     await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
 
-    // Kirim preview
     if (session.cover) {
       const msg = await ctx.replyWithPhoto(session.cover, {
         caption: buildPreviewText(session),
@@ -484,11 +758,9 @@ export const endCommand: CommandDefinition = {
 
   handler: async (ctx, env) => {
     if (!ctx.from?.id || !ctx.chat?.id) return;
-
     await ensureDb(env.DB);
 
     const endMsgId = ctx.message?.message_id;
-
     const session = await getLatestSessionByUser(env.DB, ctx.from.id);
 
     if (!session) {
@@ -506,17 +778,12 @@ export const endCommand: CommandDefinition = {
       await trackMessage(env.DB, session.session_id, endMsgId);
     }
 
-    console.log(
-      `[DBA] /end — clearing session ${session.session_id} (${session.title})`
-    );
-
     const deleted = await clearTrackedSession(
       ctx.api,
       env.DB,
       ctx.chat.id,
       session.session_id
     );
-
     await deleteSession(env.DB, session.session_id);
 
     await sendAutoDelete(
@@ -538,250 +805,388 @@ function buildChainContext(session: SessionRow): ChainContext {
   };
 }
 
-export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
-  bot.callbackQuery(/^qd:([mcefsvx]):(q_[a-f0-9]+)$/, async (ctx) => {
-    const match = ctx.match as RegExpMatchArray;
-    const action = match[1];
-    const sessionId = match[2];
+/**
+ * Handler Metadata utama: fetch AniList (kalau belum) atau tampil dari session.
+ */
+async function handleMetadataShow(
+  ctx: Context,
+  env: Env,
+  session: SessionRow,
+  tracker: Tracker
+): Promise<void> {
+  let media = getSessionMetadata(session);
 
-    if (!action || !sessionId) {
-      await ctx.answerCallbackQuery({ text: '❌ Callback invalid' });
-      return;
-    }
+  // Belum ada metadata → fetch AniList
+  if (!media) {
+    const fetched = await fetchWithTimeout(
+      () => getMetadataFromAniList(session.title),
+      SOURCE_TIMEOUT_MS
+    );
 
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({
-        text: '⏱️ Session kadaluarsa. Ulangi /dba.',
-        show_alert: true,
-      });
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-      return;
-    }
-
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
-      return;
-    }
-
-    // === BATAL ===
-    if (action === 'x') {
-      await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
-
-      const chatId = ctx.chat?.id;
-      if (!chatId) return;
-
-      const deleted = await clearTrackedSession(
-        ctx.api,
-        env.DB,
-        chatId,
-        sessionId
-      );
-      await deleteSession(env.DB, sessionId);
-
-      await sendAutoDelete(
-        ctx,
-        `✅ <b>Selesai</b>\n<i>${deleted} pesan dihapus.</i>`
-      );
-      return;
-    }
-
-    // === VOICE ACTORS (redirect ke /va menu) ===
-    if (action === 'v') {
-      await ctx.answerCallbackQuery({ text: '🎤 Buka menu Voice Actors...' });
-      await showVaMenu(ctx, env);
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
-
-    const tracker: Tracker = (msgId) =>
-      trackMessage(env.DB, sessionId, msgId);
-
-    try {
-      const chainCtx = buildChainContext(session);
-
-      /* ---------- METADATA ---------- */
-      if (action === 'm') {
-        let result;
-        try {
-          result = await chainSearch(session.title);
-        } catch (err: any) {
-          const msg = await ctx.reply(
-            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
-            { parse_mode: 'HTML' }
-          );
-          await tracker(msg.message_id);
-          return;
-        }
-
-        const yaml = buildMetadataYaml({
-          media: result.media,
-          malId: result.malId ?? session.mal_id,
-          kitsuId: result.kitsuId ?? session.kitsu_id,
-        });
-        await sendTextSection(
-          ctx,
-          `Metadata — ${session.title}`,
-          yaml,
-          tracker
-        );
-        return;
-      }
-
-      /* ---------- CHARACTERS (simpan VA silent) ---------- */
-      if (action === 'c') {
-        const { data: result, error } = await safeFetch(
-          () => chainCharacters(chainCtx),
-          25000
-        );
-
-        if (!result || !result.data || result.data.length === 0) {
-          const errs = result?.errors ?? [error ?? 'unknown'];
-          await sendTextSection(
-            ctx,
-            `Characters — ${session.title} [FAILED]`,
-            fallbackJson(errs),
-            tracker
-          );
-          return;
-        }
-
-        const chars = result.data;
-        const vas = result.voiceActors;
-        const source = result.source;
-
-        if (vas.length > 0) {
-          try {
-            await saveVoiceActors(env.DB, vas);
-          } catch (err) {
-            console.warn('[DBA] Gagal simpan VA:', err);
-          }
-        }
-
-        await sendJsonSection(
-          ctx,
-          `Characters — ${session.title} [${source}]`,
-          chars,
-          tracker
-        );
-
-        if (vas.length > 0) {
-          const msg = await ctx.reply(
-            `ℹ️ <i>${vas.length} voice actor tersimpan ke DB. ` +
-              `Ketik /va untuk kelola.</i>`,
-            { parse_mode: 'HTML' }
-          );
-          await tracker(msg.message_id);
-        }
-
-        return;
-      }
-
-      /* ---------- EPISODES ---------- */
-      if (action === 'e') {
-        const { data: result, error } = await safeFetch(
-          () => chainEpisodes(chainCtx),
-          30000
-        );
-
-        if (!result || !result.data || result.data.length === 0) {
-          const errs = result?.errors ?? [error ?? 'unknown'];
-          await sendTextSection(
-            ctx,
-            `Episodes — ${session.title} [FAILED]`,
-            fallbackJson(errs),
-            tracker
-          );
-          return;
-        }
-
-        const eps = result.data;
-        const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
-
-        await sendJsonSection(
-          ctx,
-          `Episodes — ${session.title} [${result.source}]${truncNote}`,
-          eps,
-          tracker
-        );
-        return;
-      }
-
-      /* ---------- FRANCHISES ---------- */
-      if (action === 'f') {
-        const { data: result, error } = await safeFetch(
-          () => chainRelations(chainCtx),
-          25000
-        );
-
-        if (!result || !result.data || result.data.length === 0) {
-          const errs = result?.errors ?? [error ?? 'unknown'];
-          await sendTextSection(
-            ctx,
-            `Franchises — ${session.title} [FAILED]`,
-            fallbackJson(errs),
-            tracker
-          );
-          return;
-        }
-
-        await sendJsonSection(
-          ctx,
-          `Franchises — ${session.title} [${result.source}]`,
-          result.data,
-          tracker
-        );
-        return;
-      }
-
-      /* ---------- SUMMARY ---------- */
-      if (action === 's') {
-        let result;
-        try {
-          result = await chainSearch(session.title);
-        } catch (err: any) {
-          const msg = await ctx.reply(
-            `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
-            { parse_mode: 'HTML' }
-          );
-          await tracker(msg.message_id);
-          return;
-        }
-
-        const raw = getSynopsisRaw(result.media);
-        const { data: ai } = await safeFetch(
-          () => rewriteSynopsis(env, session.title, raw),
-          AI_TIMEOUT_MS
-        );
-
-        const body = ai ?? raw ?? 'Tulis sinopsis manual...';
-        await sendTextSection(
-          ctx,
-          `Summary — ${session.title}`,
-          body,
-          tracker
-        );
-        return;
-      }
-    } catch (err: any) {
-      console.error('[DBA] callback error:', err);
-      const msg = err?.message ?? 'unknown';
-
-      let hint = '';
-      if (msg.includes('aborted') || msg.includes('timeout')) {
-        hint = '\n\n<i>API lambat. Coba lagi dalam 30 detik.</i>';
-      } else if (msg.includes('429')) {
-        hint = '\n\n<i>Rate limit. Tunggu 1 menit.</i>';
-      } else if (msg.includes('HTTP 5')) {
-        hint = '\n\n<i>Server down. Coba lagi nanti.</i>';
-      }
-
-      const m = await ctx.reply(
-        `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
+    if (!fetched) {
+      const msg = await ctx.reply(
+        '❌ Gagal fetch metadata dari AniList.',
         { parse_mode: 'HTML' }
       );
-      await tracker(m.message_id).catch(() => {});
+      await tracker(msg.message_id);
+      return;
     }
+
+    media = fetched;
+    await updateSessionMetadata(env.DB, session.session_id, media, ['anilist']);
+  }
+
+  const sources = getFetchedSources(session);
+  const missing = detectMissing(media, sources);
+  const view = buildMetadataView(session, media, missing, sources);
+  const kb = buildMetadataKeyboard(session.session_id, missing);
+
+  const msg = await ctx.reply(view, {
+    parse_mode: 'HTML',
+    reply_markup: kb,
+    link_preview_options: { is_disabled: true },
   });
+  await tracker(msg.message_id);
+}
+
+/**
+ * Handler merge: fetch source, merge, tampil ulang.
+ */
+async function handleMetadataMerge(
+  ctx: Context,
+  env: Env,
+  session: SessionRow,
+  sourceName: 'shikimori' | 'kitsu',
+  tracker: Tracker
+): Promise<void> {
+  const media = getSessionMetadata(session);
+  if (!media) {
+    const msg = await ctx.reply('❌ Session tidak punya metadata.');
+    await tracker(msg.message_id);
+    return;
+  }
+
+  const sources = getFetchedSources(session);
+  if (sources.includes(sourceName)) {
+    const msg = await ctx.reply(
+      `ℹ️ ${sourceName} sudah pernah di-fetch.`,
+      { parse_mode: 'HTML' }
+    );
+    await tracker(msg.message_id);
+    return;
+  }
+
+  // Fetch source baru
+  let incoming: AniListMedia | null = null;
+
+  if (sourceName === 'shikimori') {
+    const shiki = await fetchWithTimeout(
+      () => searchShikimori(session.title),
+      SOURCE_TIMEOUT_MS
+    );
+    if (shiki) incoming = shikimoriToAniList(shiki);
+  } else if (sourceName === 'kitsu') {
+    const kitsu = await fetchWithTimeout(
+      () => searchKitsu(session.title),
+      SOURCE_TIMEOUT_MS
+    );
+    if (kitsu) incoming = kitsuToAniList(kitsu);
+  }
+
+  if (!incoming) {
+    const msg = await ctx.reply(
+      `❌ Gagal fetch dari ${sourceName}.`,
+      { parse_mode: 'HTML' }
+    );
+    await tracker(msg.message_id);
+    return;
+  }
+
+  // Merge
+  const { merged, filled } = mergeMetadata(media, incoming, sourceName);
+
+  // Update session
+  const newSources = [...sources, sourceName];
+  await updateSessionMetadata(env.DB, session.session_id, merged, newSources);
+
+  // Reload session (untuk title/cover baru)
+  const updatedSession = (await getSession(env.DB, session.session_id))!;
+
+  // Notif kalau tidak ada yang di-fill
+  if (filled.length === 0) {
+    const msg = await ctx.reply(
+      `ℹ️ <i>Tidak ada field baru dari ${sourceName}.</i>`,
+      { parse_mode: 'HTML' }
+    );
+    await tracker(msg.message_id);
+    return;
+  }
+
+  // Tampilkan YAML baru
+  const missing = detectMissing(merged, newSources);
+  const view = buildMetadataView(updatedSession, merged, missing, newSources);
+  const kb = buildMetadataKeyboard(session.session_id, missing);
+
+  const msg = await ctx.reply(view, {
+    parse_mode: 'HTML',
+    reply_markup: kb,
+    link_preview_options: { is_disabled: true },
+  });
+  await tracker(msg.message_id);
+}
+
+export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(
+    /^qd:(ms|mk|mo|m|c|e|f|s|v|x):(q_[a-f0-9]+)$/,
+    async (ctx) => {
+      const match = ctx.match as RegExpMatchArray;
+      const action = match[1];
+      const sessionId = match[2];
+
+      if (!action || !sessionId) {
+        await ctx.answerCallbackQuery({ text: '❌ Callback invalid' });
+        return;
+      }
+
+      const session = await getSession(env.DB, sessionId);
+      if (!session) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Session kadaluarsa. Ulangi /dba.',
+          show_alert: true,
+        });
+        await ctx
+          .editMessageReplyMarkup({ reply_markup: undefined })
+          .catch(() => {});
+        return;
+      }
+
+      if (ctx.from?.id !== session.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+        return;
+      }
+
+      // === BATAL ===
+      if (action === 'x') {
+        await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
+        const chatId = ctx.chat?.id;
+        if (!chatId) return;
+
+        const deleted = await clearTrackedSession(
+          ctx.api,
+          env.DB,
+          chatId,
+          sessionId
+        );
+        await deleteSession(env.DB, sessionId);
+
+        await sendAutoDelete(
+          ctx,
+          `✅ <b>Selesai</b>\n<i>${deleted} pesan dihapus.</i>`
+        );
+        return;
+      }
+
+      // === SELESAI (metadata) ===
+      if (action === 'mo') {
+        await ctx.answerCallbackQuery({ text: '✅ Selesai!' });
+        await ctx
+          .editMessageReplyMarkup({ reply_markup: undefined })
+          .catch(() => {});
+        return;
+      }
+
+      // === METADATA REDIRECT → Shikimori ===
+      if (action === 'ms') {
+        await ctx.answerCallbackQuery({ text: '📡 Cari Shikimori...' });
+        const tracker: Tracker = (msgId) =>
+          trackMessage(env.DB, sessionId, msgId);
+        await handleMetadataMerge(ctx, env, session, 'shikimori', tracker);
+        return;
+      }
+
+      // === METADATA REDIRECT → Kitsu ===
+      if (action === 'mk') {
+        await ctx.answerCallbackQuery({ text: '📡 Cari Kitsu...' });
+        const tracker: Tracker = (msgId) =>
+          trackMessage(env.DB, sessionId, msgId);
+        await handleMetadataMerge(ctx, env, session, 'kitsu', tracker);
+        return;
+      }
+
+      // === VOICE ACTORS redirect ===
+      if (action === 'v') {
+        await ctx.answerCallbackQuery({ text: '🎤 Buka menu Voice Actors...' });
+        await showVaMenu(ctx, env);
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
+
+      const tracker: Tracker = (msgId) =>
+        trackMessage(env.DB, sessionId, msgId);
+
+      try {
+        const chainCtx = buildChainContext(session);
+
+        /* ---------- METADATA ---------- */
+        if (action === 'm') {
+          await handleMetadataShow(ctx, env, session, tracker);
+          return;
+        }
+
+        /* ---------- CHARACTERS ---------- */
+        if (action === 'c') {
+          const { data: result, error } = await safeFetch(
+            () => chainCharacters(chainCtx),
+            25000
+          );
+
+          if (!result || !result.data || result.data.length === 0) {
+            const errs = result?.errors ?? [error ?? 'unknown'];
+            await sendTextSection(
+              ctx,
+              `Characters — ${session.title} [FAILED]`,
+              fallbackJson(errs),
+              tracker
+            );
+            return;
+          }
+
+          const chars = result.data;
+          const vas = result.voiceActors;
+          const source = result.source;
+
+          if (vas.length > 0) {
+            try {
+              await saveVoiceActors(env.DB, vas);
+            } catch (err) {
+              console.warn('[DBA] Gagal simpan VA:', err);
+            }
+          }
+
+          await sendJsonSection(
+            ctx,
+            `Characters — ${session.title} [${source}]`,
+            chars,
+            tracker
+          );
+
+          if (vas.length > 0) {
+            const msg = await ctx.reply(
+              `ℹ️ <i>${vas.length} voice actor tersimpan ke DB. ` +
+                `Ketik /va untuk kelola.</i>`,
+              { parse_mode: 'HTML' }
+            );
+            await tracker(msg.message_id);
+          }
+          return;
+        }
+
+        /* ---------- EPISODES ---------- */
+        if (action === 'e') {
+          const { data: result, error } = await safeFetch(
+            () => chainEpisodes(chainCtx),
+            30000
+          );
+
+          if (!result || !result.data || result.data.length === 0) {
+            const errs = result?.errors ?? [error ?? 'unknown'];
+            await sendTextSection(
+              ctx,
+              `Episodes — ${session.title} [FAILED]`,
+              fallbackJson(errs),
+              tracker
+            );
+            return;
+          }
+
+          const eps = result.data;
+          const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
+
+          await sendJsonSection(
+            ctx,
+            `Episodes — ${session.title} [${result.source}]${truncNote}`,
+            eps,
+            tracker
+          );
+          return;
+        }
+
+        /* ---------- FRANCHISES ---------- */
+        if (action === 'f') {
+          const { data: result, error } = await safeFetch(
+            () => chainRelations(chainCtx),
+            25000
+          );
+
+          if (!result || !result.data || result.data.length === 0) {
+            const errs = result?.errors ?? [error ?? 'unknown'];
+            await sendTextSection(
+              ctx,
+              `Franchises — ${session.title} [FAILED]`,
+              fallbackJson(errs),
+              tracker
+            );
+            return;
+          }
+
+          await sendJsonSection(
+            ctx,
+            `Franchises — ${session.title} [${result.source}]`,
+            result.data,
+            tracker
+          );
+          return;
+        }
+
+        /* ---------- SUMMARY ---------- */
+        if (action === 's') {
+          let result;
+          try {
+            result = await chainSearch(session.title);
+          } catch (err: any) {
+            const msg = await ctx.reply(
+              `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
+              { parse_mode: 'HTML' }
+            );
+            await tracker(msg.message_id);
+            return;
+          }
+
+          const raw = getSynopsisRaw(result.media);
+          const { data: ai } = await safeFetch(
+            () => rewriteSynopsis(env, session.title, raw),
+            AI_TIMEOUT_MS
+          );
+
+          const body = ai ?? raw ?? 'Tulis sinopsis manual...';
+          await sendTextSection(
+            ctx,
+            `Summary — ${session.title}`,
+            body,
+            tracker
+          );
+          return;
+        }
+      } catch (err: any) {
+        console.error('[DBA] callback error:', err);
+        const msg = err?.message ?? 'unknown';
+
+        let hint = '';
+        if (msg.includes('aborted') || msg.includes('timeout')) {
+          hint = '\n\n<i>API lambat. Coba lagi dalam 30 detik.</i>';
+        } else if (msg.includes('429')) {
+          hint = '\n\n<i>Rate limit. Tunggu 1 menit.</i>';
+        } else if (msg.includes('HTTP 5')) {
+          hint = '\n\n<i>Server down. Coba lagi nanti.</i>';
+        }
+
+        const m = await ctx.reply(
+          `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
+          { parse_mode: 'HTML' }
+        );
+        await tracker(m.message_id).catch(() => {});
+      }
+    }
+  );
 }
