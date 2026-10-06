@@ -42,7 +42,6 @@ interface ShikimoriAnime {
     id: number;
     name: string;
     filtered_name: string;
-    real: boolean;
   }[];
   genres?: {
     id: number;
