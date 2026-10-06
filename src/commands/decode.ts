@@ -873,6 +873,115 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
   }
 }
 
+interface ProxyResponse {
+  ok: boolean;
+  status: number;
+  body?: string;
+  error?: string;
+  truncated?: boolean;
+}
+
+async function fetchUrlViaProxy(
+  env: Env,
+  url: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(env.VAL_TOWN_FETCH_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+
+    if (!res.ok) {
+      console.warn(`[Decode] proxy HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = (await res.json()) as ProxyResponse;
+
+    if (!data.ok || !data.body) {
+      console.warn(`[Decode] target HTTP ${data.status}: ${data.error ?? ''}`);
+      return null;
+    }
+
+    console.log(
+      `[Decode] fetched ${data.body.length} chars (truncated: ${data.truncated ?? false})`
+    );
+
+    return data.body;
+  } catch (err) {
+    console.warn('[Decode] proxy fetch failed:', err);
+    return null;
+  }
+}
+
+async function handleUrlAuto(
+  ctx: Context,
+  env: Env,
+  url: string
+): Promise<void> {
+  const loading = await ctx.reply(
+    `🌐 Fetch URL:\n<code>${escapeHtml(url)}</code>`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+  );
+
+  try {
+    const html = await fetchUrlViaProxy(env, url);
+    if (!html) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '❌ Gagal fetch URL.\n\n' +
+          '<i>Kemungkinan:</i>\n' +
+          '• Situs memblokir bot\n' +
+          '• Situs butuh JS render (SPA)\n' +
+          '• Situs down / timeout\n' +
+          '• URL tidak valid',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const sourceType: 'base64' | 'html' = looksLikeHtml(html) ? 'html' : 'base64';
+    const processed = processText(html, sourceType);
+
+    if (!processed) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Tidak ada URL video yang bisa diekstrak.\n\n<i>Panjang HTML: ${html.length} char</i>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    const urlSlug = slugify(
+      url.split('/').filter(Boolean).pop() ?? 'url'
+    );
+
+    await sendResult(
+      ctx,
+      env,
+      processed.videos,
+      urlSlug,
+      processed.labels,
+      null
+    );
+  } catch (err: any) {
+    console.error('[Decode] url error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  }
+}
+
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
   description: 'Decode HTML/Base64 atau buka tersimpan',
@@ -941,6 +1050,11 @@ export const decodeCommand: CommandDefinition = {
         }
         return;
       }
+    }
+    
+    if (/^https?:\/\//i.test(input)) {
+      await handleUrlAuto(ctx, env, input);
+      return;
     }
 
     if (input.length > MAX_INPUT_LEN) {
