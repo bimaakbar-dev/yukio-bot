@@ -1,6 +1,6 @@
 // src/services/yukionime.ts
 
-const YUKIONIME_BASE = 'https://qimochi.pages.dev';
+const YUKIONIME_BASE = 'https://yukionime.pages.dev';
 
 export interface YukionimeAnime {
   id: string;
@@ -27,8 +27,8 @@ export async function searchYukionime(
     });
     if (!res.ok) return null;
 
-    const json = (await res.json()) as { data?: any[] };
-    const list = json.data ?? [];
+    const json = (await res.json()) as { data?: YukionimeAnime[] };
+    const list: YukionimeAnime[] = json.data ?? [];
 
     const q = query.toLowerCase().trim();
     const match = list.find((a) => {
@@ -39,14 +39,16 @@ export async function searchYukionime(
     });
 
     if (!match) return null;
-
-    return match as YukionimeAnime;
+    return match;
   } catch (err) {
     console.warn('[Yukionime] search failed:', err);
     return null;
   }
 }
 
+/**
+ * Fetch detail + synopsis dari HTML page (scrape id="synopsis").
+ */
 export async function getYukionimeDetail(
   slug: string
 ): Promise<YukionimeAnime | null> {
@@ -62,13 +64,13 @@ export async function getYukionimeDetail(
     const apiJson = apiRes.ok
       ? ((await apiRes.json()) as { data?: YukionimeAnime })
       : null;
-    
+
     const data: YukionimeAnime = apiJson?.data ?? {
       id: slug,
       title: '',
     };
     data.synopsis = synopsis;
-    
+
     return data;
   } catch (err) {
     console.warn('[Yukionime] detail fetch failed:', err);
@@ -76,11 +78,16 @@ export async function getYukionimeDetail(
   }
 }
 
+/* ============================================================
+   EXTRACT SYNOPSIS
+   ============================================================ */
+
 function extractSynopsis(html: string): string | null {
+  // Cari <div id="synopsis">...</div>
   const match = html.match(
     /<div[^>]*\bid=["']synopsis["'][^>]*>([\s\S]*?)<\/div>/i
   );
-  if (!match?.[1]) return null;
+  if (!match || !match[1]) return null;
 
   return htmlToText(match[1]);
 }
