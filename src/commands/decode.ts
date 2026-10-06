@@ -979,34 +979,78 @@ interface ProxyResponse {
   truncated?: boolean;
 }
 
-async function fetchUrlViaProxy(env: Env, url: string): Promise<string | null> {
+interface ProxyDebug {
+  proxyUrl: string;
+  httpStatus: number;
+  contentType: string;
+  rawLength: number;
+  rawPreview: string;
+  parseOk: boolean;
+  error?: string;
+}
+
+async function fetchUrlViaProxy(
+  env: Env,
+  url: string
+): Promise<{ body: string | null; debug: ProxyDebug }> {
+  const proxyUrl = env.VAL_TOWN_FETCH_URL;
+  const debug: ProxyDebug = {
+    proxyUrl: proxyUrl ?? '(undefined)',
+    httpStatus: 0,
+    contentType: '',
+    rawLength: 0,
+    rawPreview: '',
+    parseOk: false,
+  };
+
+  if (!proxyUrl) {
+    debug.error = 'VAL_TOWN_FETCH_URL tidak di-set';
+    console.error('[Decode]', debug.error);
+    return { body: null, debug };
+  }
+
   try {
-    const res = await fetch(env.VAL_TOWN_FETCH_URL, {
+    const res = await fetch(proxyUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
 
-    if (!res.ok) {
-      console.warn(`[Decode] proxy HTTP ${res.status}`);
-      return null;
-    }
+    debug.httpStatus = res.status;
+    debug.contentType = res.headers.get('content-type') ?? '';
 
-    const data = (await res.json()) as ProxyResponse;
-
-    if (!data.ok || !data.body) {
-      console.warn(`[Decode] target HTTP ${data.status}: ${data.error ?? ''}`);
-      return null;
-    }
+    const raw = await res.text();
+    debug.rawLength = raw.length;
+    debug.rawPreview = raw.slice(0, 200);
 
     console.log(
-      `[Decode] fetched ${data.body.length} chars (truncated: ${data.truncated ?? false})`
+      `[Decode] proxy status=${res.status} ct=${debug.contentType} len=${raw.length}`
     );
 
-    return data.body;
-  } catch (err) {
-    console.warn('[Decode] proxy fetch failed:', err);
-    return null;
+    if (!res.ok) {
+      debug.error = `Proxy HTTP ${res.status}`;
+      return { body: null, debug };
+    }
+
+    let data: ProxyResponse;
+    try {
+      data = JSON.parse(raw) as ProxyResponse;
+      debug.parseOk = true;
+    } catch {
+      debug.error = 'Response proxy bukan JSON';
+      return { body: null, debug };
+    }
+
+    if (!data.ok || !data.body) {
+      debug.error = `Target HTTP ${data.status}: ${data.error ?? 'no body'}`;
+      return { body: null, debug };
+    }
+
+    return { body: data.body, debug };
+  } catch (err: any) {
+    debug.error = `fetch threw: ${err?.message ?? 'unknown'}`;
+    console.error('[Decode] proxy fetch threw:', err);
+    return { body: null, debug };
   }
 }
 
@@ -1017,18 +1061,29 @@ async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void>
   });
 
   try {
-    const html = await fetchUrlViaProxy(env, url);
+    const { body: html, debug } = await fetchUrlViaProxy(env, url);
+
     if (!html) {
+      const debugLines = [
+        '❌ Gagal fetch URL.',
+        '',
+        '<b>🔍 Debug Info:</b>',
+        `proxyUrl: <code>${escapeHtml(debug.proxyUrl)}</code>`,
+        `HTTP status: <code>${debug.httpStatus}</code>`,
+        `Content-Type: <code>${escapeHtml(debug.contentType || '-')}</code>`,
+        `Body length: <code>${debug.rawLength}</code>`,
+        `JSON parse: <code>${debug.parseOk ? 'ok' : 'fail'}</code>`,
+        debug.error ? `Error: <code>${escapeHtml(debug.error)}</code>` : '',
+        '',
+        '<b>Raw preview (200 char pertama):</b>',
+        `<pre>${escapeHtml(debug.rawPreview || '(kosong)')}</pre>`,
+      ].filter(Boolean);
+
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
-        '❌ Gagal fetch URL.\n\n' +
-          '<i>Kemungkinan:</i>\n' +
-          '• Situs memblokir bot\n' +
-          '• Situs butuh JS render (SPA)\n' +
-          '• Situs down / timeout\n' +
-          '• URL tidak valid',
-        { parse_mode: 'HTML' }
+        debugLines.join('\n'),
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
     }
