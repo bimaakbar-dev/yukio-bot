@@ -135,11 +135,31 @@ export default {
     if (url.pathname === '/setup-commands') {
       try {
         const bot = await getBot(env);
-        const commands = COMMANDS.map((c) => ({
-          command: c.name,
-          description: (c.description || c.name).slice(0, 256),
-        }));
-        await bot.api.setMyCommands(commands);
+        const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+
+const commands = COMMANDS
+  .filter((c) => COMMAND_NAME_RE.test(c.name))
+  .map((c) => ({
+    command: c.name,
+    description: (c.description || c.name).slice(0, 256),
+  }));
+
+const skipped = COMMANDS
+  .filter((c) => !COMMAND_NAME_RE.test(c.name))
+  .map((c) => c.name);
+
+await bot.api.setMyCommands(commands);
+menuSetForToken = env.TELEGRAM_BOT_TOKEN;
+
+return new Response(
+  JSON.stringify({
+    ok: true,
+    count: commands.length,
+    commands: commands.map((c) => `/${c.command}`),
+    skipped,
+  }, null, 2),
+  { headers: { 'Content-Type': 'application/json' } }
+);
         menuSetForToken = env.TELEGRAM_BOT_TOKEN;
 
         return new Response(
