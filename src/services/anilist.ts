@@ -392,7 +392,7 @@ export async function getMetadataFromAniList(
         day: m.startDate?.day ?? null,
       },
       duration: m.duration ?? null,
-      rating: mapAniListRating(m.source === null ? null : null),  // AniList tidak punya ageRating di metadata
+      rating: null,
       endDate: m.endDate?.year
         ? {
             year: m.endDate.year,
