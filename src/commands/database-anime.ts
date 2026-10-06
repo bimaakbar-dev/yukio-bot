@@ -16,14 +16,23 @@ import {
   getSynopsisRaw,
 } from '../services/qimochi-yaml';
 import { askAI } from '../services/ai';
+import {
+  escapeHtml,
+  sendTextSection,
+  sendJsonSection,
+  sendAutoDelete,
+  trackMessage,
+  clearTrackedSession,
+  ensureTrackDb,
+  type Tracker,
+} from '../lib/telegram-utils';
+import { showVaMenu } from './va';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
-const MSG_LIMIT = 3500;
 const AI_TIMEOUT_MS = 12000;
-const BATCH_OVERHEAD = 300;
 
 /* ============================================================
-   DB: SESSION
+   DB: INIT (sessions + voice_actors)
    ============================================================ */
 
 let dbReady = false;
@@ -67,6 +76,8 @@ async function ensureDb(db: D1Database): Promise<void> {
         )
         .run();
 
+      await ensureTrackDb(db);
+
       dbReady = true;
     } catch (err) {
       console.error('[DBA] DB init error:', err);
@@ -77,6 +88,10 @@ async function ensureDb(db: D1Database): Promise<void> {
 
   return dbInitPromise;
 }
+
+/* ============================================================
+   DB: SESSION
+   ============================================================ */
 
 interface SessionRow {
   session_id: string;
@@ -162,6 +177,24 @@ async function getSession(
   return row;
 }
 
+async function getLatestSessionByUser(
+  db: D1Database,
+  userId: number
+): Promise<SessionRow | null> {
+  await ensureDb(db);
+
+  const row = await db
+    .prepare(
+      `SELECT * FROM qimochi_sessions
+       WHERE user_id = ? AND expires_at > ?
+       ORDER BY created_at DESC LIMIT 1`
+    )
+    .bind(userId, Date.now())
+    .first<SessionRow>();
+
+  return row;
+}
+
 async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
   try {
     await db
@@ -169,21 +202,13 @@ async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
       .bind(sessionId)
       .run();
   } catch (err) {
-    console.error('[DBA] delete error:', err);
+    console.error('[DBA] delete session error:', err);
   }
 }
 
 /* ============================================================
-   VOICE ACTORS — D1 STORE
+   VOICE ACTORS STORE (untuk disimpan silent saat klik Characters)
    ============================================================ */
-
-interface VoiceActorRow {
-  id: string;
-  name: string;
-  nameNative: string | null;
-  image: string | null;
-  defaultLanguage: string | null;
-}
 
 interface VoiceActorInput {
   id: string;
@@ -193,10 +218,6 @@ interface VoiceActorInput {
   defaultLanguage?: string;
 }
 
-/**
- * Simpan VA ke D1 (skip yang sudah ada).
- * Tidak return apa-apa — silent save.
- */
 async function saveVoiceActors(
   db: D1Database,
   vas: VoiceActorInput[]
@@ -245,143 +266,9 @@ async function saveVoiceActors(
   );
 }
 
-/**
- * Ambil SEMUA VA dari D1 (sorted by id).
- */
-async function getAllVoiceActors(
-  db: D1Database
-): Promise<VoiceActorRow[]> {
-  await ensureDb(db);
-
-  const res = await db
-    .prepare(
-      `SELECT id, name, nameNative, image, defaultLanguage
-       FROM voice_actors
-       ORDER BY id ASC`
-    )
-    .all<VoiceActorRow>();
-
-  return res.results ?? [];
-}
-
 /* ============================================================
    HELPERS
    ============================================================ */
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-function splitText(text: string, max: number): string[] {
-  if (text.length <= max) return [text];
-
-  const parts: string[] = [];
-  let current = '';
-
-  for (const line of text.split('\n')) {
-    if (line.length > max) {
-      if (current) {
-        parts.push(current);
-        current = '';
-      }
-      for (let i = 0; i < line.length; i += max) {
-        const chunk = line.slice(i, i + max);
-        if (i + max >= line.length) {
-          current = chunk;
-        } else {
-          parts.push(chunk);
-        }
-      }
-      continue;
-    }
-
-    const prospective = current ? `${current}\n${line}` : line;
-    if (prospective.length > max && current.length > 0) {
-      parts.push(current);
-      current = line;
-    } else {
-      current = prospective;
-    }
-  }
-
-  if (current) parts.push(current);
-  return parts;
-}
-
-async function sendTextSection(
-  ctx: Context,
-  label: string,
-  content: string
-): Promise<void> {
-  const parts = splitText(content, MSG_LIMIT);
-
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i] ?? '';
-    const header =
-      parts.length > 1
-        ? `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${parts.length}]\n\n`
-        : `📋 <b>${escapeHtml(label)}</b>\n\n`;
-
-    await ctx.reply(`${header}<pre>${escapeHtml(part)}</pre>`, {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-    });
-
-    if (i < parts.length - 1) {
-      await new Promise((r) => setTimeout(r, 400));
-    }
-  }
-}
-
-async function sendJsonSection<T>(
-  ctx: Context,
-  label: string,
-  items: T[]
-): Promise<void> {
-  if (items.length === 0) {
-    await sendTextSection(ctx, label, '[]');
-    return;
-  }
-
-  const fullJson = JSON.stringify(items, null, 2);
-
-  if (fullJson.length <= MSG_LIMIT) {
-    await sendTextSection(ctx, label, fullJson);
-    return;
-  }
-
-  const budget = MSG_LIMIT - BATCH_OVERHEAD;
-  const avgBytes = fullJson.length / items.length;
-  const perBatch = Math.max(1, Math.floor(budget / avgBytes));
-  const totalBatches = Math.ceil(items.length / perBatch);
-
-  console.log(
-    `[DBA] JSON split "${label}": ${items.length} items, ~${Math.round(avgBytes)}B/item, ${perBatch}/batch, ${totalBatches} batches`
-  );
-
-  for (let i = 0; i < totalBatches; i++) {
-    const start = i * perBatch;
-    const end = Math.min(start + perBatch, items.length);
-    const batch = items.slice(start, end);
-    const batchJson = JSON.stringify(batch, null, 2);
-
-    const header =
-      `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${totalBatches}]\n` +
-      `<i>Item ${start + 1}-${end} dari ${items.length}</i>\n\n`;
-
-    await ctx.reply(`${header}<pre>${escapeHtml(batchJson)}</pre>`, {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-    });
-
-    if (i < totalBatches - 1) {
-      await new Promise((r) => setTimeout(r, 400));
-    }
-  }
-}
 
 function buildKeyboard(sessionId: string): InlineKeyboard {
   return new InlineKeyboard()
@@ -392,8 +279,8 @@ function buildKeyboard(sessionId: string): InlineKeyboard {
     .text('🔗 Franchises', `qd:f:${sessionId}`)
     .row()
     .text('🎤 Voice Actors', `qd:v:${sessionId}`)
-    .row()
     .text('📝 Summary', `qd:s:${sessionId}`)
+    .row()
     .text('❌ Batal', `qd:x:${sessionId}`);
 }
 
@@ -474,7 +361,7 @@ async function rewriteSynopsis(
 }
 
 /* ============================================================
-   COMMAND HANDLER
+   COMMAND: /dba
    ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
@@ -485,7 +372,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       '<b>📚 Database Anime (Yukionime)</b>\n\n' +
         '<b>Contoh:</b>\n' +
         '<code>/dba nama anime</code>\n\n' +
-        '<i>Bot akan cari data, lalu tampil tombol untuk pilih section.</i>',
+        '<i>Ketik /end untuk membersihkan semua pesan session.</i>',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
     return;
@@ -532,20 +419,30 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       return;
     }
 
+    // Track pesan user
+    if (ctx.message?.message_id) {
+      await trackMessage(env.DB, sessionId, ctx.message.message_id);
+    }
+
+    // Track loading message, lalu hapus
+    await trackMessage(env.DB, sessionId, loading.message_id);
     await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
 
+    // Kirim preview
     if (session.cover) {
-      await ctx.replyWithPhoto(session.cover, {
+      const msg = await ctx.replyWithPhoto(session.cover, {
         caption: buildPreviewText(session),
         parse_mode: 'HTML',
         reply_markup: buildKeyboard(sessionId),
       });
+      await trackMessage(env.DB, sessionId, msg.message_id);
     } else {
-      await ctx.reply(buildPreviewText(session), {
+      const msg = await ctx.reply(buildPreviewText(session), {
         parse_mode: 'HTML',
         reply_markup: buildKeyboard(sessionId),
         link_preview_options: { is_disabled: true },
       });
+      await trackMessage(env.DB, sessionId, msg.message_id);
     }
   } catch (err: any) {
     console.error('[DBA] command error:', err);
@@ -574,6 +471,59 @@ export const dbaShortCommand: CommandDefinition = {
   usage: '/dba <judul>',
   adminOnly: true,
   handler: handleCommand,
+};
+
+/* ============================================================
+   COMMAND: /end
+   ============================================================ */
+
+export const endCommand: CommandDefinition = {
+  name: 'end',
+  description: 'Hapus semua pesan session /dba aktif',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    if (!ctx.from?.id || !ctx.chat?.id) return;
+
+    await ensureDb(env.DB);
+
+    const endMsgId = ctx.message?.message_id;
+
+    const session = await getLatestSessionByUser(env.DB, ctx.from.id);
+
+    if (!session) {
+      await ctx
+        .reply(
+          '📭 <i>Tidak ada session /dba aktif.</i>\n\n' +
+            'Ketik <code>/dba &lt;judul&gt;</code> untuk mulai.',
+          { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    if (endMsgId) {
+      await trackMessage(env.DB, session.session_id, endMsgId);
+    }
+
+    console.log(
+      `[DBA] /end — clearing session ${session.session_id} (${session.title})`
+    );
+
+    const deleted = await clearTrackedSession(
+      ctx.api,
+      env.DB,
+      ctx.chat.id,
+      session.session_id
+    );
+
+    await deleteSession(env.DB, session.session_id);
+
+    await sendAutoDelete(
+      ctx,
+      `✅ <b>Selesai</b>\n<i>${deleted} pesan dihapus.</i>`
+    );
+  },
 };
 
 /* ============================================================
@@ -614,27 +564,39 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
       return;
     }
 
+    // === BATAL ===
     if (action === 'x') {
-      await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+      await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
+
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+
+      const deleted = await clearTrackedSession(
+        ctx.api,
+        env.DB,
+        chatId,
+        sessionId
+      );
       await deleteSession(env.DB, sessionId);
-      await ctx
-        .editMessageCaption({
-          caption: `❌ <b>Dibatalkan</b>`,
-          parse_mode: 'HTML',
-          reply_markup: undefined,
-        })
-        .catch(() => {
-          ctx
-            .editMessageText('❌ <b>Dibatalkan</b>', {
-              parse_mode: 'HTML',
-              reply_markup: undefined,
-            })
-            .catch(() => {});
-        });
+
+      await sendAutoDelete(
+        ctx,
+        `✅ <b>Selesai</b>\n<i>${deleted} pesan dihapus.</i>`
+      );
+      return;
+    }
+
+    // === VOICE ACTORS (redirect ke /va menu) ===
+    if (action === 'v') {
+      await ctx.answerCallbackQuery({ text: '🎤 Buka menu Voice Actors...' });
+      await showVaMenu(ctx, env);
       return;
     }
 
     await ctx.answerCallbackQuery({ text: '⏳ Memproses...' });
+
+    const tracker: Tracker = (msgId) =>
+      trackMessage(env.DB, sessionId, msgId);
 
     try {
       const chainCtx = buildChainContext(session);
@@ -645,10 +607,11 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         try {
           result = await chainSearch(session.title);
         } catch (err: any) {
-          await ctx.reply(
+          const msg = await ctx.reply(
             `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
             { parse_mode: 'HTML' }
           );
+          await tracker(msg.message_id);
           return;
         }
 
@@ -657,7 +620,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           malId: result.malId ?? session.mal_id,
           kitsuId: result.kitsuId ?? session.kitsu_id,
         });
-        await sendTextSection(ctx, `Metadata — ${session.title}`, yaml);
+        await sendTextSection(
+          ctx,
+          `Metadata — ${session.title}`,
+          yaml,
+          tracker
+        );
         return;
       }
 
@@ -673,7 +641,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           await sendTextSection(
             ctx,
             `Characters — ${session.title} [FAILED]`,
-            fallbackJson(errs)
+            fallbackJson(errs),
+            tracker
           );
           return;
         }
@@ -682,7 +651,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         const vas = result.voiceActors;
         const source = result.source;
 
-        // Simpan VA ke D1 (silent)
         if (vas.length > 0) {
           try {
             await saveVoiceActors(env.DB, vas);
@@ -691,43 +659,21 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           }
         }
 
-        // Kirim HANYA characters
         await sendJsonSection(
           ctx,
           `Characters — ${session.title} [${source}]`,
-          chars
+          chars,
+          tracker
         );
 
-        // Notif kecil: VA tersimpan
         if (vas.length > 0) {
-          await ctx.reply(
+          const msg = await ctx.reply(
             `ℹ️ <i>${vas.length} voice actor tersimpan ke DB. ` +
-              `Klik <b>🎤 Voice Actors</b> untuk lihat semua.</i>`,
+              `Ketik /va untuk kelola.</i>`,
             { parse_mode: 'HTML' }
           );
+          await tracker(msg.message_id);
         }
-
-        return;
-      }
-
-      /* ---------- VOICE ACTORS (baca dari D1) ---------- */
-      if (action === 'v') {
-        const vas = await getAllVoiceActors(env.DB);
-
-        if (vas.length === 0) {
-          await ctx.reply(
-            '📭 <i>Belum ada voice actor di DB.</i>\n\n' +
-              'Klik <b>👥 Characters</b> dulu untuk fetch dari sumber.',
-            { parse_mode: 'HTML' }
-          );
-          return;
-        }
-
-        await sendJsonSection(
-          ctx,
-          `Voice Actors (${vas.length}) — voice-actors.json`,
-          vas
-        );
 
         return;
       }
@@ -744,7 +690,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           await sendTextSection(
             ctx,
             `Episodes — ${session.title} [FAILED]`,
-            fallbackJson(errs)
+            fallbackJson(errs),
+            tracker
           );
           return;
         }
@@ -755,7 +702,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         await sendJsonSection(
           ctx,
           `Episodes — ${session.title} [${result.source}]${truncNote}`,
-          eps
+          eps,
+          tracker
         );
         return;
       }
@@ -772,7 +720,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           await sendTextSection(
             ctx,
             `Franchises — ${session.title} [FAILED]`,
-            fallbackJson(errs)
+            fallbackJson(errs),
+            tracker
           );
           return;
         }
@@ -780,7 +729,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         await sendJsonSection(
           ctx,
           `Franchises — ${session.title} [${result.source}]`,
-          result.data
+          result.data,
+          tracker
         );
         return;
       }
@@ -791,10 +741,11 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         try {
           result = await chainSearch(session.title);
         } catch (err: any) {
-          await ctx.reply(
+          const msg = await ctx.reply(
             `❌ Gagal: ${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}`,
             { parse_mode: 'HTML' }
           );
+          await tracker(msg.message_id);
           return;
         }
 
@@ -805,7 +756,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         );
 
         const body = ai ?? raw ?? 'Tulis sinopsis manual...';
-        await sendTextSection(ctx, `Summary — ${session.title}`, body);
+        await sendTextSection(
+          ctx,
+          `Summary — ${session.title}`,
+          body,
+          tracker
+        );
         return;
       }
     } catch (err: any) {
@@ -821,10 +777,11 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         hint = '\n\n<i>Server down. Coba lagi nanti.</i>';
       }
 
-      await ctx.reply(
+      const m = await ctx.reply(
         `❌ Gagal: ${escapeHtml(msg.slice(0, 200))}${hint}`,
         { parse_mode: 'HTML' }
       );
+      await tracker(m.message_id).catch(() => {});
     }
   });
 }
