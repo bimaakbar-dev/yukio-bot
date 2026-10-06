@@ -5,7 +5,11 @@ import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../types/anime';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
-import { searchYukionime, getYukionimeDetail } from '../services/yukionime';
+import {
+  searchYukionime,
+  getYukionimeDetail,
+  type YukionimeAnime,
+} from '../services/yukionime';
 import { getCache, setCache } from '../lib/cache';
 import {
   searchAnime,
@@ -226,24 +230,32 @@ function extractTitleFromMALUrl(url: string): string | null {
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
 
-/* ============================================================
-   YUKIONIME CHECK
-   ============================================================ */
+interface YukionimeCheckResult {
+  match: YukionimeAnime | null;
+  synopsis: string | null;
+}
 
 async function checkYukionime(
-  ctx: any,
   query: string
-): Promise<void> {
-  const match = await searchYukionime(query);
-  if (!match) return;
+): Promise<YukionimeCheckResult> {
+  try {
+    const match = await searchYukionime(query);
+    if (!match) return { match: null, synopsis: null };
 
-  const detail = await getYukionimeDetail(match.id);
+    const detail = await getYukionimeDetail(match.id);
+    const synopsis = detail?.synopsis ?? null;
 
-  const synopsisPreview = detail?.synopsis
-    ? detail.synopsis.slice(0, 300) +
-      (detail.synopsis.length > 300 ? '…' : '')
-    : null;
+    return { match, synopsis };
+  } catch (err) {
+    console.warn('[Anime] yukionime check failed:', err);
+    return { match: null, synopsis: null };
+  }
+}
 
+function buildYukionimeWarning(
+  match: YukionimeAnime,
+  synopsis: string | null
+): string {
   const lines: string[] = [];
   lines.push('⚠️ <b>Sudah ada di database Yukionime!</b>');
   lines.push('');
@@ -254,24 +266,22 @@ async function checkYukionime(
   if (match.type) lines.push(`🎬 <b>Tipe:</b> ${escapeHtml(match.type)}`);
   if (match.status) lines.push(`📊 <b>Status:</b> ${escapeHtml(match.status)}`);
 
-  if (synopsisPreview) {
+  if (synopsis) {
+    const preview = synopsis.slice(0, 200) + (synopsis.length > 200 ? '…' : '');
     lines.push('');
-    lines.push('📝 <b>Sinopsis (preview):</b>');
-    lines.push(`<i>${escapeHtml(synopsisPreview)}</i>`);
+    lines.push('📝 <b>Sinopsis:</b>');
+    lines.push(`<i>${escapeHtml(preview)}</i>`);
+    lines.push('');
+    lines.push('✅ <i>Sinopsis akan dipakai otomatis (skip AI).</i>');
   }
 
   lines.push('');
-  lines.push('🔗 <a href="https://qimochi.pages.dev/anime/' + escapeHtml(match.id) + '/">Lihat halaman</a>');
+  lines.push(
+    `🔗 <a href="https://yukionime.pages.dev/anime/${escapeHtml(match.id)}/">Lihat halaman</a>`
+  );
 
-  await ctx.reply(lines.join('\n'), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
+  return lines.join('\n');
 }
-
-/* ============================================================
-   COMMAND
-   ============================================================ */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
@@ -311,14 +321,18 @@ export const animeCommand: CommandDefinition = {
         if (t) searchQuery = t;
       }
 
-      // === CEK YUKIONIME ===
-      try {
-        await checkYukionime(ctx, searchQuery);
-      } catch (err) {
-        console.warn('[Anime] yukionime check failed:', err);
+      const yukionime = await checkYukionime(searchQuery);
+
+      if (yukionime.match) {
+        await ctx.reply(
+          buildYukionimeWarning(yukionime.match, yukionime.synopsis),
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          }
+        );
       }
 
-      // === LANJUT ANILIST ===
       const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
       media = await getCache<AniListMedia>(env.DB, cacheKey);
 
@@ -368,7 +382,13 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      const need = detectMissing(media);
+      let need = detectMissing(media);
+
+      if (yukionime.synopsis) {
+        need = need.filter((n) => n !== 'synopsis');
+        console.log('[Anime] skip AI synopsis (pakai dari yukionime)');
+      }
+
       console.log(
         `[Anime] missing after merge: [${need.join(', ') || 'none'}]`
       );
@@ -424,10 +444,20 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
-      const { yaml, body, missing, aiUsed } = buildQimochiHubResult(
-        media,
-        enriched
-      );
+      if (yukionime.synopsis) {
+        enriched = { ...(enriched ?? {}), synopsis: yukionime.synopsis };
+      }
+
+      const result = buildQimochiHubResult(media, enriched);
+      let { yaml, body, missing, aiUsed } = result;
+
+      if (yukionime.synopsis) {
+        aiUsed = aiUsed.map((f) =>
+          f === 'synopsis' ? 'synopsis (dari Yukionime)' : f
+        );
+        if (!aiUsed.includes('synopsis (dari Yukionime)')) {
+        }
+      }
 
       const slug = slugify(pickTitle(media));
 
