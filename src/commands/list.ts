@@ -1,3 +1,4 @@
+// src/commands/list.ts
 import type { CommandDefinition } from './registry';
 import { pingCommand } from './ping';
 import { helpCommand } from './help';
@@ -9,7 +10,9 @@ import { decodeCommand, listCommand, deleteCommand } from './decode';
 import {
   databaseAnimeCommand,
   dbaShortCommand,
+  endCommand,
 } from './database-anime';
+import { vaCommand } from './va';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -18,6 +21,8 @@ export const COMMANDS: CommandDefinition[] = [
   animeCommand,
   databaseAnimeCommand,
   dbaShortCommand,
+  endCommand,
+  vaCommand,
   aiCommand,
   clearcacheCommand,
   decodeCommand,
