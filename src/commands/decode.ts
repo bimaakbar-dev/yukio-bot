@@ -422,7 +422,7 @@ function extractEntries(html: string): RawEntry[] {
     if (!b64 || seen.has(b64)) continue;
     seen.add(b64);
 
-    const label = labelMatch ? labelMatch[1].trim() : null;
+    const label = labelMatch?.[1]?.trim() ?? null;
     entries.push({ base64: b64, label: label || null });
   }
 
