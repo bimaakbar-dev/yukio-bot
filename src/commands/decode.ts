@@ -30,28 +30,28 @@ const VIDEO_HOSTS = [
   'anoboy',
   'oploverz',
   'blogspot',
-  'blogger.com',        // ✅ NEW
-  'desustream',         // ✅ NEW
+  'blogger.com',
+  'desustream',
   'kuragebunch',
   'streamsb',
   'filemoon.sx',
-  'vidhide',            // ✅ NEW
-  'odvidhide',          // ✅ NEW
-  'ondesuhd',           // ✅ NEW
+  'vidhide',
+  'odvidhide',
+  'ondesuhd',
   'vidcloud',
   'hxfile',
   'krakenfiles',
   'gofile',
   'acefile',
   'animekuid',
-  'animesub',           // ✅ NEW
-  'lexanime',           // ✅ NEW
+  'animesub',
+  'lexanime',
 ];
 
 const WRAPPER_HOSTS = [
   'animesail.xyz',
   '154999000.xyz',
-  'video.animesub.web.id', // ✅ NEW
+  'video.animesub.web.id',
 ];
 
 const SERVER_ALIASES: Record<string, string> = {
@@ -62,22 +62,18 @@ const SERVER_ALIASES: Record<string, string> = {
   buzi: 'buzzheavier', buzzheavier: 'buzzheavier',
   mp4: 'mp4upload', mp4upload: 'mp4upload',
   mega: 'mega', lokal: 'lokal', kamado: 'kamado', pancal: 'pancal',
-  // ✅ NEW
   'b-tube': 'blogger', 'btube': 'blogger',
   'blogger': 'blogger', 'blogspot': 'blogger',
   odstream: 'odstream', odcdn: 'odcdn',
   ondesuhd: 'ondesuhd', vidhide: 'vidhide',
 };
 
-// ✅ NEW: Next.js RSC embed regex
-// Body berisi literal: \"quality\":\"360p\",\"mirror\":\"vidhide\",\"link\":\"https://...\"
-// (1 backslash sebelum quote setelah JSON.parse)
 const RSC_EMBED_RE =
   /\\"quality\\":\\"([^\\"]+)\\",\\"mirror\\":\\"([^\\"]+)\\",\\"link\\":\\"([^\\"]+)\\"/g;
 
 interface RawEntry {
-  base64?: string;   // ✅ FIX: optional
-  url?: string;      // ✅ NEW: URL plain (dari RSC payload)
+  base64?: string;
+  url?: string;
   label: string | null;
 }
 
@@ -272,7 +268,6 @@ function isWrapper(url: string): boolean {
 
 function parseResolution(label: string | null): string | null {
   if (!label) return null;
-  // ✅ FIX: support "[720P]" juga
   const m =
     label.match(/\b(\d{3,4})p\b/i) ??
     label.match(/\[\s*(\d{3,4})p\s*\]/i);
@@ -284,9 +279,7 @@ function parseServerName(label: string | null): string | null {
 
   const cleaned = label
     .toLowerCase()
-    // ✅ NEW: strip "[720P] " prefix
     .replace(/^\s*\[\s*\d{3,4}p\s*\]\s*/i, '')
-    // ✅ NEW: strip "720P " prefix tanpa bracket
     .replace(/^\s*\d{3,4}p\s+/i, '')
     .replace(/\s+\d{3,4}p\s*$/i, '')
     .replace(/\s*[-_]\s*\d+$/i, '')
@@ -399,7 +392,6 @@ function expandUrlParams(url: string, depth = 0): string[] {
     return [...out];
   }
 
-  // ✅ NEW: scan path segments untuk base64 (mis. /embed/aHR0cHM6...)
   for (const seg of parsed.pathname.split('/')) {
     if (seg.length < 20 || seg.length > 800) continue;
     let dec = seg;
@@ -472,17 +464,17 @@ function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
-// ✅ NEW: ekstrak embed dari Next.js RSC payload
 function extractNextJsEmbeds(html: string): RawEntry[] {
   const out: RawEntry[] = [];
   const seen = new Set<string>();
 
   for (const m of html.matchAll(RSC_EMBED_RE)) {
-    const quality = m[1];
-    const mirror = m[2];
-    let link = m[3];
+    const quality = m[1] ?? '';
+    const mirror  = m[2] ?? '';
+    let link      = m[3] ?? '';
 
-    // unescape \u002F, \/ etc
+    if (!link) continue;
+
     link = link
       .replace(/\\u002F/gi, '/')
       .replace(/\\\//g, '/');
@@ -503,7 +495,6 @@ function extractEntries(html: string): RawEntry[] {
   const entries: RawEntry[] = [];
   const seen = new Set<string>();
 
-  // ✅ NEW: Next.js RSC — jalankan DULU biar tidak kalah sama fallback base64
   for (const e of extractNextJsEmbeds(html)) {
     const key = e.url!;
     if (seen.has(key)) continue;
@@ -525,7 +516,6 @@ function extractEntries(html: string): RawEntry[] {
     entries.push({ base64: b64, label: label || null });
   }
 
-  // ✅ FIX: option — ambil base64 dari value= dulu, fallback ke data-*=
   for (const m of html.matchAll(/<option\b([^>]*?)>([^<]*)<\/option>/gi)) {
     const attrs = m[1] ?? '';
     const label = (m[2] ?? '').trim();
@@ -591,7 +581,6 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
     const resolution = parseResolution(e.label);
     const server = parseServerName(e.label);
 
-    // ✅ NEW: entry sudah punya URL plain (dari RSC) — langsung resolve
     if (e.url) {
       resolve(e.url, resolution, server, 0, new Set());
       continue;
@@ -610,7 +599,6 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
     }
   }
 
-  // ✅ FIX: fallback ke resolved dulu (bug lama: fallback ke unresolved yang isinya kosong)
   if (final.length === 0) {
     for (const [url, info] of resolved) {
       final.push({ url, resolution: info.resolution, server: info.server });
@@ -922,10 +910,10 @@ function processText(
   input: string,
   sourceType: 'base64' | 'html'
 ): { videos: ResolvedEntry[]; labels: (string | null)[] } | null {
-  const entries =
+  const entries: RawEntry[] =
     sourceType === 'html'
       ? extractEntries(input)
-      : [{ base64: input, label: null } as RawEntry];
+      : [{ base64: input, label: null }];
   if (entries.length === 0) return null;
   const videos = collectResolvedVideos(entries);
   if (videos.length === 0) return null;
@@ -1062,7 +1050,6 @@ async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void>
 
     const urlSlug = slugify(url.split('/').filter(Boolean).pop() ?? 'url');
 
-    // ✅ FIX: pakai urlSlug sebagai sourceFilename biar episodeNumber terdeteksi
     await sendResult(ctx, env, processed.videos, urlSlug, processed.labels, urlSlug);
   } catch (err: any) {
     console.error('[Decode] url error:', err);
