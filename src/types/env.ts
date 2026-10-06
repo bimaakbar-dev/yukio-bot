@@ -8,6 +8,8 @@ export interface Env {
   DISCORD_APP_ID: string;
   DISCORD_ADMIN_USER_ID: string;
 
+  VAL_TOWN_FETCH_URL: string;
+
   DB: D1Database;
   AI: Ai;
 }
