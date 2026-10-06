@@ -61,14 +61,27 @@ function createBot(env: Env): Bot {
 }
 
 async function setupBotMenu(bot: Bot, token: string): Promise<void> {
-  // Skip kalau sudah di-set untuk token ini (per isolate)
   if (menuSetForToken === token) return;
 
   try {
-    const commands = COMMANDS.map((c) => ({
-      command: c.name,
-      description: (c.description || c.name).slice(0, 256),
-    }));
+    const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+
+    const commands = COMMANDS
+      .filter((c) => COMMAND_NAME_RE.test(c.name))
+      .map((c) => ({
+        command: c.name,
+        description: (c.description || c.name).slice(0, 256),
+      }));
+
+    const skipped = COMMANDS
+      .filter((c) => !COMMAND_NAME_RE.test(c.name))
+      .map((c) => c.name);
+
+    if (skipped.length > 0) {
+      console.warn(
+        `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
+      );
+    }
 
     await bot.api.setMyCommands(commands);
     menuSetForToken = token;
@@ -90,7 +103,6 @@ async function getBot(env: Env): Promise<Bot> {
       .init()
       .then(async () => {
         console.log(`[Bot] init OK in ${Date.now() - t0}ms`);
-        // Set command menu sekali (best effort)
         await setupBotMenu(cachedBot!, env.TELEGRAM_BOT_TOKEN);
       })
       .catch((err) => {
@@ -120,7 +132,6 @@ export default {
       );
     }
 
-    // Endpoint manual untuk set command menu
     if (url.pathname === '/setup-commands') {
       try {
         const bot = await getBot(env);
@@ -242,12 +253,10 @@ export default {
       return registerDiscordCommands(env);
     }
 
-    // Discord — interaction endpoint
     if (url.pathname === '/discord') {
       return handleDiscordRequest(request, env, ctx);
     }
 
-    // Telegram — webhook
     if (url.pathname === '/webhook') {
       const t0 = Date.now();
       try {
