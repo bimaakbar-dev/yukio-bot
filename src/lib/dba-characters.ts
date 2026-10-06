@@ -6,15 +6,9 @@ import { InlineKeyboard } from 'grammy';
 export const CHAR_PART_SIZE = 50;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
-export interface CachedCharacters {
-  session_id: string;
-  source: string;
-  total: number;
-  data: string;
-  voice_actors: string;
-  created_at: number;
-  expires_at: number;
-}
+/* ============================================================
+   TABLE
+   ============================================================ */
 
 let cacheDbReady = false;
 let cacheDbInitPromise: Promise<void> | null = null;
@@ -33,11 +27,24 @@ export async function ensureCharCacheTable(db: D1Database): Promise<void> {
             total        INTEGER NOT NULL,
             data         TEXT NOT NULL,
             voice_actors TEXT,
+            sent_parts   TEXT,
             created_at   INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL
           )`
         )
         .run();
+
+      // Migration: tambah kolom sent_parts kalau belum ada
+      try {
+        await db
+          .prepare(
+            'ALTER TABLE qimochi_char_cache ADD COLUMN sent_parts TEXT'
+          )
+          .run();
+      } catch {
+        // ignore
+      }
+
       cacheDbReady = true;
     } catch (err) {
       console.error('[CharCache] DB init error:', err);
@@ -48,6 +55,10 @@ export async function ensureCharCacheTable(db: D1Database): Promise<void> {
 
   return cacheDbInitPromise;
 }
+
+/* ============================================================
+   SAVE
+   ============================================================ */
 
 export async function saveCharCache(
   db: D1Database,
@@ -62,13 +73,14 @@ export async function saveCharCache(
   await db
     .prepare(
       `INSERT INTO qimochi_char_cache
-        (session_id, source, total, data, voice_actors, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+        (session_id, source, total, data, voice_actors, sent_parts, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id) DO UPDATE SET
          source = excluded.source,
          total = excluded.total,
          data = excluded.data,
          voice_actors = excluded.voice_actors,
+         sent_parts = excluded.sent_parts,
          created_at = excluded.created_at,
          expires_at = excluded.expires_at`
     )
@@ -78,6 +90,7 @@ export async function saveCharCache(
       chars.length,
       JSON.stringify(chars),
       JSON.stringify(voiceActors),
+      JSON.stringify([]),
       now,
       now + CACHE_TTL_MS
     )
@@ -86,20 +99,37 @@ export async function saveCharCache(
   console.log(`[CharCache] saved ${chars.length} chars for ${sessionId}`);
 }
 
+/* ============================================================
+   READ
+   ============================================================ */
+
+export interface CharCacheData {
+  chars: UnifiedCharacter[];
+  source: string;
+  total: number;
+  sentParts: Set<number>;
+}
+
 export async function getCharCache(
   db: D1Database,
   sessionId: string
-): Promise<{ chars: UnifiedCharacter[]; source: string; total: number } | null> {
+): Promise<CharCacheData | null> {
   await ensureCharCacheTable(db);
 
   const row = await db
     .prepare(
-      `SELECT source, total, data, expires_at
+      `SELECT source, total, data, sent_parts, expires_at
        FROM qimochi_char_cache
        WHERE session_id = ?`
     )
     .bind(sessionId)
-    .first<{ source: string; total: number; data: string; expires_at: number }>();
+    .first<{
+      source: string;
+      total: number;
+      data: string;
+      sent_parts: string | null;
+      expires_at: number;
+    }>();
 
   if (!row) return null;
 
@@ -110,11 +140,73 @@ export async function getCharCache(
 
   try {
     const chars = JSON.parse(row.data) as UnifiedCharacter[];
-    return { chars, source: row.source, total: row.total };
+    let sentParts: number[] = [];
+    if (row.sent_parts) {
+      try {
+        const arr = JSON.parse(row.sent_parts);
+        if (Array.isArray(arr)) sentParts = arr.filter((n) => typeof n === 'number');
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      chars,
+      source: row.source,
+      total: row.total,
+      sentParts: new Set(sentParts),
+    };
   } catch {
     return null;
   }
 }
+
+/* ============================================================
+   MARK SENT
+   ============================================================ */
+
+export async function markPartSent(
+  db: D1Database,
+  sessionId: string,
+  partIndex: number
+): Promise<void> {
+  try {
+    await ensureCharCacheTable(db);
+
+    const row = await db
+      .prepare('SELECT sent_parts FROM qimochi_char_cache WHERE session_id = ?')
+      .bind(sessionId)
+      .first<{ sent_parts: string | null }>();
+
+    if (!row) return;
+
+    let sentParts: number[] = [];
+    if (row.sent_parts) {
+      try {
+        const arr = JSON.parse(row.sent_parts);
+        if (Array.isArray(arr)) sentParts = arr.filter((n) => typeof n === 'number');
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!sentParts.includes(partIndex)) {
+      sentParts.push(partIndex);
+      await db
+        .prepare(
+          'UPDATE qimochi_char_cache SET sent_parts = ? WHERE session_id = ?'
+        )
+        .bind(JSON.stringify(sentParts), sessionId)
+        .run();
+    }
+  } catch (err) {
+    console.warn('[CharCache] mark sent error:', err);
+  }
+}
+
+/* ============================================================
+   DELETE
+   ============================================================ */
 
 export async function deleteCharCache(
   db: D1Database,
@@ -130,6 +222,10 @@ export async function deleteCharCache(
     console.warn('[CharCache] delete error:', err);
   }
 }
+
+/* ============================================================
+   PARTS
+   ============================================================ */
 
 export function getCharacterPart(
   chars: UnifiedCharacter[],
@@ -153,13 +249,17 @@ export function countParts(total: number, partSize = CHAR_PART_SIZE): number {
   return Math.ceil(total / partSize);
 }
 
+/* ============================================================
+   MENU KEYBOARD
+   ============================================================ */
+
 const PARTS_PER_ROW = 5;
 
 export function buildPartsKeyboard(
   sessionId: string,
   total: number,
-  partSize = CHAR_PART_SIZE,
-  sentParts: Set<number> = new Set()
+  sentParts: Set<number> = new Set(),
+  partSize = CHAR_PART_SIZE
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
   const numParts = countParts(total, partSize);
