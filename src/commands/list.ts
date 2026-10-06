@@ -6,7 +6,7 @@ import { statusCommand } from './status';
 import { animeCommand } from './anime';
 import { aiCommand } from './ai';
 import { clearcacheCommand } from './clearcache';
-import { decodeCommand, listCommand, deleteCommand } from './decode';
+import { decodeCommand, listCommand, deleteCommand, batchCommand } from './decode';
 import {
   databaseAnimeCommand,
   dbaShortCommand,
@@ -26,6 +26,7 @@ export const COMMANDS: CommandDefinition[] = [
   aiCommand,
   clearcacheCommand,
   decodeCommand,
+  batchCommand,
   listCommand,
   deleteCommand,
 ];
