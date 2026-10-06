@@ -2,23 +2,13 @@
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from '../types/anime';
 
-/**
- * AniList GraphQL diblokir dari CF Workers IP.
- * Pakai Val Town proxy sebagai relay.
- * Limit: 100K runs/day, reset 24 jam.
- */
-const ANILIST_URL =
-  'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
+const ANILIST_URL = 'https://yukio-db.val.run/';
 
 const TIMEOUT = 8000;
 const PER_PAGE = 25;
-const MAX_PAGES = 40; // hard cap 1000 karakter
+const MAX_PAGES = 40;
 const PARALLEL_BATCH = 5;
-const FETCH_TIME_BUDGET_MS = 12000; // 12s max fetch
-
-/* ============================================================
-   TYPES
-   ============================================================ */
+const FETCH_TIME_BUDGET_MS = 12000;
 
 export interface AniListVoiceActor {
   anilistId: number;
@@ -35,10 +25,6 @@ export interface AniListCharacter {
   role: 'main' | 'supporting';
   voiceActors: AniListVoiceActor[];
 }
-
-/* ============================================================
-   CHARACTERS — Fetch page
-   ============================================================ */
 
 interface AniListCharEdge {
   role: string;
@@ -144,20 +130,6 @@ async function fetchCharactersPage(
   }
 }
 
-/* ============================================================
-   CHARACTERS — Fetch ALL (paralel)
-   ============================================================ */
-
-/**
- * Fetch SEMUA characters dari AniList (paralel).
- *
- * Alur:
- *   1. Fetch page 1 → dapat `lastPage`
- *   2. Fetch page 2..lastPage secara paralel (5 per batch)
- *   3. Aggregate semua edges
- *
- * Time budget: FETCH_TIME_BUDGET_MS. Kalau lewat, stop dan return partial.
- */
 export async function getCharactersFromAniList(
   idMal: number
 ): Promise<AniListCharacter[] | null> {
@@ -165,7 +137,6 @@ export async function getCharactersFromAniList(
 
   console.log(`[AniList] characters start — idMal: ${idMal}`);
 
-  // === 1. Fetch page 1 ===
   const first = await fetchCharactersPage(idMal, 1);
   if (!first) {
     console.warn('[AniList] page 1 failed');
@@ -182,10 +153,8 @@ export async function getCharactersFromAniList(
   const allEdges: AniListCharEdge[] = [...first.edges];
   let truncated = false;
 
-  // === 2. Fetch sisa page (paralel) ===
   if (lastPage > 1) {
     for (let batchStart = 2; batchStart <= lastPage; batchStart += PARALLEL_BATCH) {
-      // Time budget check
       const elapsed = Date.now() - startTime;
       if (elapsed > FETCH_TIME_BUDGET_MS) {
         console.warn(
@@ -225,7 +194,6 @@ export async function getCharactersFromAniList(
 
   if (allEdges.length === 0) return null;
 
-  // === 3. Transform ===
   const all: AniListCharacter[] = [];
   const seen = new Set<string>();
 
@@ -269,10 +237,6 @@ export async function getCharactersFromAniList(
 
   return all.length > 0 ? all : null;
 }
-
-/* ============================================================
-   METADATA
-   ============================================================ */
 
 function mapAniListSource(raw: string | null | undefined): string | null {
   if (!raw) return null;
