@@ -12,6 +12,7 @@ const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
 const MSG_BUDGET = 3800;
 const JSON_INLINE_THRESHOLD = 3500;
+const BATCH_MAX = 30;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -46,6 +47,7 @@ const VIDEO_HOSTS = [
   'animekuid',
   'animesub',
   'lexanime',
+  'dropbox.com',
 ];
 
 const WRAPPER_HOSTS = [
@@ -65,7 +67,8 @@ const SERVER_ALIASES: Record<string, string> = {
   'b-tube': 'blogger', 'btube': 'blogger',
   'blogger': 'blogger', 'blogspot': 'blogger',
   odstream: 'odstream', odcdn: 'odcdn',
-  ondesuhd: 'ondesuhd', vidhide: 'vidhide',
+  ondesuhd: 'ondesuhd', ondesu: 'ondesu',
+  vidhide: 'vidhide',
 };
 
 const RSC_EMBED_RE =
@@ -83,6 +86,11 @@ interface ResolvedEntry {
   server: string | null;
 }
 
+interface EpisodeObject {
+  number: number;
+  streams: { quality: string; servers: { name: string; url: string }[] }[];
+}
+
 interface FileRef {
   id: number;
   label: string;
@@ -90,6 +98,24 @@ interface FileRef {
   file_id: string;
   created_at: number;
   last_accessed: number;
+}
+
+interface ProxyResponse {
+  ok: boolean;
+  status: number;
+  body?: string;
+  error?: string;
+  truncated?: boolean;
+}
+
+interface ProxyDebug {
+  proxyUrl: string;
+  httpStatus: number;
+  contentType: string;
+  rawLength: number;
+  rawPreview: string;
+  parseOk: boolean;
+  error?: string;
 }
 
 let dbReady = false;
@@ -619,7 +645,7 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   return final;
 }
 
-function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
+function buildEpisodeObject(items: ResolvedEntry[], episodeNumber: number): EpisodeObject {
   const byQuality = new Map<string, { name: string; url: string }[]>();
 
   for (const item of items) {
@@ -640,9 +666,11 @@ function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
     servers: byQuality.get(q)!,
   }));
 
-  const payload = { number: episodeNumber, streams };
+  return { number: episodeNumber, streams };
+}
 
-  return JSON.stringify(payload, null, 2) + '\n';
+function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
+  return JSON.stringify(buildEpisodeObject(items, episodeNumber), null, 2) + '\n';
 }
 
 function buildUrlList(items: ResolvedEntry[], label?: string): string {
@@ -971,24 +999,6 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
   }
 }
 
-interface ProxyResponse {
-  ok: boolean;
-  status: number;
-  body?: string;
-  error?: string;
-  truncated?: boolean;
-}
-
-interface ProxyDebug {
-  proxyUrl: string;
-  httpStatus: number;
-  contentType: string;
-  rawLength: number;
-  rawPreview: string;
-  parseOk: boolean;
-  error?: string;
-}
-
 async function fetchUrlViaProxy(
   env: Env,
   url: string
@@ -1041,20 +1051,16 @@ async function fetchUrlViaProxy(
       return { body: null, debug };
     }
 
-    // ✅ FIX: body kosong / terlalu pendek → benar-benar gagal
     if (!data.body || data.body.length < 200) {
       debug.error = `Target HTTP ${data.status}: body kosong/terlalu pendek`;
       return { body: null, debug };
     }
 
-    // ✅ FIX: kalau status non-2xx tapi body ada isinya, tetap coba proses
-    // (situs Next.js SSR biasanya tetap render halaman walau 404/403)
     if (data.status >= 400) {
       debug.error = `Target HTTP ${data.status} (tetap coba proses, body ${data.body.length} char)`;
       console.warn(`[Decode] ${debug.error}`);
     }
 
-    // ✅ Body ada → kasih ke caller
     return { body: data.body, debug };
   } catch (err: any) {
     debug.error = `fetch threw: ${err?.message ?? 'unknown'}`;
@@ -1128,6 +1134,188 @@ async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void>
   }
 }
 
+// =================================================================
+// BATCH
+// =================================================================
+
+function buildBatchUrls(input: string, start: number, end: number): string[] {
+  const urls: string[] = [];
+
+  // 1. Template dengan {n}
+  if (input.includes('{n}')) {
+    for (let n = start; n <= end; n++) {
+      urls.push(input.replace(/\{n\}/g, String(n)));
+    }
+    return urls;
+  }
+
+  // 2. URL yang sudah ada "episode-N" → ganti dengan pattern baru
+  const epMatch = input.match(/(episode|eps?|e)[-_]?0*\d+/i);
+  if (epMatch && epMatch.index !== undefined) {
+    const prefix = input.slice(0, epMatch.index);
+    const suffix = input.slice(epMatch.index + epMatch[0].length);
+    for (let n = start; n <= end; n++) {
+      urls.push(`${prefix}episode-${n}${suffix}`);
+    }
+    return urls;
+  }
+
+  // 3. Base URL → append episode-{n}-sub-indo
+  const base = input.replace(/\/+$/, '');
+  for (let n = start; n <= end; n++) {
+    urls.push(`${base}/episode-${n}-sub-indo`);
+  }
+  return urls;
+}
+
+async function handleBatch(ctx: Context, env: Env): Promise<void> {
+  const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+
+  if (!arg) {
+    await ctx.reply(
+      '<b>📦 Batch Decode</b>\n\n' +
+        '<b>Usage:</b>\n' +
+        '<code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n\n' +
+        '<b>Contoh 1 (base URL):</b>\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>\n\n' +
+        '<b>Contoh 2 (pakai placeholder):</b>\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-{n}-sub-indo 7-12</code>\n\n' +
+        '<b>Contoh 3 (URL episode existing):</b>\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-6-sub-indo 7-12</code>\n\n' +
+        `<i>Max ${BATCH_MAX} episode per batch.</i>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return;
+  }
+
+  const m = arg.match(/^(\S+)\s+(\d+)\s*-\s*(\d+)\s*$/);
+  if (!m) {
+    await ctx.reply(
+      '❌ Format salah.\n\n' +
+        'Usage: <code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n' +
+        'Contoh: <code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const input = m[1] ?? '';
+  const start = parseInt(m[2] ?? '0', 10);
+  const end = parseInt(m[3] ?? '0', 10);
+
+  if (start < 1 || end < start) {
+    await ctx.reply('❌ Range tidak valid. Contoh: <code>7-12</code>', {
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+
+  const total = end - start + 1;
+  if (total > BATCH_MAX) {
+    await ctx.reply(`❌ Max ${BATCH_MAX} episode per batch (kamu minta ${total}).`);
+    return;
+  }
+
+  const urls = buildBatchUrls(input, start, end);
+
+  const loading = await ctx.reply(
+    `📦 <b>Batch ${total} episode</b> (${start}-${end})\n\n⏳ Memulai...`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+  );
+
+  const results: EpisodeObject[] = [];
+  const errors: { number: number; error: string }[] = [];
+
+  for (let i = 0; i < urls.length; i++) {
+    const n = start + i;
+    const url = urls[i]!;
+
+    // Update progress
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `📦 <b>Batch ${total} episode</b> (${start}-${end})\n\n` +
+          `⏳ [${i + 1}/${total}] Episode ${n}...\n` +
+          `<code>${escapeHtml(url)}</code>`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+    } catch {
+      /* ignore */
+    }
+
+    const { body, debug } = await fetchUrlViaProxy(env, url);
+    if (!body) {
+      errors.push({ number: n, error: debug.error ?? 'fetch failed' });
+      continue;
+    }
+
+    const sourceType: 'base64' | 'html' = looksLikeHtml(body) ? 'html' : 'base64';
+    const processed = processText(body, sourceType);
+    if (!processed) {
+      errors.push({ number: n, error: `no video URLs (${body.length} char)` });
+      continue;
+    }
+
+    results.push(buildEpisodeObject(processed.videos, n));
+  }
+
+  results.sort((a, b) => a.number - b.number);
+
+  const combinedJson = JSON.stringify(results, null, 2) + '\n';
+
+  const totalUrls = results.reduce(
+    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
+    0
+  );
+
+  const filename = `batch-${start}-${end}.json`;
+
+  const captionLines = [
+    `✅ <b>Batch selesai!</b>`,
+    `📊 Berhasil: <b>${results.length}/${total}</b> episode`,
+    `🎬 Total URL: <b>${totalUrls}</b>`,
+  ];
+  if (errors.length > 0) {
+    captionLines.push('');
+    captionLines.push(`⚠️ <b>Gagal (${errors.length}):</b>`);
+    for (const e of errors.slice(0, 10)) {
+      captionLines.push(`• Ep ${e.number}: <code>${escapeHtml(e.error)}</code>`);
+    }
+    if (errors.length > 10) {
+      captionLines.push(`<i>...dan ${errors.length - 10} lainnya</i>`);
+    }
+  }
+
+  const caption = captionLines.join('\n');
+
+  try {
+    await sendDocumentViaApi(
+      env.TELEGRAM_BOT_TOKEN,
+      ctx.chat!.id,
+      filename,
+      combinedJson,
+      caption
+    );
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+  } catch (err: any) {
+    console.error('[Batch] sendDocument failed:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Gagal kirim file: <code>${escapeHtml(err?.message ?? 'unknown')}</code>\n\n` +
+          caption,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      )
+      .catch(() => {});
+  }
+}
+
+// =================================================================
+// COMMANDS
+// =================================================================
+
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
   description: 'Decode HTML/Base64 atau buka tersimpan',
@@ -1151,6 +1339,7 @@ export const decodeCommand: CommandDefinition = {
           '<b>Kirim file</b> <code>.html</code> / <code>.txt</code> → auto proses + simpan\n' +
           '<b>One-shot:</b> <code>/decode &lt;base64&gt;</code>\n' +
           '<b>Buka tersimpan:</b> <code>/decode &lt;label&gt;</code>\n' +
+          '<b>Batch:</b> <code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n' +
           '<b>List:</b> <code>/list</code>\n' +
           '<b>Hapus:</b> <code>/delete &lt;label&gt;</code>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
@@ -1236,6 +1425,14 @@ export const decodeCommand: CommandDefinition = {
         .catch(() => {});
     }
   },
+};
+
+export const batchCommand: CommandDefinition = {
+  name: 'batch',
+  description: 'Decode batch episode (range)',
+  usage: '/batch <url> <start>-<end>',
+  adminOnly: true,
+  handler: handleBatch,
 };
 
 export const listCommand: CommandDefinition = {
