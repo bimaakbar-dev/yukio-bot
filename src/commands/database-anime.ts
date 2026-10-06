@@ -3,7 +3,6 @@ import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
-import type { D1Database } from '@cloudflare/workers-types';
 import type { AniListMedia } from '../types/anime';
 import { chainSearch } from '../services/qimochi-chain';
 import {
@@ -12,533 +11,75 @@ import {
   chainRelations,
   type ChainContext,
 } from '../services/qimochi-chain-extras';
-import {
-  buildMetadataYaml,
-  getSynopsisRaw,
-} from '../services/qimochi-yaml';
+import { getSynopsisRaw } from '../services/qimochi-yaml';
 import { searchShikimori, shikimoriToAniList } from '../services/shikimori';
 import { searchKitsu, kitsuToAniList } from '../services/kitsu';
 import { getMetadataFromAniList } from '../services/anilist';
 import { askAI } from '../services/ai';
 import {
-  escapeHtml,
   sendTextSection,
   sendJsonSection,
   sendAutoDelete,
   trackMessage,
   clearTrackedSession,
-  ensureTrackDb,
   type Tracker,
 } from '../lib/telegram-utils';
+
+/* ---------- DBA modules ---------- */
+import {
+  escapeHtml,
+  fetchWithTimeout,
+  safeFetch,
+  fallbackJson,
+  parseJsonArray,
+  parseJsonMedia,
+} from '../lib/dba-common';
+import {
+  ensureDb,
+  saveSession,
+  getSession,
+  getLatestSessionByUser,
+  updateSessionMetadata,
+  deleteSession,
+  type SessionRow,
+} from '../lib/dba-session';
+import {
+  detectMissing,
+  mergeMetadata,
+  buildMetadataKeyboard,
+  buildMetadataView,
+} from '../lib/dba-metadata';
+import {
+  saveCharCache,
+  getCharCache,
+  deleteCharCache,
+  getCharacterPart,
+  countParts,
+  buildPartsKeyboard,
+  markPartSent,
+  CHAR_PART_SIZE,
+} from '../lib/dba-characters';
+import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
-const SESSION_TTL_MS = 30 * 60 * 1000;
+/* ============================================================
+   CONSTANTS
+   ============================================================ */
+
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
+const CHAR_FETCH_TIMEOUT_MS = 25000;
 
-let dbReady = false;
-let dbInitPromise: Promise<void> | null = null;
+/* ============================================================
+   HELPERS
+   ============================================================ */
 
-async function ensureDb(db: D1Database): Promise<void> {
-  if (dbReady) return;
-  if (dbInitPromise) return dbInitPromise;
-
-  dbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS qimochi_sessions (
-            session_id   TEXT PRIMARY KEY,
-            user_id      INTEGER NOT NULL,
-            mal_id       INTEGER,
-            kitsu_id     TEXT,
-            title        TEXT NOT NULL,
-            cover        TEXT,
-            year         TEXT,
-            type         TEXT,
-            studio       TEXT,
-            source       TEXT,
-            metadata     TEXT,
-            fetched_sources TEXT,
-            created_at   INTEGER NOT NULL,
-            expires_at   INTEGER NOT NULL
-          )`
-        )
-        .run();
-
-      for (const col of ['metadata', 'fetched_sources']) {
-        try {
-          await db
-            .prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
-            .run();
-        } catch {}
-      }
-
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS voice_actors (
-            id              TEXT PRIMARY KEY,
-            name            TEXT NOT NULL,
-            nameNative      TEXT,
-            image           TEXT,
-            defaultLanguage TEXT,
-            created_at      INTEGER NOT NULL
-          )`
-        )
-        .run();
-
-      await ensureTrackDb(db);
-
-      dbReady = true;
-    } catch (err) {
-      console.error('[DBA] DB init error:', err);
-      dbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return dbInitPromise;
-}
-
-interface SessionRow {
-  session_id: string;
-  user_id: number;
-  mal_id: number | null;
-  kitsu_id: string | null;
-  title: string;
-  cover: string | null;
-  year: string | null;
-  type: string | null;
-  studio: string | null;
-  source: string | null;
-  metadata: string | null;
-  fetched_sources: string | null;
-  created_at: number;
-  expires_at: number;
-}
-
-async function saveSession(
-  db: D1Database,
-  userId: number,
-  data: {
-    malId: number | null;
-    kitsuId: string | null;
-    title: string;
-    cover: string | null;
-    year: string | null;
-    type: string | null;
-    studio: string | null;
-    source: string | null;
-    metadata?: AniListMedia | null;
-    fetchedSources?: string[];
-  }
-): Promise<string> {
-  await ensureDb(db);
-
-  const sessionId = `q_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
-  const now = Date.now();
-
-  await db
-    .prepare(
-      `INSERT INTO qimochi_sessions
-        (session_id, user_id, mal_id, kitsu_id, title, cover, year, type, studio, source, metadata, fetched_sources, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      sessionId,
-      userId,
-      data.malId,
-      data.kitsuId,
-      data.title,
-      data.cover,
-      data.year,
-      data.type,
-      data.studio,
-      data.source,
-      data.metadata ? JSON.stringify(data.metadata) : null,
-      data.fetchedSources ? JSON.stringify(data.fetchedSources) : null,
-      now,
-      now + SESSION_TTL_MS
-    )
-    .run();
-
-  return sessionId;
-}
-
-async function updateSessionMetadata(
-  db: D1Database,
-  sessionId: string,
-  metadata: AniListMedia,
-  fetchedSources: string[]
-): Promise<void> {
-  await ensureDb(db);
-  await db
-    .prepare(
-      `UPDATE qimochi_sessions
-       SET metadata = ?, fetched_sources = ?, title = ?, cover = ?
-       WHERE session_id = ?`
-    )
-    .bind(
-      JSON.stringify(metadata),
-      JSON.stringify(fetchedSources),
-      metadata.title.romaji,
-      metadata.coverImage.extraLarge,
-      sessionId
-    )
-    .run();
-}
-
-async function getSession(
-  db: D1Database,
-  sessionId: string
-): Promise<SessionRow | null> {
-  await ensureDb(db);
-
-  const row = await db
-    .prepare('SELECT * FROM qimochi_sessions WHERE session_id = ?')
-    .bind(sessionId)
-    .first<SessionRow>();
-
-  if (!row) return null;
-
-  if (row.expires_at < Date.now()) {
-    await db
-      .prepare('DELETE FROM qimochi_sessions WHERE session_id = ?')
-      .bind(sessionId)
-      .run()
-      .catch(() => {});
-    return null;
-  }
-
-  return row;
-}
-
-async function getLatestSessionByUser(
-  db: D1Database,
-  userId: number
-): Promise<SessionRow | null> {
-  await ensureDb(db);
-
-  return db
-    .prepare(
-      `SELECT * FROM qimochi_sessions
-       WHERE user_id = ? AND expires_at > ?
-       ORDER BY created_at DESC LIMIT 1`
-    )
-    .bind(userId, Date.now())
-    .first<SessionRow>();
-}
-
-async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
-  try {
-    await db
-      .prepare('DELETE FROM qimochi_sessions WHERE session_id = ?')
-      .bind(sessionId)
-      .run();
-  } catch (err) {
-    console.error('[DBA] delete session error:', err);
-  }
-}
-
-interface MissingInfo {
-  fields: string[];
-  canShikimori: boolean;
-  canKitsu: boolean;
-}
-
-const SHIKIMORI_CAN_FILL = new Set([
-  'titleEnglish', 'titleNative', 'malId', 'source',
-  'duration', 'rating', 'aired.to', 'genres', 'studios',
-  'banner', 'trailer', 'stats.score',
-]);
-
-const KITSU_CAN_FILL = new Set([
-  'titleEnglish', 'titleNative', 'kitsuId',
-  'duration', 'banner', 'aired.to', 'genres', 'stats.score',
-]);
-
-function detectMissing(
-  media: AniListMedia,
-  fetchedSources: string[]
-): MissingInfo {
-  const fields: string[] = [];
-
-  if (!media.title.english) fields.push('titleEnglish');
-  if (!media.title.native) fields.push('titleNative');
-  if (!media.myanimelistId) fields.push('malId');
-  if (!media.source) fields.push('source');
-  if (!media.duration) fields.push('duration');
-  if (!media.rating) fields.push('rating');
-  if (!media.endDate) fields.push('aired.to');
-  if (!media.genres || media.genres.length === 0) fields.push('genres');
-  if (!media.studios?.nodes?.length) fields.push('studios');
-  if (!media.banner) fields.push('banner');
-  if (!media.trailer) fields.push('trailer');
-  if (!media.averageScore) fields.push('stats.score');
-
-  const hasShiki = fetchedSources.includes('shikimori');
-  const hasKitsu = fetchedSources.includes('kitsu');
-
-  const canShikimori =
-    !hasShiki && fields.some((f) => SHIKIMORI_CAN_FILL.has(f));
-  const canKitsu =
-    !hasKitsu && fields.some((f) => KITSU_CAN_FILL.has(f));
-
-  return { fields, canShikimori, canKitsu };
-}
-
-interface MergeResult {
-  merged: AniListMedia;
-  filled: string[];
-}
-
-function mergeMetadata(
-  base: AniListMedia,
-  incoming: AniListMedia,
-  sourceName: string
-): MergeResult {
-  const merged: AniListMedia = JSON.parse(JSON.stringify(base));
-  const filled: string[] = [];
-
-  if (!merged.title.english && incoming.title.english) {
-    merged.title.english = incoming.title.english;
-    filled.push('titleEnglish');
-  }
-
-  if (!merged.title.native && incoming.title.native) {
-    merged.title.native = incoming.title.native;
-    filled.push('titleNative');
-  }
-
-  if (!merged.myanimelistId && incoming.myanimelistId) {
-    merged.myanimelistId = incoming.myanimelistId;
-    filled.push('malId');
-  }
-
-  if (!merged.source && incoming.source) {
-    merged.source = incoming.source;
-    filled.push('source');
-  }
-
-  if (!merged.duration && incoming.duration) {
-    merged.duration = incoming.duration;
-    filled.push('duration');
-  }
-
-  if (!merged.rating && incoming.rating) {
-    merged.rating = incoming.rating;
-    filled.push('rating');
-  }
-
-  if (!merged.endDate && incoming.endDate) {
-    merged.endDate = incoming.endDate;
-    filled.push('aired.to');
-  }
-
-  if (
-    (!merged.genres || merged.genres.length === 0) &&
-    incoming.genres?.length
-  ) {
-    merged.genres = incoming.genres;
-    filled.push('genres');
-  }
-
-  if (!merged.studios?.nodes?.length && incoming.studios?.nodes?.length) {
-    merged.studios = incoming.studios;
-    filled.push('studios');
-  }
-
-  if (!merged.banner && incoming.banner) {
-    merged.banner = incoming.banner;
-    filled.push('banner');
-  }
-
-  if (!merged.trailer && incoming.trailer) {
-    merged.trailer = incoming.trailer;
-    filled.push('trailer');
-  }
-
-  if (!merged.averageScore && incoming.averageScore) {
-    merged.averageScore = incoming.averageScore;
-    filled.push('stats.score');
-  }
-
-  if (!merged.coverImage.extraLarge && incoming.coverImage.extraLarge) {
-    merged.coverImage.extraLarge = incoming.coverImage.extraLarge;
-    merged.coverImage.large = incoming.coverImage.large;
-    filled.push('image');
-  }
-
-  console.log(
-    `[Merge] ${sourceName} filled: ${filled.length > 0 ? filled.join(', ') : 'nothing'}`
-  );
-
-  return { merged, filled };
-}
-
-interface VoiceActorInput {
-  id: string;
-  name: string;
-  nameNative?: string;
-  image?: string;
-  defaultLanguage?: string;
-}
-
-async function saveVoiceActors(
-  db: D1Database,
-  vas: VoiceActorInput[]
-): Promise<{ newCount: number; skippedCount: number }> {
-  if (vas.length === 0) return { newCount: 0, skippedCount: 0 };
-
-  await ensureDb(db);
-
-  const CHUNK = 100;
-
-  const existingSet = new Set<string>();
-
-  for (let i = 0; i < vas.length; i += CHUNK) {
-    const slice = vas.slice(i, i + CHUNK);
-    const ids = slice.map((v) => v.id);
-    const placeholders = ids.map(() => '?').join(',');
-    const res = await db
-      .prepare(`SELECT id FROM voice_actors WHERE id IN (${placeholders})`)
-      .bind(...ids)
-      .all<{ id: string }>();
-    for (const r of res.results ?? []) {
-      existingSet.add(r.id);
-    }
-  }
-
-  const newVAs = vas.filter((v) => !existingSet.has(v.id));
-
-  if (newVAs.length === 0) {
-    console.log(`[DBA] VA: ${vas.length} total, semua sudah ada`);
-    return { newCount: 0, skippedCount: vas.length };
-  }
-
-  const now = Date.now();
-
-  for (let i = 0; i < newVAs.length; i += CHUNK) {
-    const slice = newVAs.slice(i, i + CHUNK);
-    const stmts = slice.map((v) =>
-      db
-        .prepare(
-          `INSERT OR IGNORE INTO voice_actors
-           (id, name, nameNative, image, defaultLanguage, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        )
-        .bind(
-          v.id,
-          v.name,
-          v.nameNative ?? null,
-          v.image ?? null,
-          v.defaultLanguage ?? 'Japanese',
-          now
-        )
-    );
-    await db.batch(stmts);
-  }
-
-  console.log(
-    `[DBA] VA: ${newVAs.length} baru disimpan, ${vas.length - newVAs.length} sudah ada`
-  );
-
+function buildChainContext(session: SessionRow): ChainContext {
   return {
-    newCount: newVAs.length,
-    skippedCount: vas.length - newVAs.length,
-  };
-}
-
-function getFetchedSources(session: SessionRow): string[] {
-  if (!session.fetched_sources) return [];
-  try {
-    const arr = JSON.parse(session.fetched_sources);
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
-}
-
-function getSessionMetadata(session: SessionRow): AniListMedia | null {
-  if (!session.metadata) return null;
-  try {
-    return JSON.parse(session.metadata) as AniListMedia;
-  } catch {
-    return null;
-  }
-}
-
-function buildMetadataKeyboard(
-  sessionId: string,
-  missing: MissingInfo
-): InlineKeyboard {
-  const kb = new InlineKeyboard();
-  let hasRow = false;
-
-  if (missing.canShikimori) {
-    kb.text('📡 Cari Shikimori', `qd:ms:${sessionId}`);
-    hasRow = true;
-  }
-  if (missing.canKitsu) {
-    if (hasRow) kb.row();
-    kb.text('📡 Cari Kitsu', `qd:mk:${sessionId}`);
-    hasRow = true;
-  }
-  if (hasRow) kb.row();
-  kb.text('✅ Selesai', `qd:mo:${sessionId}`);
-
-  return kb;
-}
-
-function buildMetadataView(
-  session: SessionRow,
-  media: AniListMedia,
-  missing: MissingInfo,
-  sources: string[]
-): string {
-  const yaml = buildMetadataYaml({
-    media,
-    malId: media.myanimelistId ?? session.mal_id,
+    malId: session.mal_id,
     kitsuId: session.kitsu_id,
-  });
-
-  const sourceLabel = sources.length > 0
-    ? sources.map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(' + ')
-    : '—';
-
-  const lines: string[] = [];
-  lines.push(`📋 <b>Metadata — ${escapeHtml(media.title.romaji)}</b>`);
-  lines.push(`<i>Sumber: ${escapeHtml(sourceLabel)}</i>`);
-
-  if (missing.fields.length > 0) {
-    lines.push('');
-    lines.push(
-      `⚠️ <b>Field kosong (${missing.fields.length}):</b> ` +
-        `<code>${escapeHtml(missing.fields.join(', '))}</code>`
-    );
-  } else {
-    lines.push('');
-    lines.push('✅ <b>Semua field lengkap!</b>');
-  }
-
-  lines.push('');
-  lines.push(`<pre>${escapeHtml(yaml)}</pre>`);
-
-  return lines.join('\n');
-}
-
-async function fetchWithTimeout<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<T | null> {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
+    title: session.title,
+  };
 }
 
 function buildKeyboard(sessionId: string): InlineKeyboard {
@@ -568,31 +109,9 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
-function safeFetch<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<{ data: T | null; error: string | null }> {
-  return Promise.race([
-    fn().then(
-      (data) => ({ data, error: null }),
-      (err) => ({
-        data: null,
-        error: (err as Error)?.message ?? 'unknown',
-      })
-    ),
-    new Promise<{ data: T | null; error: string | null }>((r) =>
-      setTimeout(() => r({ data: null, error: `timeout ${timeoutMs}ms` }), timeoutMs)
-    ),
-  ]);
-}
-
-function fallbackJson(errors: string[]): string {
-  return JSON.stringify(
-    { error: true, message: 'Semua sumber gagal', errors },
-    null,
-    2
-  );
-}
+/* ============================================================
+   AI SYNOPSIS
+   ============================================================ */
 
 async function rewriteSynopsis(
   env: Env,
@@ -626,6 +145,10 @@ async function rewriteSynopsis(
     return null;
   }
 }
+
+/* ============================================================
+   COMMAND: /dba
+   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -734,6 +257,10 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
+/* ============================================================
+   COMMAND: /end
+   ============================================================ */
+
 export const endCommand: CommandDefinition = {
   name: 'end',
   description: 'Hapus semua pesan session /dba aktif',
@@ -767,6 +294,7 @@ export const endCommand: CommandDefinition = {
       ctx.chat.id,
       session.session_id
     );
+    await deleteCharCache(env.DB, session.session_id);
     await deleteSession(env.DB, session.session_id);
 
     await sendAutoDelete(
@@ -776,13 +304,9 @@ export const endCommand: CommandDefinition = {
   },
 };
 
-function buildChainContext(session: SessionRow): ChainContext {
-  return {
-    malId: session.mal_id,
-    kitsuId: session.kitsu_id,
-    title: session.title,
-  };
-}
+/* ============================================================
+   METADATA HANDLERS
+   ============================================================ */
 
 async function handleMetadataShow(
   ctx: Context,
@@ -790,9 +314,8 @@ async function handleMetadataShow(
   session: SessionRow,
   tracker: Tracker
 ): Promise<void> {
-  let media = getSessionMetadata(session);
+  let media = parseJsonMedia(session.metadata);
 
-  // Belum ada metadata → fetch AniList
   if (!media) {
     const fetched = await fetchWithTimeout(
       () => getMetadataFromAniList(session.title),
@@ -800,10 +323,9 @@ async function handleMetadataShow(
     );
 
     if (!fetched) {
-      const msg = await ctx.reply(
-        '❌ Gagal fetch metadata dari AniList.',
-        { parse_mode: 'HTML' }
-      );
+      const msg = await ctx.reply('❌ Gagal fetch metadata dari AniList.', {
+        parse_mode: 'HTML',
+      });
       await tracker(msg.message_id);
       return;
     }
@@ -812,7 +334,7 @@ async function handleMetadataShow(
     await updateSessionMetadata(env.DB, session.session_id, media, ['anilist']);
   }
 
-  const sources = getFetchedSources(session);
+  const sources = parseJsonArray(session.fetched_sources);
   const missing = detectMissing(media, sources);
   const view = buildMetadataView(session, media, missing, sources);
   const kb = buildMetadataKeyboard(session.session_id, missing);
@@ -832,14 +354,14 @@ async function handleMetadataMerge(
   sourceName: 'shikimori' | 'kitsu',
   tracker: Tracker
 ): Promise<void> {
-  const media = getSessionMetadata(session);
+  const media = parseJsonMedia(session.metadata);
   if (!media) {
     const msg = await ctx.reply('❌ Session tidak punya metadata.');
     await tracker(msg.message_id);
     return;
   }
 
-  const sources = getFetchedSources(session);
+  const sources = parseJsonArray(session.fetched_sources);
   if (sources.includes(sourceName)) {
     const msg = await ctx.reply(
       `ℹ️ ${sourceName} sudah pernah di-fetch.`,
@@ -849,7 +371,6 @@ async function handleMetadataMerge(
     return;
   }
 
-  // Fetch source baru
   let incoming: AniListMedia | null = null;
 
   if (sourceName === 'shikimori') {
@@ -867,25 +388,19 @@ async function handleMetadataMerge(
   }
 
   if (!incoming) {
-    const msg = await ctx.reply(
-      `❌ Gagal fetch dari ${sourceName}.`,
-      { parse_mode: 'HTML' }
-    );
+    const msg = await ctx.reply(`❌ Gagal fetch dari ${sourceName}.`, {
+      parse_mode: 'HTML',
+    });
     await tracker(msg.message_id);
     return;
   }
 
-  // Merge
   const { merged, filled } = mergeMetadata(media, incoming, sourceName);
-
-  // Update session
   const newSources = [...sources, sourceName];
   await updateSessionMetadata(env.DB, session.session_id, merged, newSources);
 
-  // Reload session (untuk title/cover baru)
   const updatedSession = (await getSession(env.DB, session.session_id))!;
 
-  // Notif kalau tidak ada yang di-fill
   if (filled.length === 0) {
     const msg = await ctx.reply(
       `ℹ️ <i>Tidak ada field baru dari ${sourceName}.</i>`,
@@ -895,7 +410,6 @@ async function handleMetadataMerge(
     return;
   }
 
-  // Tampilkan YAML baru
   const missing = detectMissing(merged, newSources);
   const view = buildMetadataView(updatedSession, merged, missing, newSources);
   const kb = buildMetadataKeyboard(session.session_id, missing);
@@ -908,13 +422,86 @@ async function handleMetadataMerge(
   await tracker(msg.message_id);
 }
 
+/* ============================================================
+   CALLBACK HANDLERS
+   ============================================================ */
+
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
+  /* ========================================================
+     PART HANDLER (per-part characters)
+     ======================================================== */
+  bot.callbackQuery(
+    /^qd:cp:(\d+):(q_[a-f0-9]+)$/,
+    async (ctx) => {
+      const partIndex = parseInt(ctx.match[1] ?? '0', 10);
+      const sessionId = ctx.match[2];
+
+      if (!sessionId || isNaN(partIndex)) {
+        await ctx.answerCallbackQuery({ text: '❌ Callback invalid' });
+        return;
+      }
+
+      const session = await getSession(env.DB, sessionId);
+      if (!session) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Session kadaluarsa. Ulangi /dba.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      if (ctx.from?.id !== session.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: '⏳ Mengirim part...' });
+
+      const tracker: Tracker = (msgId) =>
+        trackMessage(env.DB, sessionId, msgId);
+
+      const cache = await getCharCache(env.DB, sessionId);
+      if (!cache) {
+        const msg = await ctx.reply(
+          '⏱️ Cache characters kadaluarsa. Klik 📋 Characters lagi.',
+          { parse_mode: 'HTML' }
+        );
+        await tracker(msg.message_id);
+        return;
+      }
+
+      const part = getCharacterPart(cache.chars, partIndex);
+      if (!part) {
+        const msg = await ctx.reply('❌ Part tidak ditemukan.', {
+          parse_mode: 'HTML',
+        });
+        await tracker(msg.message_id);
+        return;
+      }
+
+      const numParts = countParts(cache.total);
+
+      // Kirim part
+      await sendJsonSection(
+        ctx,
+        `Characters ${part.start}-${part.end} dari ${cache.total} — ${session.title} [${partIndex + 1}/${numParts}]`,
+        part.items,
+        tracker
+      );
+
+      // Mark part as sent
+      await markPartSent(env.DB, sessionId, partIndex);
+    }
+  );
+
+  /* ========================================================
+     MAIN ACTIONS
+     ======================================================== */
   bot.callbackQuery(
     /^qd:(ms|mk|mo|m|c|e|f|s|v|x):(q_[a-f0-9]+)$/,
     async (ctx) => {
-      const match = ctx.match as RegExpMatchArray;
-      const action = match[1];
-      const sessionId = match[2];
+      const action = ctx.match[1];
+      const sessionId = ctx.match[2];
 
       if (!action || !sessionId) {
         await ctx.answerCallbackQuery({ text: '❌ Callback invalid' });
@@ -950,6 +537,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           chatId,
           sessionId
         );
+        await deleteCharCache(env.DB, sessionId);
         await deleteSession(env.DB, sessionId);
 
         await sendAutoDelete(
@@ -968,7 +556,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === METADATA REDIRECT → Shikimori ===
+      // === METADATA → Shikimori ===
       if (action === 'ms') {
         await ctx.answerCallbackQuery({ text: '📡 Cari Shikimori...' });
         const tracker: Tracker = (msgId) =>
@@ -977,7 +565,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === METADATA REDIRECT → Kitsu ===
+      // === METADATA → Kitsu ===
       if (action === 'mk') {
         await ctx.answerCallbackQuery({ text: '📡 Cari Kitsu...' });
         const tracker: Tracker = (msgId) =>
@@ -1009,9 +597,35 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
         /* ---------- CHARACTERS ---------- */
         if (action === 'c') {
+          // Cek cache dulu
+          const cached = await getCharCache(env.DB, sessionId);
+
+          if (cached) {
+            const numParts = countParts(cached.total);
+            const kb = buildPartsKeyboard(
+              sessionId,
+              cached.total,
+              cached.sentParts
+            );
+            const msg = await ctx.reply(
+              `📋 <b>Characters — ${escapeHtml(session.title)}</b>\n` +
+                `Total: <b>${cached.total}</b> karakter (${numParts} part × ${CHAR_PART_SIZE})\n` +
+                `Sumber: ${escapeHtml(cached.source)}\n\n` +
+                `<i>Pilih part:</i>`,
+              {
+                parse_mode: 'HTML',
+                reply_markup: kb,
+                link_preview_options: { is_disabled: true },
+              }
+            );
+            await tracker(msg.message_id);
+            return;
+          }
+
+          // Belum ada cache → fetch dari chain
           const { data: result, error } = await safeFetch(
             () => chainCharacters(chainCtx),
-            25000
+            CHAR_FETCH_TIMEOUT_MS
           );
 
           if (!result || !result.data || result.data.length === 0) {
@@ -1029,8 +643,8 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           const vas = result.voiceActors;
           const source = result.source;
 
+          // Simpan VA
           let vaResult = { newCount: 0, skippedCount: 0 };
-
           if (vas.length > 0) {
             try {
               vaResult = await saveVoiceActors(env.DB, vas);
@@ -1039,24 +653,34 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             }
           }
 
-          await sendJsonSection(
-            ctx,
-            `Characters — ${session.title} [${source}]`,
-            chars,
-            tracker
-          );
-
-          if (vas.length > 0) {
-            const text =
-              vaResult.newCount > 0
-                ? `ℹ️ <i>${vaResult.newCount} VA baru tersimpan ` +
-                  `(${vaResult.skippedCount} skip dari ${vas.length} total). ` +
-                  `Ketik /va untuk kelola.</i>`
-                : `ℹ️ <i>Semua ${vas.length} VA sudah ada di DB (skip).</i>`;
-
-            const msg = await ctx.reply(text, { parse_mode: 'HTML' });
-            await tracker(msg.message_id);
+          // Simpan cache karakter
+          try {
+            await saveCharCache(env.DB, sessionId, chars, vas, source);
+          } catch (err) {
+            console.warn('[DBA] Gagal simpan cache chars:', err);
           }
+
+          // Tampilkan menu part
+          const total = chars.length;
+          const numParts = countParts(total);
+          const kb = buildPartsKeyboard(sessionId, total);
+
+          let text =
+            `📋 <b>Characters — ${escapeHtml(session.title)}</b>\n` +
+            `Total: <b>${total}</b> karakter (${numParts} part × ${CHAR_PART_SIZE})\n` +
+            `Sumber: ${escapeHtml(source)}\n`;
+
+          if (vaResult.newCount > 0) {
+            text += `🎤 <b>${vaResult.newCount}</b> VA baru tersimpan (${vaResult.skippedCount} skip)\n`;
+          }
+          text += `\n<i>Pilih part:</i>`;
+
+          const menuMsg = await ctx.reply(text, {
+            parse_mode: 'HTML',
+            reply_markup: kb,
+            link_preview_options: { is_disabled: true },
+          });
+          await tracker(menuMsg.message_id);
           return;
         }
 
