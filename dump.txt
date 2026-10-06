@@ -1,6 +1,6 @@
 === REPO DUMP ===
-Generated: Tue Oct  6 16:43:41 UTC 2026
-Commit: 0b1505f
+Generated: Tue Oct  6 19:19:26 UTC 2026
+Commit: bff7fc1
 
 === STRUCTURE ===
 .
@@ -58,6 +58,7 @@ Commit: 0b1505f
 ./src/services/qimochi-json.ts
 ./src/services/qimochi-yaml.ts
 ./src/services/shikimori.ts
+./src/services/yukionime.ts
 ./src/types/anime.ts
 ./src/types/env.ts
 ./tsconfig.json
@@ -568,6 +569,13 @@ import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../types/anime';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import {
+  searchYukionime,
+  getYukionimeDetail,
+  isYukionimeComplete,
+  yukionimeToAniListMedia,
+  type YukionimeAnime,
+} from '../services/yukionime';
 import { getCache, setCache } from '../lib/cache';
 import {
   searchAnime,
@@ -582,9 +590,24 @@ import {
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
-/* ═══════════════════════════════════════════════
+/* ============================================================
+   SLUGIFY
+   ============================================================ */
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/* ============================================================
    DB: TEMP SESSIONS
-   ═══════════════════════════════════════════════ */
+   ============================================================ */
 
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
@@ -606,11 +629,19 @@ async function ensureDb(db: D1Database): Promise<void> {
             ai_used      TEXT NOT NULL,
             cover        TEXT,
             source_label TEXT,
+            slug         TEXT,
             created_at   INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL
           )`
         )
         .run();
+
+      try {
+        await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
+      } catch {
+        // ignore: kolom sudah ada
+      }
+
       dbReady = true;
     } catch (err) {
       console.error('[Anime] DB init error:', err);
@@ -632,6 +663,7 @@ async function saveSession(
     aiUsed: string[];
     cover: string | null;
     sourceLabel: string | null;
+    slug: string;
   }
 ): Promise<string> {
   await ensureDb(db);
@@ -642,8 +674,8 @@ async function saveSession(
   await db
     .prepare(
       `INSERT INTO temp_anime
-         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, slug, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
@@ -654,6 +686,7 @@ async function saveSession(
       JSON.stringify(data.aiUsed),
       data.cover,
       data.sourceLabel,
+      data.slug,
       now,
       now + SESSION_TTL_MS
     )
@@ -671,6 +704,7 @@ interface SessionRow {
   ai_used: string;
   cover: string | null;
   source_label: string | null;
+  slug: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -714,9 +748,9 @@ async function deleteSession(
   }
 }
 
-/* ═══════════════════════════════════════════════
+/* ============================================================
    HELPERS
-   ═══════════════════════════════════════════════ */
+   ============================================================ */
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -776,14 +810,90 @@ function extractTitleFromMALUrl(url: string): string | null {
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
 
-/* ═══════════════════════════════════════════════
+/* ============================================================
+   YUKIONIME HELPERS
+   ============================================================ */
+
+interface YukionimeCheckResult {
+  match: YukionimeAnime | null;
+  synopsis: string | null;
+  complete: boolean;
+}
+
+async function checkYukionime(
+  query: string
+): Promise<YukionimeCheckResult> {
+  try {
+    const match = await searchYukionime(query);
+    if (!match) return { match: null, synopsis: null, complete: false };
+
+    const detail = await getYukionimeDetail(match.id);
+    const synopsis = detail?.synopsis ?? null;
+
+    // Merge: pakai detail (lebih lengkap) + synopsis dari scrape
+    const merged: YukionimeAnime = {
+      ...match,
+      ...(detail ?? {}),
+      synopsis,
+    };
+
+    const complete = isYukionimeComplete(merged);
+
+    return { match: merged, synopsis, complete };
+  } catch (err) {
+    console.warn('[Anime] yukionime check failed:', err);
+    return { match: null, synopsis: null, complete: false };
+  }
+}
+
+function buildYukionimeWarning(
+  match: YukionimeAnime,
+  synopsis: string | null,
+  isComplete: boolean
+): string {
+  const lines: string[] = [];
+  lines.push('⚠️ <b>Sudah ada di database Yukionime!</b>');
+  lines.push('');
+  lines.push(`🆔 <b>Slug:</b> <code>${escapeHtml(match.id)}</code>`);
+  lines.push(`📌 <b>Judul:</b> ${escapeHtml(match.title)}`);
+
+  if (match.year) lines.push(`📅 <b>Tahun:</b> ${match.year}`);
+  if (match.type) lines.push(`🎬 <b>Tipe:</b> ${escapeHtml(match.type)}`);
+  if (match.status) lines.push(`📊 <b>Status:</b> ${escapeHtml(match.status)}`);
+
+  if (synopsis) {
+    const preview =
+      synopsis.slice(0, 200) + (synopsis.length > 200 ? '…' : '');
+    lines.push('');
+    lines.push('📝 <b>Sinopsis:</b>');
+    lines.push(`<i>${escapeHtml(preview)}</i>`);
+  }
+
+  lines.push('');
+  if (isComplete) {
+    lines.push('✅ <i>Data lengkap. Langsung dipakai (skip AniList).</i>');
+  } else {
+    lines.push(
+      '⚠️ <i>Data tidak lengkap. Lanjut cari di AniList untuk melengkapi.</i>'
+    );
+  }
+
+  lines.push('');
+  lines.push(
+    `🔗 <a href="https://yukionime.pages.dev/anime/${escapeHtml(match.id)}/">Lihat halaman</a>`
+  );
+
+  return lines.join('\n');
+}
+
+/* ============================================================
    COMMAND
-   ═══════════════════════════════════════════════ */
+   ============================================================ */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime → tombol convert YAML',
-  usage: '/anime jujutsu kaisen',
+  usage: '/anime nama anime',
   adminOnly: true,
 
   handler: async (ctx, env) => {
@@ -809,14 +919,100 @@ export const animeCommand: CommandDefinition = {
     const loading = await ctx.reply('🔍 Mencari...');
 
     try {
-      let media: AniListMedia | null = null;
-      let sourceLabel = '';
       let searchQuery = query;
 
       if (isMALUrl(query)) {
         const t = extractTitleFromMALUrl(query);
         if (t) searchQuery = t;
       }
+
+      /* ========================================================
+         STEP 1: CEK YUKIONIME
+         ======================================================== */
+      const yukionime = await checkYukionime(searchQuery);
+
+      if (yukionime.match && yukionime.complete) {
+        // === DATA LENGKAP → LANGSUNG PAKAI ===
+        console.log(
+          '[Anime] yukionime complete — skip AniList'
+        );
+
+        // Hapus loading
+        await ctx.api
+          .deleteMessage(ctx.chat!.id, loading.message_id)
+          .catch(() => {});
+
+        // Kirim warning + info
+        await ctx.reply(
+          buildYukionimeWarning(
+            yukionime.match,
+            yukionime.synopsis,
+            true
+          ),
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          }
+        );
+
+        // Convert yukionime → AniListMedia
+        const media = yukionimeToAniListMedia({
+          ...yukionime.match,
+          synopsis: yukionime.synopsis,
+        });
+
+        // Build result TANPA AI enrichment
+        const result = buildQimochiHubResult(media, null);
+        const slug = yukionime.match.id;
+
+        const sessionId = await saveSession(env.DB, ctx.from!.id, {
+          yaml: result.yaml,
+          body: result.body,
+          missing: result.missing,
+          aiUsed: result.aiUsed,
+          cover: yukionime.match.image ?? null,
+          sourceLabel: '📚 Dari Yukionime (database)',
+          slug,
+        });
+
+        const keyboard = new InlineKeyboard()
+          .text('📋 Convert ke YAML', `an:y:${sessionId}`)
+          .text('❌ Batal', `an:x:${sessionId}`);
+
+        await ctx.reply(
+          '✅ <b>Data siap!</b> (dari database Yukionime)\n\n' +
+            'Klik tombol di bawah untuk convert ke <b>YAML</b> + sinopsis.',
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: keyboard,
+          }
+        );
+
+        console.log(`[Anime] total: ${Date.now() - T0}ms (yukionime)`);
+        return;
+      }
+
+      // Yukionime ada tapi tidak lengkap → warning, lanjut AniList
+      if (yukionime.match) {
+        await ctx.reply(
+          buildYukionimeWarning(
+            yukionime.match,
+            yukionime.synopsis,
+            false
+          ),
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          }
+        );
+      }
+
+      /* ========================================================
+         STEP 2: FETCH ANILIST
+         ======================================================== */
+      let media: AniListMedia | null = null;
+      let sourceLabel = '';
 
       const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
       media = await getCache<AniListMedia>(env.DB, cacheKey);
@@ -867,11 +1063,23 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
-      const need = detectMissing(media);
+      /* ========================================================
+         STEP 3: DETECT MISSING (+ skip synopsis kalau ada yukionime)
+         ======================================================== */
+      let need = detectMissing(media);
+
+      if (yukionime.synopsis) {
+        need = need.filter((n) => n !== 'synopsis');
+        console.log('[Anime] skip AI synopsis (yukionime punya)');
+      }
+
       console.log(
         `[Anime] missing after merge: [${need.join(', ') || 'none'}]`
       );
 
+      /* ========================================================
+         STEP 4: AI ENRICH
+         ======================================================== */
       let enriched: Enriched | null = null;
 
       if (need.length > 0) {
@@ -890,7 +1098,6 @@ export const animeCommand: CommandDefinition = {
             releaseDate: media.startDate?.year
               ? `${media.startDate.year}-01-01`
               : null,
-            // Kirim raw description — AI akan rewrite (Russian → Indonesia, dll)
             originalSynopsis: media.description,
           },
           need
@@ -924,10 +1131,28 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
-      const { yaml, body, missing, aiUsed } = buildQimochiHubResult(
-        media,
-        enriched
-      );
+      /* ========================================================
+         STEP 5: INJECT SYNOPSIS YUKIONIME
+         ======================================================== */
+      if (yukionime.synopsis) {
+        enriched = { ...(enriched ?? {}), synopsis: yukionime.synopsis };
+      }
+
+      /* ========================================================
+         STEP 6: BUILD RESULT
+         ======================================================== */
+      const result = buildQimochiHubResult(media, enriched);
+      const { yaml, body, missing } = result;
+      let aiUsed = result.aiUsed;
+
+      // Ganti label AI → "dari Yukionime" kalau pakai synopsis yukionime
+      if (yukionime.synopsis) {
+        aiUsed = aiUsed.map((f) =>
+          f === 'synopsis' ? 'synopsis (dari Yukionime)' : f
+        );
+      }
+
+      const slug = slugify(pickTitle(media));
 
       const sessionId = await saveSession(env.DB, ctx.from!.id, {
         yaml,
@@ -936,6 +1161,7 @@ export const animeCommand: CommandDefinition = {
         aiUsed,
         cover: media.coverImage.extraLarge || media.coverImage.large || null,
         sourceLabel: sourceLabel || null,
+        slug,
       });
 
       const keyboard = new InlineKeyboard()
@@ -975,9 +1201,9 @@ export const animeCommand: CommandDefinition = {
   },
 };
 
-/* ═══════════════════════════════════════════════
+/* ============================================================
    CALLBACK HANDLERS
-   ═══════════════════════════════════════════════ */
+   ============================================================ */
 
 export function setupAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^an:y:([a-f0-9]+)$/, async (ctx) => {
@@ -1021,7 +1247,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       warnLines.push('');
     }
     if (aiUsed.length > 0) {
-      warnLines.push('🤖 <b>Diisi AI (VERIFIKASI ulang):</b>');
+      warnLines.push('🤖 <b>Diisi AI / dari sumber (VERIFIKASI):</b>');
       for (const f of aiUsed)
         warnLines.push(`• <code>${escapeHtml(f)}</code>`);
     }
@@ -1031,6 +1257,13 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         link_preview_options: { is_disabled: true },
       });
     }
+
+    const slug = session.slug ?? 'unknown';
+    await ctx.reply(
+      `🆔 <b>Slug</b>\n<i>Buat file: <code>${escapeHtml(slug)}.md</code></i>\n\n` +
+        `<pre>${escapeHtml(slug)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
 
     await ctx.reply(
       `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(session.yaml)}</pre>`,
@@ -1088,6 +1321,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
   });
 }
+
 ===== END FILE =====
 
 ===== FILE: ./src/commands/clearcache.ts =====
@@ -1973,6 +2207,7 @@ const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
 const MSG_BUDGET = 3800;
 const JSON_INLINE_THRESHOLD = 3500;
+const BATCH_MAX = 30;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -1985,9 +2220,36 @@ const VIDEO_HOSTS = [
   'mixdrop', 'iixdrop', 'abyss', 'abyssplayer',
   'framezi', 'kturbo',
   'pixeldrain', 'vikingfile', 'buzzheavier', 'mega.nz', 'doply',
+  'xtwap.top',
+  'otakudesu',
+  'kuramanime',
+  'anoboy',
+  'oploverz',
+  'blogspot',
+  'blogger.com',
+  'desustream',
+  'kuragebunch',
+  'streamsb',
+  'filemoon.sx',
+  'vidhide',
+  'odvidhide',
+  'ondesuhd',
+  'vidcloud',
+  'hxfile',
+  'krakenfiles',
+  'gofile',
+  'acefile',
+  'animekuid',
+  'animesub',
+  'lexanime',
+  'dropbox.com',
 ];
 
-const WRAPPER_HOSTS = ['animesail.xyz', '154999000.xyz'];
+const WRAPPER_HOSTS = [
+  'animesail.xyz',
+  '154999000.xyz',
+  'video.animesub.web.id',
+];
 
 const SERVER_ALIASES: Record<string, string> = {
   abyss: 'abyss', dodo: 'doply', doply: 'doply',
@@ -1997,10 +2259,19 @@ const SERVER_ALIASES: Record<string, string> = {
   buzi: 'buzzheavier', buzzheavier: 'buzzheavier',
   mp4: 'mp4upload', mp4upload: 'mp4upload',
   mega: 'mega', lokal: 'lokal', kamado: 'kamado', pancal: 'pancal',
+  'b-tube': 'blogger', 'btube': 'blogger',
+  'blogger': 'blogger', 'blogspot': 'blogger',
+  odstream: 'odstream', odcdn: 'odcdn',
+  ondesuhd: 'ondesuhd', ondesu: 'ondesu',
+  vidhide: 'vidhide',
 };
 
+const RSC_EMBED_RE =
+  /\\"quality\\":\\"([^\\"]+)\\",\\"mirror\\":\\"([^\\"]+)\\",\\"link\\":\\"([^\\"]+)\\"/g;
+
 interface RawEntry {
-  base64: string;
+  base64?: string;
+  url?: string;
   label: string | null;
 }
 
@@ -2010,6 +2281,11 @@ interface ResolvedEntry {
   server: string | null;
 }
 
+interface EpisodeObject {
+  number: number;
+  streams: { quality: string; servers: { name: string; url: string }[] }[];
+}
+
 interface FileRef {
   id: number;
   label: string;
@@ -2017,6 +2293,24 @@ interface FileRef {
   file_id: string;
   created_at: number;
   last_accessed: number;
+}
+
+interface ProxyResponse {
+  ok: boolean;
+  status: number;
+  body?: string;
+  error?: string;
+  truncated?: boolean;
+}
+
+interface ProxyDebug {
+  proxyUrl: string;
+  httpStatus: number;
+  contentType: string;
+  rawLength: number;
+  rawPreview: string;
+  parseOk: boolean;
+  error?: string;
 }
 
 let dbReady = false;
@@ -2145,7 +2439,9 @@ function decodeBase64(input: string): string | null {
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new TextDecoder('utf-8', { fatal: false, ignoreBOM: false }).decode(bytes);
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 function isLikelyBase64(s: string): boolean {
@@ -2168,8 +2464,11 @@ function isPrintable(s: string): boolean {
 function looksLikeHtml(s: string): boolean {
   if (s.length < 30) return false;
   return (
-    /<!DOCTYPE/i.test(s) || /<html[\s>]/i.test(s) || /<script[\s>]/i.test(s) ||
-    /<iframe[\s>]/i.test(s) || /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
+    /<!DOCTYPE/i.test(s) ||
+    /<html[\s>]/i.test(s) ||
+    /<script[\s>]/i.test(s) ||
+    /<iframe[\s>]/i.test(s) ||
+    /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
   );
 }
 
@@ -2183,18 +2482,31 @@ function isWrapper(url: string): boolean {
   try {
     const h = new URL(url).hostname.toLowerCase();
     return WRAPPER_HOSTS.some((w) => h === w || h.endsWith('.' + w));
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 function parseResolution(label: string | null): string | null {
   if (!label) return null;
-  const m = label.match(/\b(\d{3,4})p\b/i);
+  const m =
+    label.match(/\b(\d{3,4})p\b/i) ??
+    label.match(/\[\s*(\d{3,4})p\s*\]/i);
   return m && m[1] ? `${m[1]}p` : null;
 }
 
 function parseServerName(label: string | null): string | null {
   if (!label) return null;
-  const cleaned = label.toLowerCase().replace(/\s+\d{3,4}p\s*$/i, '').trim();
+
+  const cleaned = label
+    .toLowerCase()
+    .replace(/^\s*\[\s*\d{3,4}p\s*\]\s*/i, '')
+    .replace(/^\s*\d{3,4}p\s+/i, '')
+    .replace(/\s+\d{3,4}p\s*$/i, '')
+    .replace(/\s*[-_]\s*\d+$/i, '')
+    .replace(/\s+\d+$/i, '')
+    .trim();
+
   if (!cleaned) return null;
   return SERVER_ALIASES[cleaned] ?? cleaned;
 }
@@ -2206,17 +2518,15 @@ function resolutionRank(r: string | null): number {
 }
 
 function slugify(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/\.(html?|txt|json)$/i, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40) || `file-${Date.now()}`;
+  return (
+    s
+      .toLowerCase()
+      .replace(/\.(html?|txt|json)$/i, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40) || `file-${Date.now()}`
+  );
 }
-
-/* ============================================================
-   EPISODE NUMBER DETECTION
-   ============================================================ */
 
 function parseEpisodeNumber(
   filename: string | null,
@@ -2229,7 +2539,6 @@ function parseEpisodeNumber(
   const isValid = (n: number): boolean =>
     n > 0 && n < 10000 && !RESOLUTIONS.has(n);
 
-  // Pass 1: filename
   if (filename) {
     const m = filename.match(/\b(?:ep|eps|episode|e)\s*[-_.]?\s*0*(\d+)\b/i);
     if (m && m[1]) {
@@ -2238,7 +2547,6 @@ function parseEpisodeNumber(
     }
   }
 
-  // Pass 2: label "Episode N"
   for (const label of labels) {
     if (!label) continue;
     const m = label.match(/\b(?:episode|eps|ep)\s*0*(\d+)\b/i);
@@ -2248,7 +2556,6 @@ function parseEpisodeNumber(
     }
   }
 
-  // Pass 3: label murni angka
   for (const label of labels) {
     if (!label) continue;
     const m = label.trim().match(/^0*(\d+)$/);
@@ -2261,15 +2568,14 @@ function parseEpisodeNumber(
   return 1;
 }
 
-/* ============================================================
-   URL EXTRACTION
-   ============================================================ */
-
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
   const cleaned = htmlDecode(s);
   const trimmed = cleaned.trim();
-  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) { found.add(trimmed); return [...found]; }
+  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) {
+    found.add(trimmed);
+    return [...found];
+  }
 
   for (const m of cleaned.matchAll(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi)) {
     const u = htmlDecode(m[1] ?? '');
@@ -2299,8 +2605,30 @@ function extractUrlsFromDecoded(s: string): string[] {
 function expandUrlParams(url: string, depth = 0): string[] {
   const out = new Set<string>([url]);
   if (depth > MAX_PARAM_DEPTH) return [...out];
+
   let parsed: URL;
-  try { parsed = new URL(url); } catch { return [...out]; }
+  try {
+    parsed = new URL(url);
+  } catch {
+    return [...out];
+  }
+
+  for (const seg of parsed.pathname.split('/')) {
+    if (seg.length < 20 || seg.length > 800) continue;
+    let dec = seg;
+    try {
+      dec = decodeURIComponent(seg);
+    } catch {
+      /* ignore */
+    }
+    if (!isLikelyBase64(dec)) continue;
+    const decoded = decodeBase64(dec);
+    if (!decoded || !isPrintable(decoded)) continue;
+    const trimmed = decoded.trim();
+    if (/^https?:\/\//i.test(trimmed)) {
+      for (const sub of expandUrlParams(trimmed, depth + 1)) out.add(sub);
+    }
+  }
 
   for (const [key, value] of parsed.searchParams.entries()) {
     if (!value || value.length < 12) continue;
@@ -2316,7 +2644,9 @@ function expandUrlParams(url: string, depth = 0): string[] {
         if (/^https?:\/\//i.test(dec)) {
           for (const sub of expandUrlParams(dec, depth + 1)) out.add(sub);
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
     if (isLikelyBase64(value)) {
       const decoded = decodeBase64(value);
@@ -2355,15 +2685,68 @@ function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
+function extractNextJsEmbeds(html: string): RawEntry[] {
+  const out: RawEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const m of html.matchAll(RSC_EMBED_RE)) {
+    const quality = m[1] ?? '';
+    const mirror  = m[2] ?? '';
+    let link      = m[3] ?? '';
+
+    if (!link) continue;
+
+    link = link
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\\//g, '/');
+
+    if (!/^https?:\/\//i.test(link)) continue;
+    if (seen.has(link)) continue;
+    seen.add(link);
+
+    out.push({
+      url: link,
+      label: `[${quality.toUpperCase()}] ${mirror.toUpperCase()}`,
+    });
+  }
+  return out;
+}
+
 function extractEntries(html: string): RawEntry[] {
   const entries: RawEntry[] = [];
   const seen = new Set<string>();
 
-  for (const m of html.matchAll(
-    /<option\b[^>]*?\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["'][^>]*?>([^<]*)<\/option>/gi
-  )) {
-    const b64 = m[1];
+  for (const e of extractNextJsEmbeds(html)) {
+    const key = e.url!;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push(e);
+  }
+
+  for (const m of html.matchAll(/<button\b([^>]*?)>/gi)) {
+    const attrs = m[1] ?? '';
+    const labelMatch = attrs.match(/\bdata-label\s*=\s*["']([^"']*)["']/i);
+    const embedMatch = attrs.match(/\bdata-embed\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i);
+    if (!embedMatch) continue;
+
+    const b64 = embedMatch[1];
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+
+    const label = labelMatch?.[1]?.trim() ?? null;
+    entries.push({ base64: b64, label: label || null });
+  }
+
+  for (const m of html.matchAll(/<option\b([^>]*?)>([^<]*)<\/option>/gi)) {
+    const attrs = m[1] ?? '';
     const label = (m[2] ?? '').trim();
+
+    const b64Match =
+      attrs.match(/\bvalue\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i) ??
+      attrs.match(/\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i);
+
+    if (!b64Match) continue;
+    const b64 = b64Match[1];
     if (!b64 || seen.has(b64)) continue;
     seen.add(b64);
     entries.push({ base64: b64, label: label || null });
@@ -2391,13 +2774,21 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   const resolved = new Map<string, { resolution: string | null; server: string | null }>();
   const unresolved = new Map<string, { resolution: string | null; server: string | null }>();
 
-  function resolve(url: string, resolution: string | null, server: string | null, depth: number, seen: Set<string>): void {
+  function resolve(
+    url: string,
+    resolution: string | null,
+    server: string | null,
+    depth: number,
+    seen: Set<string>
+  ): void {
     if (depth > 4 || seen.has(url)) return;
     seen.add(url);
     const children = expandUrlParams(url).filter((u) => u !== url);
     if (isWrapper(url)) {
       if (children.length === 0) {
-        if (!resolved.has(url) && !unresolved.has(url)) unresolved.set(url, { resolution, server });
+        if (!resolved.has(url) && !unresolved.has(url)) {
+          unresolved.set(url, { resolution, server });
+        }
       } else {
         for (const c of children) resolve(c, resolution, server, depth + 1, seen);
       }
@@ -2408,20 +2799,38 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   }
 
   for (const e of entries) {
-    const dec = multiLayerDecode(e.base64);
-    if (!dec || dec.urls.length === 0) continue;
     const resolution = parseResolution(e.label);
     const server = parseServerName(e.label);
+
+    if (e.url) {
+      resolve(e.url, resolution, server, 0, new Set());
+      continue;
+    }
+
+    if (!e.base64) continue;
+    const dec = multiLayerDecode(e.base64);
+    if (!dec || dec.urls.length === 0) continue;
     for (const url of dec.urls) resolve(url, resolution, server, 0, new Set());
   }
 
   const final: ResolvedEntry[] = [];
   for (const [url, info] of resolved) {
-    if (isVideoUrl(url)) final.push({ url, resolution: info.resolution, server: info.server });
+    if (isVideoUrl(url)) {
+      final.push({ url, resolution: info.resolution, server: info.server });
+    }
+  }
+
+  if (final.length === 0) {
+    for (const [url, info] of resolved) {
+      final.push({ url, resolution: info.resolution, server: info.server });
+    }
   }
   if (final.length === 0) {
-    for (const [url, info] of unresolved) final.push({ url, resolution: info.resolution, server: info.server });
+    for (const [url, info] of unresolved) {
+      final.push({ url, resolution: info.resolution, server: info.server });
+    }
   }
+
   final.sort((a, b) => {
     const ra = resolutionRank(a.resolution);
     const rb = resolutionRank(b.resolution);
@@ -2431,23 +2840,7 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   return final;
 }
 
-/* ============================================================
-   BUILD OUTPUT — SINGLE EPISODE JSON
-   ============================================================ */
-
-/**
- * Build JSON untuk 1 episode — struktur final:
- *   src/data/anime/{slug}/episodes/{number}.json
- *
- * Output:
- *   {
- *     "number": N,
- *     "streams": [
- *       { "quality": "1080p", "servers": [{ "name": "...", "url": "..." }] }
- *     ]
- *   }
- */
-function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
+function buildEpisodeObject(items: ResolvedEntry[], episodeNumber: number): EpisodeObject {
   const byQuality = new Map<string, { name: string; url: string }[]>();
 
   for (const item of items) {
@@ -2468,12 +2861,11 @@ function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
     servers: byQuality.get(q)!,
   }));
 
-  const payload = {
-    number: episodeNumber,
-    streams,
-  };
+  return { number: episodeNumber, streams };
+}
 
-  return JSON.stringify(payload, null, 2) + '\n';
+function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
+  return JSON.stringify(buildEpisodeObject(items, episodeNumber), null, 2) + '\n';
 }
 
 function buildUrlList(items: ResolvedEntry[], label?: string): string {
@@ -2520,10 +2912,6 @@ function splitMessage(text: string, budget = MSG_BUDGET): string[] {
   return parts;
 }
 
-/* ============================================================
-   TELEGRAM DOCUMENT UPLOAD
-   ============================================================ */
-
 async function sendDocumentViaApi(
   botToken: string,
   chatId: number,
@@ -2531,8 +2919,7 @@ async function sendDocumentViaApi(
   content: string,
   caption: string
 ): Promise<void> {
-  const boundary =
-    '----YukioDecode' + Math.random().toString(36).slice(2, 12);
+  const boundary = '----YukioDecode' + Math.random().toString(36).slice(2, 12);
 
   const encoder = new TextEncoder();
   const CRLF = '\r\n';
@@ -2576,28 +2963,16 @@ async function sendDocumentViaApi(
   const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-    },
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
     body,
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(
-      `sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`
-    );
+    throw new Error(`sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`);
   }
 }
 
-/**
- * Kirim hasil decode:
- *   1. URL list (inline, sebagai info)
- *   2. JSON — inline <pre> kalau kecil, file .json kalau besar
- *
- * Target save user:
- *   src/data/anime/{slug}/episodes/{number}.json
- */
 async function sendResult(
   ctx: Context,
   env: Env,
@@ -2606,7 +2981,6 @@ async function sendResult(
   sourceLabels: (string | null)[],
   sourceFilename: string | null
 ): Promise<void> {
-  // URL list untuk info
   const urlList = buildUrlList(items, label);
   for (const part of splitMessage(urlList)) {
     await ctx.reply(part, {
@@ -2615,10 +2989,7 @@ async function sendResult(
     });
   }
 
-  // Detect nomor episode
   const episodeNumber = parseEpisodeNumber(sourceFilename, sourceLabels);
-
-  // Build JSON (single episode)
   const json = buildJson(items, episodeNumber);
 
   console.log(
@@ -2627,7 +2998,6 @@ async function sendResult(
 
   const targetPath = `src/data/anime/{slug}/episodes/${episodeNumber}.json`;
 
-  // Kecil → inline <pre>
   if (json.length <= JSON_INLINE_THRESHOLD) {
     await ctx.reply(
       `📋 <b>Episode ${episodeNumber}</b>\n` +
@@ -2638,7 +3008,6 @@ async function sendResult(
     return;
   }
 
-  // Besar → file attachment
   const filename = `ep-${episodeNumber}.json`;
 
   const caption =
@@ -2646,13 +3015,7 @@ async function sendResult(
     `<i>Rename & save ke <code>${escapeHtml(targetPath)}</code></i>`;
 
   try {
-    await sendDocumentViaApi(
-      env.TELEGRAM_BOT_TOKEN,
-      ctx.chat!.id,
-      filename,
-      json,
-      caption
-    );
+    await sendDocumentViaApi(env.TELEGRAM_BOT_TOKEN, ctx.chat!.id, filename, json, caption);
   } catch (err) {
     console.warn('[Decode] sendDocument failed, fallback inline:', err);
     await ctx.reply(
@@ -2661,10 +3024,6 @@ async function sendResult(
     );
   }
 }
-
-/* ============================================================
-   FILE DOWNLOAD
-   ============================================================ */
 
 async function downloadByFileId(
   ctx: Context,
@@ -2707,10 +3066,9 @@ async function downloadByFileId(
         )
         .catch(() => {});
     } else {
-      await ctx.reply(
-        `❌ Gagal ambil file: <code>${escapeHtml(msg)}</code>`,
-        { parse_mode: 'HTML' }
-      );
+      await ctx.reply(`❌ Gagal ambil file: <code>${escapeHtml(msg)}</code>`, {
+        parse_mode: 'HTML',
+      });
     }
     return null;
   }
@@ -2726,7 +3084,9 @@ async function downloadDocText(
   const size = doc.file_size ?? 0;
   if (size > MAX_FILE_BYTES) {
     await ctx.reply(
-      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${MAX_FILE_BYTES / 1024 / 1024} MB).\n\n<i>Potong dulu HTML-nya.</i>`,
+      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${
+        MAX_FILE_BYTES / 1024 / 1024
+      } MB).\n\n<i>Potong dulu HTML-nya.</i>`,
       { parse_mode: 'HTML' }
     );
     return null;
@@ -2734,9 +3094,13 @@ async function downloadDocText(
 
   const name = doc.file_name ?? '';
   const mime = doc.mime_type ?? '';
-  const ok = /\.(html?|txt|json|js|css)$/i.test(name) || /^text\/|json|javascript/i.test(mime);
+  const ok =
+    /\.(html?|txt|json|js|css)$/i.test(name) || /^text\/|json|javascript/i.test(mime);
   if (!ok) {
-    await ctx.reply(`❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`, { parse_mode: 'HTML' });
+    await ctx.reply(
+      `❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`,
+      { parse_mode: 'HTML' }
+    );
     return null;
   }
 
@@ -2769,7 +3133,7 @@ function processText(
   input: string,
   sourceType: 'base64' | 'html'
 ): { videos: ResolvedEntry[]; labels: (string | null)[] } | null {
-  const entries =
+  const entries: RawEntry[] =
     sourceType === 'html'
       ? extractEntries(input)
       : [{ base64: input, label: null }];
@@ -2779,10 +3143,6 @@ function processText(
   const labels = entries.map((e) => e.label);
   return { videos, labels };
 }
-
-/* ============================================================
-   PUBLIC HANDLERS
-   ============================================================ */
 
 export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
   const result = await downloadDocText(ctx, env);
@@ -2834,6 +3194,323 @@ export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> 
   }
 }
 
+async function fetchUrlViaProxy(
+  env: Env,
+  url: string
+): Promise<{ body: string | null; debug: ProxyDebug }> {
+  const proxyUrl = env.VAL_TOWN_FETCH_URL;
+  const debug: ProxyDebug = {
+    proxyUrl: proxyUrl ?? '(undefined)',
+    httpStatus: 0,
+    contentType: '',
+    rawLength: 0,
+    rawPreview: '',
+    parseOk: false,
+  };
+
+  if (!proxyUrl) {
+    debug.error = 'VAL_TOWN_FETCH_URL tidak di-set';
+    console.error('[Decode]', debug.error);
+    return { body: null, debug };
+  }
+
+  try {
+    const res = await fetch(proxyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+
+    debug.httpStatus = res.status;
+    debug.contentType = res.headers.get('content-type') ?? '';
+
+    const raw = await res.text();
+    debug.rawLength = raw.length;
+    debug.rawPreview = raw.slice(0, 200);
+
+    console.log(
+      `[Decode] proxy status=${res.status} ct=${debug.contentType} len=${raw.length}`
+    );
+
+    if (!res.ok) {
+      debug.error = `Proxy HTTP ${res.status}`;
+      return { body: null, debug };
+    }
+
+    let data: ProxyResponse;
+    try {
+      data = JSON.parse(raw) as ProxyResponse;
+      debug.parseOk = true;
+    } catch {
+      debug.error = 'Response proxy bukan JSON';
+      return { body: null, debug };
+    }
+
+    if (!data.body || data.body.length < 200) {
+      debug.error = `Target HTTP ${data.status}: body kosong/terlalu pendek`;
+      return { body: null, debug };
+    }
+
+    if (data.status >= 400) {
+      debug.error = `Target HTTP ${data.status} (tetap coba proses, body ${data.body.length} char)`;
+      console.warn(`[Decode] ${debug.error}`);
+    }
+
+    return { body: data.body, debug };
+  } catch (err: any) {
+    debug.error = `fetch threw: ${err?.message ?? 'unknown'}`;
+    console.error('[Decode] proxy fetch threw:', err);
+    return { body: null, debug };
+  }
+}
+
+async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void> {
+  const loading = await ctx.reply(`🌐 Fetch URL:\n<code>${escapeHtml(url)}</code>`, {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
+
+  try {
+    const { body: html, debug } = await fetchUrlViaProxy(env, url);
+
+    if (!html) {
+      const debugLines = [
+        '❌ Gagal fetch URL.',
+        '',
+        '<b>🔍 Debug Info:</b>',
+        `proxyUrl: <code>${escapeHtml(debug.proxyUrl)}</code>`,
+        `HTTP status: <code>${debug.httpStatus}</code>`,
+        `Content-Type: <code>${escapeHtml(debug.contentType || '-')}</code>`,
+        `Body length: <code>${debug.rawLength}</code>`,
+        `JSON parse: <code>${debug.parseOk ? 'ok' : 'fail'}</code>`,
+        debug.error ? `Error: <code>${escapeHtml(debug.error)}</code>` : '',
+        '',
+        '<b>Raw preview (200 char pertama):</b>',
+        `<pre>${escapeHtml(debug.rawPreview || '(kosong)')}</pre>`,
+      ].filter(Boolean);
+
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        debugLines.join('\n'),
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return;
+    }
+
+    const sourceType: 'base64' | 'html' = looksLikeHtml(html) ? 'html' : 'base64';
+    const processed = processText(html, sourceType);
+
+    if (!processed) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Tidak ada URL video yang bisa diekstrak.\n\n<i>Panjang HTML: ${html.length} char</i>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+    const urlSlug = slugify(url.split('/').filter(Boolean).pop() ?? 'url');
+
+    await sendResult(ctx, env, processed.videos, urlSlug, processed.labels, urlSlug);
+  } catch (err: any) {
+    console.error('[Decode] url error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Error: ${escapeHtml(err?.message ?? 'unknown')}`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  }
+}
+
+// =================================================================
+// BATCH
+// =================================================================
+
+function buildBatchUrls(input: string, start: number, end: number): string[] {
+  const urls: string[] = [];
+
+  // 1. Template dengan {n}
+  if (input.includes('{n}')) {
+    for (let n = start; n <= end; n++) {
+      urls.push(input.replace(/\{n\}/g, String(n)));
+    }
+    return urls;
+  }
+
+  // 2. URL yang sudah ada "episode-N" → ganti dengan pattern baru
+  const epMatch = input.match(/(episode|eps?|e)[-_]?0*\d+/i);
+  if (epMatch && epMatch.index !== undefined) {
+    const prefix = input.slice(0, epMatch.index);
+    const suffix = input.slice(epMatch.index + epMatch[0].length);
+    for (let n = start; n <= end; n++) {
+      urls.push(`${prefix}episode-${n}${suffix}`);
+    }
+    return urls;
+  }
+
+  // 3. Base URL → append episode-{n}-sub-indo
+  const base = input.replace(/\/+$/, '');
+  for (let n = start; n <= end; n++) {
+    urls.push(`${base}/episode-${n}-sub-indo`);
+  }
+  return urls;
+}
+
+async function handleBatch(ctx: Context, env: Env): Promise<void> {
+  const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+
+  if (!arg) {
+    await ctx.reply(
+      '<b>📦 Batch Decode</b>\n\n' +
+        '<b>Usage:</b>\n' +
+        '<code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n\n' +
+        '<b>Contoh 1 (base URL):</b>\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>\n\n' +
+        '<b>Contoh 2 (pakai placeholder):</b>\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-{n}-sub-indo 7-12</code>\n\n' +
+        '<b>Contoh 3 (URL episode existing):</b>\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-6-sub-indo 7-12</code>\n\n' +
+        `<i>Max ${BATCH_MAX} episode per batch.</i>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return;
+  }
+
+  const m = arg.match(/^(\S+)\s+(\d+)\s*-\s*(\d+)\s*$/);
+  if (!m) {
+    await ctx.reply(
+      '❌ Format salah.\n\n' +
+        'Usage: <code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n' +
+        'Contoh: <code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const input = m[1] ?? '';
+  const start = parseInt(m[2] ?? '0', 10);
+  const end = parseInt(m[3] ?? '0', 10);
+
+  if (start < 1 || end < start) {
+    await ctx.reply('❌ Range tidak valid. Contoh: <code>7-12</code>', {
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+
+  const total = end - start + 1;
+  if (total > BATCH_MAX) {
+    await ctx.reply(`❌ Max ${BATCH_MAX} episode per batch (kamu minta ${total}).`);
+    return;
+  }
+
+  const urls = buildBatchUrls(input, start, end);
+
+  const loading = await ctx.reply(
+    `📦 <b>Batch ${total} episode</b> (${start}-${end})\n\n⏳ Memulai...`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+  );
+
+  const results: EpisodeObject[] = [];
+  const errors: { number: number; error: string }[] = [];
+
+  for (let i = 0; i < urls.length; i++) {
+    const n = start + i;
+    const url = urls[i]!;
+
+    // Update progress
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `📦 <b>Batch ${total} episode</b> (${start}-${end})\n\n` +
+          `⏳ [${i + 1}/${total}] Episode ${n}...\n` +
+          `<code>${escapeHtml(url)}</code>`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+    } catch {
+      /* ignore */
+    }
+
+    const { body, debug } = await fetchUrlViaProxy(env, url);
+    if (!body) {
+      errors.push({ number: n, error: debug.error ?? 'fetch failed' });
+      continue;
+    }
+
+    const sourceType: 'base64' | 'html' = looksLikeHtml(body) ? 'html' : 'base64';
+    const processed = processText(body, sourceType);
+    if (!processed) {
+      errors.push({ number: n, error: `no video URLs (${body.length} char)` });
+      continue;
+    }
+
+    results.push(buildEpisodeObject(processed.videos, n));
+  }
+
+  results.sort((a, b) => a.number - b.number);
+
+  const combinedJson = JSON.stringify(results, null, 2) + '\n';
+
+  const totalUrls = results.reduce(
+    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
+    0
+  );
+
+  const filename = `batch-${start}-${end}.json`;
+
+  const captionLines = [
+    `✅ <b>Batch selesai!</b>`,
+    `📊 Berhasil: <b>${results.length}/${total}</b> episode`,
+    `🎬 Total URL: <b>${totalUrls}</b>`,
+  ];
+  if (errors.length > 0) {
+    captionLines.push('');
+    captionLines.push(`⚠️ <b>Gagal (${errors.length}):</b>`);
+    for (const e of errors.slice(0, 10)) {
+      captionLines.push(`• Ep ${e.number}: <code>${escapeHtml(e.error)}</code>`);
+    }
+    if (errors.length > 10) {
+      captionLines.push(`<i>...dan ${errors.length - 10} lainnya</i>`);
+    }
+  }
+
+  const caption = captionLines.join('\n');
+
+  try {
+    await sendDocumentViaApi(
+      env.TELEGRAM_BOT_TOKEN,
+      ctx.chat!.id,
+      filename,
+      combinedJson,
+      caption
+    );
+    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+  } catch (err: any) {
+    console.error('[Batch] sendDocument failed:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ Gagal kirim file: <code>${escapeHtml(err?.message ?? 'unknown')}</code>\n\n` +
+          caption,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      )
+      .catch(() => {});
+  }
+}
+
+// =================================================================
+// COMMANDS
+// =================================================================
+
 export const decodeCommand: CommandDefinition = {
   name: 'decode',
   description: 'Decode HTML/Base64 atau buka tersimpan',
@@ -2857,6 +3534,7 @@ export const decodeCommand: CommandDefinition = {
           '<b>Kirim file</b> <code>.html</code> / <code>.txt</code> → auto proses + simpan\n' +
           '<b>One-shot:</b> <code>/decode &lt;base64&gt;</code>\n' +
           '<b>Buka tersimpan:</b> <code>/decode &lt;label&gt;</code>\n' +
+          '<b>Batch:</b> <code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n' +
           '<b>List:</b> <code>/list</code>\n' +
           '<b>Hapus:</b> <code>/delete &lt;label&gt;</code>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
@@ -2904,8 +3582,16 @@ export const decodeCommand: CommandDefinition = {
       }
     }
 
+    if (/^https?:\/\//i.test(input)) {
+      await handleUrlAuto(ctx, env, input);
+      return;
+    }
+
     if (input.length > MAX_INPUT_LEN) {
-      await ctx.reply(`❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`, { parse_mode: 'HTML' });
+      await ctx.reply(
+        `❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`,
+        { parse_mode: 'HTML' }
+      );
       return;
     }
 
@@ -2936,6 +3622,14 @@ export const decodeCommand: CommandDefinition = {
   },
 };
 
+export const batchCommand: CommandDefinition = {
+  name: 'batch',
+  description: 'Decode batch episode (range)',
+  usage: '/batch <url> <start>-<end>',
+  adminOnly: true,
+  handler: handleBatch,
+};
+
 export const listCommand: CommandDefinition = {
   name: 'list',
   description: 'Lihat file referensi tersimpan',
@@ -2945,9 +3639,10 @@ export const listCommand: CommandDefinition = {
   handler: async (ctx, env) => {
     const rows = await listFileRefs(env.DB, 30);
     if (rows.length === 0) {
-      await ctx.reply('📭 Belum ada file tersimpan.\n\n<i>Kirim file .html/.txt ke bot untuk mulai.</i>', {
-        parse_mode: 'HTML',
-      });
+      await ctx.reply(
+        '📭 Belum ada file tersimpan.\n\n<i>Kirim file .html/.txt ke bot untuk mulai.</i>',
+        { parse_mode: 'HTML' }
+      );
       return;
     }
 
@@ -2955,7 +3650,8 @@ export const listCommand: CommandDefinition = {
     lines.push(`📚 <b>File Tersimpan (${rows.length})</b>\n`);
     for (const r of rows) {
       const days = Math.floor((Date.now() - r.last_accessed) / 86400000);
-      const age = days === 0 ? 'hari ini' : days === 1 ? '1 hari lalu' : `${days} hari lalu`;
+      const age =
+        days === 0 ? 'hari ini' : days === 1 ? '1 hari lalu' : `${days} hari lalu`;
       const fname = r.filename ? ` — <i>${escapeHtml(r.filename)}</i>` : '';
       lines.push(`• <code>${escapeHtml(r.label)}</code>${fname} — <i>${age}</i>`);
     }
@@ -2989,11 +3685,12 @@ export const deleteCommand: CommandDefinition = {
         { parse_mode: 'HTML' }
       );
     } else {
-      await ctx.reply(`❌ Tidak ada: <code>${escapeHtml(arg)}</code>`, { parse_mode: 'HTML' });
+      await ctx.reply(`❌ Tidak ada: <code>${escapeHtml(arg)}</code>`, {
+        parse_mode: 'HTML',
+      });
     }
   },
 };
-
 ===== END FILE =====
 
 ===== FILE: ./src/commands/help.ts =====
@@ -3053,7 +3750,7 @@ import { statusCommand } from './status';
 import { animeCommand } from './anime';
 import { aiCommand } from './ai';
 import { clearcacheCommand } from './clearcache';
-import { decodeCommand, listCommand, deleteCommand } from './decode';
+import { decodeCommand, listCommand, deleteCommand, batchCommand } from './decode';
 import {
   databaseAnimeCommand,
   dbaShortCommand,
@@ -3073,6 +3770,7 @@ export const COMMANDS: CommandDefinition[] = [
   aiCommand,
   clearcacheCommand,
   decodeCommand,
+  batchCommand,
   listCommand,
   deleteCommand,
 ];
@@ -6638,23 +7336,13 @@ export async function chatAI(
 import { fetchWithRetry } from '../lib/http';
 import type { AniListMedia } from '../types/anime';
 
-/**
- * AniList GraphQL diblokir dari CF Workers IP.
- * Pakai Val Town proxy sebagai relay.
- * Limit: 100K runs/day, reset 24 jam.
- */
-const ANILIST_URL =
-  'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
+const ANILIST_URL = 'https://yukio-db.val.run/';
 
 const TIMEOUT = 8000;
 const PER_PAGE = 25;
-const MAX_PAGES = 40; // hard cap 1000 karakter
+const MAX_PAGES = 40;
 const PARALLEL_BATCH = 5;
-const FETCH_TIME_BUDGET_MS = 12000; // 12s max fetch
-
-/* ============================================================
-   TYPES
-   ============================================================ */
+const FETCH_TIME_BUDGET_MS = 12000;
 
 export interface AniListVoiceActor {
   anilistId: number;
@@ -6671,10 +7359,6 @@ export interface AniListCharacter {
   role: 'main' | 'supporting';
   voiceActors: AniListVoiceActor[];
 }
-
-/* ============================================================
-   CHARACTERS — Fetch page
-   ============================================================ */
 
 interface AniListCharEdge {
   role: string;
@@ -6780,20 +7464,6 @@ async function fetchCharactersPage(
   }
 }
 
-/* ============================================================
-   CHARACTERS — Fetch ALL (paralel)
-   ============================================================ */
-
-/**
- * Fetch SEMUA characters dari AniList (paralel).
- *
- * Alur:
- *   1. Fetch page 1 → dapat `lastPage`
- *   2. Fetch page 2..lastPage secara paralel (5 per batch)
- *   3. Aggregate semua edges
- *
- * Time budget: FETCH_TIME_BUDGET_MS. Kalau lewat, stop dan return partial.
- */
 export async function getCharactersFromAniList(
   idMal: number
 ): Promise<AniListCharacter[] | null> {
@@ -6801,7 +7471,6 @@ export async function getCharactersFromAniList(
 
   console.log(`[AniList] characters start — idMal: ${idMal}`);
 
-  // === 1. Fetch page 1 ===
   const first = await fetchCharactersPage(idMal, 1);
   if (!first) {
     console.warn('[AniList] page 1 failed');
@@ -6818,10 +7487,8 @@ export async function getCharactersFromAniList(
   const allEdges: AniListCharEdge[] = [...first.edges];
   let truncated = false;
 
-  // === 2. Fetch sisa page (paralel) ===
   if (lastPage > 1) {
     for (let batchStart = 2; batchStart <= lastPage; batchStart += PARALLEL_BATCH) {
-      // Time budget check
       const elapsed = Date.now() - startTime;
       if (elapsed > FETCH_TIME_BUDGET_MS) {
         console.warn(
@@ -6861,7 +7528,6 @@ export async function getCharactersFromAniList(
 
   if (allEdges.length === 0) return null;
 
-  // === 3. Transform ===
   const all: AniListCharacter[] = [];
   const seen = new Set<string>();
 
@@ -6905,10 +7571,6 @@ export async function getCharactersFromAniList(
 
   return all.length > 0 ? all : null;
 }
-
-/* ============================================================
-   METADATA
-   ============================================================ */
 
 function mapAniListSource(raw: string | null | undefined): string | null {
   if (!raw) return null;
@@ -9244,6 +9906,247 @@ export function shikimoriToAniList(s: ShikimoriAnime): AniListMedia {
 }
 ===== END FILE =====
 
+===== FILE: ./src/services/yukionime.ts =====
+// src/services/yukionime.ts
+import type { AniListMedia } from '../types/anime';
+
+const YUKIONIME_BASE = 'https://yukionime.pages.dev';
+
+export interface YukionimeAnime {
+  id: string;
+  title: string;
+  titleEnglish?: string | null;
+  titleNative?: string | null;
+  image?: string | null;
+  banner?: string | null;
+  trailer?: string | null;
+  year?: number | null;
+  type?: string;
+  status?: string;
+  season?: string | null;
+  source?: string | null;
+  episodes?: number | null;
+  duration?: number | null;
+  rating?: string | null;
+  aired?: { from?: string | null; to?: string | null } | null;
+  stats?: { score?: number; scoredBy?: number } | null;
+  genres?: string[];
+  studios?: Array<string | { slug: string; name: string }>;
+  externalIds?: {
+    mal?: number | null;
+    anilist?: number | null;
+    kitsu?: string | null;
+  };
+  synopsis?: string | null;
+}
+
+/* ============================================================
+   SEARCH
+   ============================================================ */
+
+export async function searchYukionime(
+  query: string
+): Promise<YukionimeAnime | null> {
+  try {
+    const res = await fetch(`${YUKIONIME_BASE}/api/v1/anime.json`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+
+    const json = (await res.json()) as { data?: YukionimeAnime[] };
+    const list: YukionimeAnime[] = json.data ?? [];
+
+    const q = query.toLowerCase().trim();
+    const match = list.find((a) => {
+      const t1 = (a.title ?? '').toLowerCase();
+      const t2 = (a.titleEnglish ?? '').toLowerCase();
+      const t3 = (a.titleNative ?? '').toLowerCase();
+      return t1.includes(q) || t2.includes(q) || t3.includes(q);
+    });
+
+    if (!match) return null;
+    return match;
+  } catch (err) {
+    console.warn('[Yukionime] search failed:', err);
+    return null;
+  }
+}
+
+/* ============================================================
+   DETAIL + SYNOPSIS
+   ============================================================ */
+
+export async function getYukionimeDetail(
+  slug: string
+): Promise<YukionimeAnime | null> {
+  try {
+    const apiRes = await fetch(`${YUKIONIME_BASE}/api/v1/anime/${slug}.json`);
+    if (!apiRes.ok) return null;
+
+    const apiJson = (await apiRes.json()) as { data?: YukionimeAnime };
+    const data: YukionimeAnime = apiJson?.data ?? { id: slug, title: '' };
+
+    // Fetch HTML untuk synopsis
+    const htmlRes = await fetch(`${YUKIONIME_BASE}/anime/${slug}/`);
+    if (htmlRes.ok) {
+      const html = await htmlRes.text();
+      data.synopsis = extractSynopsis(html);
+    }
+
+    return data;
+  } catch (err) {
+    console.warn('[Yukionime] detail fetch failed:', err);
+    return null;
+  }
+}
+
+/* ============================================================
+   CHECK LENGKAP
+   ============================================================ */
+
+export function isYukionimeComplete(anime: YukionimeAnime): boolean {
+  if (!anime.id) return false;
+  if (!anime.title) return false;
+  if (!anime.image) return false;
+  if (!anime.status) return false;
+  if (!anime.type) return false;
+  if (!anime.year) return false;
+  if (!anime.genres || anime.genres.length === 0) return false;
+  if (!anime.studios || anime.studios.length === 0) return false;
+  if (!anime.stats?.score || anime.stats.score <= 0) return false;
+  if (!anime.synopsis) return false;
+
+  return true;
+}
+
+/* ============================================================
+   CONVERT KE AniListMedia
+   ============================================================ */
+
+export function yukionimeToAniListMedia(anime: YukionimeAnime): AniListMedia {
+  const format = mapTypeToFormat(anime.type ?? 'TV');
+  const status = mapStatusToAniList(anime.status ?? 'finished');
+
+  const startDate = parseDateStr(anime.aired?.from ?? null);
+  const endDate = parseDateStr(anime.aired?.to ?? null);
+
+  const studios = (anime.studios ?? []).map((s) => ({
+    name: typeof s === 'string' ? s : s.name,
+  }));
+
+  return {
+    id: anime.externalIds?.anilist ?? 0,
+    title: {
+      romaji: anime.title,
+      english: anime.titleEnglish ?? null,
+      native: anime.titleNative ?? null,
+    },
+    coverImage: {
+      extraLarge: anime.image ?? '',
+      large: anime.image ?? '',
+    },
+    description: anime.synopsis ?? null,
+    format,
+    status,
+    seasonYear: anime.year ?? null,
+    episodes: anime.episodes ?? null,
+    genres: (anime.genres ?? []).map(capitalize),
+    averageScore: anime.stats?.score
+      ? Math.round(anime.stats.score * 10)
+      : null,
+    studios: { nodes: studios },
+    startDate: startDate ?? {
+      year: anime.year ?? null,
+      month: null,
+      day: null,
+    },
+    duration: anime.duration ?? null,
+    rating: anime.rating ?? null,
+    endDate: endDate ?? null,
+    banner: anime.banner ?? null,
+    trailer: anime.trailer ?? null,
+    myanimelistId: anime.externalIds?.mal ?? null,
+    source: anime.source ?? null,
+  };
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+function mapTypeToFormat(type: string): string {
+  const map: Record<string, string> = {
+    TV: 'TV',
+    Movie: 'MOVIE',
+    OVA: 'OVA',
+    ONA: 'ONA',
+    Special: 'SPECIAL',
+    Music: 'MUSIC',
+    Unknown: 'TV',
+  };
+  return map[type] ?? 'TV';
+}
+
+function mapStatusToAniList(status: string): string {
+  const map: Record<string, string> = {
+    airing: 'RELEASING',
+    finished: 'FINISHED',
+    upcoming: 'NOT_YET_RELEASED',
+    hiatus: 'HIATUS',
+    cancelled: 'CANCELLED',
+  };
+  return map[status] ?? 'RELEASING';
+}
+
+function capitalize(s: string): string {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function parseDateStr(
+  s: string | null
+): { year: number; month: number; day: number } | null {
+  if (!s) return null;
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  const [, y, mo, d] = m;
+  if (!y || !mo || !d) return null;
+  return {
+    year: parseInt(y, 10),
+    month: parseInt(mo, 10),
+    day: parseInt(d, 10),
+  };
+}
+
+function extractSynopsis(html: string): string | null {
+  const match = html.match(
+    /<div[^>]*\bid=["']synopsis["'][^>]*>([\s\S]*?)<\/div>/i
+  );
+  if (!match || !match[1]) return null;
+  return htmlToText(match[1]);
+}
+
+function htmlToText(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '• ')
+    .replace(/<h[1-6][^>]*>/gi, '\n')
+    .replace(/<\/h[1-6]>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+===== END FILE =====
+
 ===== FILE: ./src/types/anime.ts =====
 // src/types/anime.ts
 /**
@@ -9314,9 +10217,12 @@ export interface Env {
   DISCORD_APP_ID: string;
   DISCORD_ADMIN_USER_ID: string;
 
+  VAL_TOWN_FETCH_URL: string;
+
   DB: D1Database;
   AI: Ai;
 }
+
 ===== END FILE =====
 
 ===== FILE: ./tsconfig.json =====
@@ -9373,4 +10279,6 @@ crons = ["0 3 * * *"]
 ADMIN_USER_ID = "1605070949"
 BUSINESS_OWNER_ID = "1605070949"
 DISCORD_PUBLIC_KEY = "27f6ff67480b1af5ab5d8cd34139ca28834a2b70c85ce09170f146e803822f21"
+VAL_TOWN_FETCH_URL = "https://yukio-anime.val.run/"
+
 ===== END FILE =====
