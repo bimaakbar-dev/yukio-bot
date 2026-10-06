@@ -2,8 +2,9 @@
 import type { AniListMedia } from '../types/anime';
 import { searchKitsu, kitsuToAniList } from './kitsu';
 import { searchShikimori, shikimoriToAniList } from './shikimori';
+import { getMetadataFromAniList } from './anilist';
 
-const TIMEOUT_PER_SOURCE = 7000;
+const TIMEOUT_PER_SOURCE = 8000;
 
 export interface ChainSearchResult {
   media: AniListMedia;
@@ -29,100 +30,86 @@ async function withTimeout<T>(
 }
 
 /**
- * Merge dua hasil media dari Shikimori + Kitsu.
+ * Chain search:
+ *   1. AniList (via Val Town) + Kitsu — paralel
+ *      AniList = metadata lengkap
+ *      Kitsu = kitsuId (untuk episodes)
+ *   2. AniList gagal → fallback Shikimori
+ *   3. Shikimori gagal → fallback Kitsu saja
  *
- * Strategy:
- * - description: Kitsu English > Shikimori (untuk AI rewrite)
- * - banner: Kitsu (Shikimori tidak punya)
- * - duration, rating, endDate, trailer, franchise, myanimelistId:
- *   Shikimori > Kitsu
- */
-function mergeMedia(
-  shiki: AniListMedia,
-  kitsu: AniListMedia | null
-): AniListMedia {
-  if (!kitsu) return shiki;
-
-  return {
-    ...shiki,
-    // Description: English Kitsu prioritas
-    description: kitsu.description ?? shiki.description,
-    // Banner: Kitsu (Shikimori tidak punya)
-    banner: shiki.banner ?? kitsu.banner ?? null,
-    // Extended: Shikimori prioritas
-    duration: shiki.duration ?? kitsu.duration ?? null,
-    rating: shiki.rating ?? kitsu.rating ?? null,
-    endDate: shiki.endDate ?? kitsu.endDate ?? null,
-    trailer: shiki.trailer ?? kitsu.trailer ?? null,
-  };
-}
-
-/**
- * Cari anime dari 2 sumber secara PARALEL:
- * Shikimori + Kitsu
- *
- * Shikimori → primary metadata (MAL ID, franchise, extended)
- * Kitsu      → kitsuId untuk episodes + banner + English description
- *
- * Kalau Shikimori gagal, fallback ke Kitsu sepenuhnya.
  * Jikan sudah di-drop (blocked dari CF Workers).
  */
 export async function chainSearch(query: string): Promise<ChainSearchResult> {
-  const tried: string[] = ['Shikimori', 'Kitsu'];
+  const t0 = Date.now();
+  const tried: string[] = ['AniList', 'Kitsu'];
   const errors: string[] = [];
 
-  const t0 = Date.now();
-
-  const [shikiR, kitsuR] = await Promise.allSettled([
-    withTimeout(() => searchShikimori(query), TIMEOUT_PER_SOURCE),
+  // === 1. AniList + Kitsu (paralel) ===
+  const [aniListR, kitsuR] = await Promise.allSettled([
+    withTimeout(() => getMetadataFromAniList(query), TIMEOUT_PER_SOURCE),
     withTimeout(() => searchKitsu(query), TIMEOUT_PER_SOURCE),
   ]);
 
-  const shikimori =
-    shikiR.status === 'fulfilled' ? shikiR.value : null;
+  const aniList =
+    aniListR.status === 'fulfilled' ? aniListR.value : null;
   const kitsuResult =
     kitsuR.status === 'fulfilled' ? kitsuR.value : null;
 
   console.log(
     `[Chain] parallel fetch done in ${Date.now() - t0}ms — ` +
-      `Shikimori=${shikimori ? 'OK' : 'fail'}, ` +
+      `AniList=${aniList ? 'OK' : 'fail'}, ` +
       `Kitsu=${kitsuResult ? 'OK' : 'fail'}`
   );
 
-  if (!shikimori) errors.push('Shikimori: timeout atau gagal');
+  if (!aniList) errors.push('AniList: timeout atau gagal');
   if (!kitsuResult) errors.push('Kitsu: timeout atau gagal');
 
-  // === PRIMARY: Shikimori (+ merge Kitsu) ===
-  if (shikimori) {
-    const shikiMedia = shikimoriToAniList(shikimori);
-    const kitsuMedia = kitsuResult ? kitsuToAniList(kitsuResult) : null;
-    const merged = mergeMedia(shikiMedia, kitsuMedia);
+  const kitsuId = kitsuResult?.anime.id ?? null;
 
-    const source = kitsuResult ? 'Shikimori + Kitsu' : 'Shikimori';
-
+  // === 2. AniList sukses → PRIMARY ===
+  if (aniList) {
     return {
-      media: merged,
-      malId: shikimori.id ?? null,
-      kitsuId: kitsuResult?.anime.id ?? null,
-      source,
+      media: aniList,
+      malId: aniList.myanimelistId ?? null,
+      kitsuId,
+      source: kitsuResult ? 'AniList + Kitsu' : 'AniList',
       tried,
       errors,
     };
   }
 
-  // === FALLBACK: Kitsu only ===
+  // === 3. Fallback: Shikimori ===
+  tried.push('Shikimori');
+  const shiki = await withTimeout(
+    () => searchShikimori(query),
+    TIMEOUT_PER_SOURCE
+  );
+
+  if (shiki) {
+    return {
+      media: shikimoriToAniList(shiki),
+      malId: shiki.id ?? null,
+      kitsuId,
+      source: kitsuResult ? 'Shikimori + Kitsu' : 'Shikimori',
+      tried,
+      errors,
+    };
+  }
+  errors.push('Shikimori: timeout atau gagal');
+
+  // === 4. Fallback: Kitsu only ===
   if (kitsuResult) {
     return {
       media: kitsuToAniList(kitsuResult),
       malId: null,
-      kitsuId: kitsuResult.anime.id,
+      kitsuId,
       source: 'Kitsu',
       tried,
       errors,
     };
   }
 
-  // === SEMUA GAGAL ===
+  // === 5. Semua gagal ===
   throw new Error(
     `Semua sumber gagal.\n\n` +
       `Sudah dicoba:\n` +
@@ -131,8 +118,7 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
 }
 
 /**
- * Chain untuk search by title — kalau kita cuma tahu title
- * dan butuh malId/kitsuId (untuk fetch characters/episodes).
+ * Wrapper untuk cari by title — butuh malId/kitsuId.
  */
 export async function resolveAnimeIds(
   query: string
