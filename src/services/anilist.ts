@@ -250,22 +250,6 @@ function mapAniListStatus(raw: string | null | undefined): string {
   return map[upper] ?? 'RELEASING';
 }
 
-function mapAniListRating(raw: string | null | undefined): string | null {
-  if (!raw) return null;
-  const upper = raw.toUpperCase();
-
-  const map: Record<string, string> = {
-    G: 'G',
-    PG: 'PG',
-    'PG-13': 'PG-13',
-    R: 'R',
-    'R+': 'R+',
-    RX: 'Rx',
-  };
-
-  return map[upper] ?? null;
-}
-
 const METADATA_QUERY = `
   query ($search: String) {
     Media(search: $search, type: ANIME) {
