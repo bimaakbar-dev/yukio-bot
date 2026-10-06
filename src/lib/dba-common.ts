@@ -1,10 +1,5 @@
 // src/lib/dba-common.ts
-import type { D1Database } from '@cloudflare/workers-types';
 import type { AniListMedia } from '../types/anime';
-
-/* ============================================================
-   HTML / ESCAPE
-   ============================================================ */
 
 export function escapeHtml(s: string): string {
   return s
@@ -12,10 +7,6 @@ export function escapeHtml(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
-
-/* ============================================================
-   SAFE FETCH (timeout wrapper)
-   ============================================================ */
 
 export async function fetchWithTimeout<T>(
   fn: () => Promise<T>,
@@ -49,10 +40,6 @@ export function safeFetch<T>(
   ]);
 }
 
-/* ============================================================
-   JSON FALLBACK
-   ============================================================ */
-
 export function fallbackJson(errors: string[]): string {
   return JSON.stringify(
     { error: true, message: 'Semua sumber gagal', errors },
@@ -60,10 +47,6 @@ export function fallbackJson(errors: string[]): string {
     2
   );
 }
-
-/* ============================================================
-   SESSION DATA HELPERS (parse kolom JSON)
-   ============================================================ */
 
 export function parseJsonArray(raw: string | null): string[] {
   if (!raw) return [];
