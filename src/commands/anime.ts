@@ -266,7 +266,6 @@ async function checkYukionime(
     const detail = await getYukionimeDetail(match.id);
     const synopsis = detail?.synopsis ?? null;
 
-    // Merge: pakai detail (lebih lengkap) + synopsis dari scrape
     const merged: YukionimeAnime = {
       ...match,
       ...(detail ?? {}),
@@ -368,17 +367,12 @@ export const animeCommand: CommandDefinition = {
       const yukionime = await checkYukionime(searchQuery);
 
       if (yukionime.match && yukionime.complete) {
-        // === DATA LENGKAP → LANGSUNG PAKAI ===
-        console.log(
-          '[Anime] yukionime complete — skip AniList'
-        );
+        console.log('[Anime] yukionime complete — skip AniList');
 
-        // Hapus loading
         await ctx.api
           .deleteMessage(ctx.chat!.id, loading.message_id)
           .catch(() => {});
 
-        // Kirim warning + info
         await ctx.reply(
           buildYukionimeWarning(
             yukionime.match,
@@ -391,13 +385,11 @@ export const animeCommand: CommandDefinition = {
           }
         );
 
-        // Convert yukionime → AniListMedia
         const media = yukionimeToAniListMedia({
           ...yukionime.match,
           synopsis: yukionime.synopsis,
         });
 
-        // Build result TANPA AI enrichment
         const result = buildQimochiHubResult(media, null);
         const slug = yukionime.match.id;
 
@@ -429,7 +421,6 @@ export const animeCommand: CommandDefinition = {
         return;
       }
 
-      // Yukionime ada tapi tidak lengkap → warning, lanjut AniList
       if (yukionime.match) {
         await ctx.reply(
           buildYukionimeWarning(
@@ -500,7 +491,7 @@ export const animeCommand: CommandDefinition = {
       );
 
       /* ========================================================
-         STEP 3: DETECT MISSING (+ skip synopsis kalau ada yukionime)
+         STEP 3: DETECT MISSING
          ======================================================== */
       let need = detectMissing(media);
 
@@ -581,7 +572,6 @@ export const animeCommand: CommandDefinition = {
       const { yaml, body, missing } = result;
       let aiUsed = result.aiUsed;
 
-      // Ganti label AI → "dari Yukionime" kalau pakai synopsis yukionime
       if (yukionime.synopsis) {
         aiUsed = aiUsed.map((f) =>
           f === 'synopsis' ? 'synopsis (dari Yukionime)' : f
@@ -729,7 +719,26 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       await ctx.reply(session.source_label);
     }
 
-    await deleteSession(env.DB, sessionId);
+    // ✅ NEW: Tombol Publish ke Web
+    const targetPath = `src/content/anime/${slug}.md`;
+
+    const pubKb = new InlineKeyboard()
+      .text('📤 Publish ke Web', `pub:an:${sessionId}`)
+      .text('❌ Batal', `pub:skip:${sessionId}`);
+
+    await ctx.reply(
+      `✅ <b>Review selesai?</b>\n\n` +
+        `📁 Target:\n<code>${escapeHtml(targetPath)}</code>\n\n` +
+        `Kalau cocok, klik tombol Publish di bawah.`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: pubKb,
+      }
+    );
+
+    // ⚠️ Session TIDAK dihapus di sini — dibutuhkan oleh publish handler
+    // Session dihapus otomatis setelah push sukses atau user klik Batal
   });
 
   bot.callbackQuery(/^an:x:([a-f0-9]+)$/, async (ctx) => {
