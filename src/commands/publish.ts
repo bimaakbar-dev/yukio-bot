@@ -55,17 +55,11 @@ async function deleteSession(
   }
 }
 
-/**
- * Bangun markdown final dari session.
- */
 function buildMarkdown(session: SessionRow): string {
   const body = session.body.trim();
   return `${session.yaml}\n\n${body}\n`;
 }
 
-/**
- * Proses push ke GitHub — dipakai untuk callback `pub:an:*` dan `pub:anforce:*`.
- */
 async function doPublishAnime(
   ctx: Context,
   env: Env,
@@ -93,7 +87,6 @@ async function doPublishAnime(
   const path = `src/content/anime/${slug}.md`;
   const content = buildMarkdown(session);
 
-  // Cek existing
   if (!force) {
     let existing: Awaited<ReturnType<typeof githubGetFile>> = null;
     try {
@@ -177,11 +170,7 @@ async function doPublishAnime(
     .catch(() => {});
 }
 
-/**
- * Setup callback untuk tombol Publish dari /anime.
- */
 export function setupPublishCallbacks(bot: Bot, env: Env): void {
-  // Publish anime (tanpa force)
   bot.callbackQuery(/^pub:an:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (!sessionId) {
@@ -191,7 +180,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     await doPublishAnime(ctx, env, sessionId, false);
   });
 
-  // Publish anime (force overwrite)
   bot.callbackQuery(/^pub:anforce:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (!sessionId) {
@@ -201,7 +189,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     await doPublishAnime(ctx, env, sessionId, true);
   });
 
-  // Skip / batal
   bot.callbackQuery(/^pub:skip:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (sessionId) {
@@ -215,12 +202,8 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
   });
 }
 
-/**
- * Command /publish-anime [slug]
- * Push session /anime terbaru tanpa lewat tombol.
- */
 export const publishAnimeCommand: CommandDefinition = {
-  name: 'publish-anime',
+  name: 'publish_anime',
   description: 'Push metadata anime ke repo web',
   usage: '/publish-anime [slug]',
   adminOnly: true,
@@ -230,7 +213,6 @@ export const publishAnimeCommand: CommandDefinition = {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    // Ambil session terbaru user
     const row = await env.DB
       .prepare(
         `SELECT * FROM temp_anime
@@ -249,7 +231,6 @@ export const publishAnimeCommand: CommandDefinition = {
       return;
     }
 
-    // Kalau user kasih slug manual, override
     const slug = argSlug || row.slug;
     if (!slug) {
       await ctx.reply(
