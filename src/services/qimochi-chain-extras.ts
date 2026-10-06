@@ -2,12 +2,8 @@
 import { fetchWithRetry } from '../lib/http';
 import { getCharactersFromAniList } from './anilist';
 
-/* ============================================================
-   UNIFIED TYPES
-   ============================================================ */
-
 export interface UnifiedVoiceActor {
-  id: string; // slug
+  id: string;
   name: string;
   nameNative?: string;
   image?: string;
@@ -19,7 +15,7 @@ export interface UnifiedCharacter {
   nameNative?: string;
   image?: string;
   role: 'main' | 'supporting' | 'background';
-  voiceActors: string[]; // slug reference
+  voiceActors: string[];
 }
 
 export interface UnifiedEpisode {
@@ -51,25 +47,13 @@ export interface CharactersChainResult extends ChainResult<UnifiedCharacter> {
   voiceActors: UnifiedVoiceActor[];
 }
 
-/* ============================================================
-   CONSTANTS
-   ============================================================ */
-
 const PER_SOURCE_TIMEOUT = 8000;
-const MAX_ITEMS = 100; // fallback (Shikimori/Kitsu)
-
-/* Episodes config */
+const MAX_ITEMS = 100;
 const MAX_EPISODES = 700;
 const KITSU_PAGE_LIMIT = 20;
 const PARALLEL_BATCH = 5;
 const EPISODES_TIME_BUDGET_MS = 20000;
-
-/* Relations config */
 const MAX_RELATIONS = 30;
-
-/* ============================================================
-   UTILITIES
-   ============================================================ */
 
 async function withTimeout<T>(
   fn: () => Promise<T>,
@@ -95,10 +79,6 @@ function slugify(str: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
 }
-
-/* ============================================================
-   KITSU — CHARACTERS (fallback, tanpa VA)
-   ============================================================ */
 
 interface KitsuIncluded {
   id: string;
@@ -190,10 +170,6 @@ async function getKitsuCharacters(
 
   return out.length > 0 ? out : null;
 }
-
-/* ============================================================
-   KITSU — EPISODES
-   ============================================================ */
 
 interface KitsuEpisodeItem {
   id: string;
@@ -338,23 +314,24 @@ async function getKitsuEpisodes(
       attr.canonicalTitle ??
       `Episode ${number}`;
     const aired = attr.airdate ? attr.airdate.split('T')[0] : undefined;
-    const duration =
-      attr.length && attr.length > 0
-        ? Math.round(attr.length / 60)
-        : undefined;
+	const duration =
+  	attr.length && attr.length > 0
+    	? attr.length
+    	: undefined;
 
-    out.push({ number, title, aired, duration });
-    if (out.length >= MAX_EPISODES) break;
+	out.push({
+  	number,
+  	title,
+  	...(aired ? { aired } : {}),
+  	...(duration ? { duration } : {}),
+	});
+	if (out.length >= MAX_EPISODES) break;
   }
 
   out.sort((a, b) => a.number - b.number);
 
   return { episodes: out, truncated };
 }
-
-/* ============================================================
-   SHIKIMORI — CHARACTERS (fallback, tanpa VA)
-   ============================================================ */
 
 interface ShikimoriRoleEntry {
   roles?: string[];
@@ -441,10 +418,6 @@ async function getShikimoriCharacters(
 
   return out.length > 0 ? out : null;
 }
-
-/* ============================================================
-   SHIKIMORI — RELATIONS
-   ============================================================ */
 
 interface ShikimoriRelatedAnime {
   id: number;
@@ -538,24 +511,11 @@ async function getShikimoriRelations(
   return out.length > 0 ? out : null;
 }
 
-/* ============================================================
-   CHAIN — CHARACTERS (AniList primary)
-   ============================================================ */
-
-/**
- * Ambil characters + VA master.
- *
- * Priority: AniList (dengan VA) → Shikimori (tanpa VA) → Kitsu (tanpa VA)
- *
- * Untuk AniList, kita butuh malId.
- * Kalau malId null, skip AniList dan langsung fallback.
- */
 export async function chainCharacters(
   ctx: ChainContext
 ): Promise<CharactersChainResult> {
   const errors: string[] = [];
 
-  // === 1. ANILIST (primary, dengan VA) ===
   if (ctx.malId) {
     const aniListChars = await withTimeout(
       () => getCharactersFromAniList(ctx.malId!),
@@ -573,7 +533,6 @@ export async function chainCharacters(
           const slug = slugify(va.name);
           if (!slug) continue;
 
-          // Dedup VA master
           if (!voiceActorsMap.has(slug)) {
             voiceActorsMap.set(slug, {
               id: slug,
@@ -615,7 +574,6 @@ export async function chainCharacters(
     errors.push('AniList: tidak ada MAL ID');
   }
 
-  // === 2. SHIKIMORI (fallback, tanpa VA) ===
   if (ctx.malId) {
     const shiki = await withTimeout(
       () => getShikimoriCharacters(ctx.malId!),
@@ -632,7 +590,6 @@ export async function chainCharacters(
     errors.push('Shikimori: gagal atau kosong');
   }
 
-  // === 3. KITSU (fallback, tanpa VA) ===
   if (ctx.kitsuId) {
     const kitsu = await withTimeout(
       () => getKitsuCharacters(ctx.kitsuId!),
@@ -651,10 +608,6 @@ export async function chainCharacters(
 
   return { data: null, voiceActors: [], source: 'none', errors };
 }
-
-/* ============================================================
-   CHAIN — EPISODES
-   ============================================================ */
 
 export interface EpisodesChainResult extends ChainResult<UnifiedEpisode> {
   truncated?: boolean;
@@ -683,10 +636,6 @@ export async function chainEpisodes(
 
   return { data: null, source: 'none', errors };
 }
-
-/* ============================================================
-   CHAIN — RELATIONS
-   ============================================================ */
 
 export async function chainRelations(
   ctx: ChainContext
