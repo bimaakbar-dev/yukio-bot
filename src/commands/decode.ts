@@ -1041,11 +1041,20 @@ async function fetchUrlViaProxy(
       return { body: null, debug };
     }
 
-    if (!data.ok || !data.body) {
-      debug.error = `Target HTTP ${data.status}: ${data.error ?? 'no body'}`;
+    // ✅ FIX: body kosong / terlalu pendek → benar-benar gagal
+    if (!data.body || data.body.length < 200) {
+      debug.error = `Target HTTP ${data.status}: body kosong/terlalu pendek`;
       return { body: null, debug };
     }
 
+    // ✅ FIX: kalau status non-2xx tapi body ada isinya, tetap coba proses
+    // (situs Next.js SSR biasanya tetap render halaman walau 404/403)
+    if (data.status >= 400) {
+      debug.error = `Target HTTP ${data.status} (tetap coba proses, body ${data.body.length} char)`;
+      console.warn(`[Decode] ${debug.error}`);
+    }
+
+    // ✅ Body ada → kasih ke caller
     return { body: data.body, debug };
   } catch (err: any) {
     debug.error = `fetch threw: ${err?.message ?? 'unknown'}`;
