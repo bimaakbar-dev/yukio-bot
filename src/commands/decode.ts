@@ -30,20 +30,29 @@ const VIDEO_HOSTS = [
   'anoboy',
   'oploverz',
   'blogspot',
-  'desustream',
+  'blogger.com',        // ✅ NEW
+  'desustream',         // ✅ NEW
   'kuragebunch',
   'streamsb',
   'filemoon.sx',
-  'vidhide',
+  'vidhide',            // ✅ NEW
+  'odvidhide',          // ✅ NEW
+  'ondesuhd',           // ✅ NEW
   'vidcloud',
   'hxfile',
   'krakenfiles',
   'gofile',
   'acefile',
   'animekuid',
+  'animesub',           // ✅ NEW
+  'lexanime',           // ✅ NEW
 ];
 
-const WRAPPER_HOSTS = ['animesail.xyz', '154999000.xyz'];
+const WRAPPER_HOSTS = [
+  'animesail.xyz',
+  '154999000.xyz',
+  'video.animesub.web.id', // ✅ NEW
+];
 
 const SERVER_ALIASES: Record<string, string> = {
   abyss: 'abyss', dodo: 'doply', doply: 'doply',
@@ -53,10 +62,22 @@ const SERVER_ALIASES: Record<string, string> = {
   buzi: 'buzzheavier', buzzheavier: 'buzzheavier',
   mp4: 'mp4upload', mp4upload: 'mp4upload',
   mega: 'mega', lokal: 'lokal', kamado: 'kamado', pancal: 'pancal',
+  // ✅ NEW
+  'b-tube': 'blogger', 'btube': 'blogger',
+  'blogger': 'blogger', 'blogspot': 'blogger',
+  odstream: 'odstream', odcdn: 'odcdn',
+  ondesuhd: 'ondesuhd', vidhide: 'vidhide',
 };
 
+// ✅ NEW: Next.js RSC embed regex
+// Body berisi literal: \"quality\":\"360p\",\"mirror\":\"vidhide\",\"link\":\"https://...\"
+// (1 backslash sebelum quote setelah JSON.parse)
+const RSC_EMBED_RE =
+  /\\"quality\\":\\"([^\\"]+)\\",\\"mirror\\":\\"([^\\"]+)\\",\\"link\\":\\"([^\\"]+)\\"/g;
+
 interface RawEntry {
-  base64: string;
+  base64?: string;   // ✅ FIX: optional
+  url?: string;      // ✅ NEW: URL plain (dari RSC payload)
   label: string | null;
 }
 
@@ -201,7 +222,9 @@ function decodeBase64(input: string): string | null {
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new TextDecoder('utf-8', { fatal: false, ignoreBOM: false }).decode(bytes);
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 function isLikelyBase64(s: string): boolean {
@@ -224,8 +247,11 @@ function isPrintable(s: string): boolean {
 function looksLikeHtml(s: string): boolean {
   if (s.length < 30) return false;
   return (
-    /<!DOCTYPE/i.test(s) || /<html[\s>]/i.test(s) || /<script[\s>]/i.test(s) ||
-    /<iframe[\s>]/i.test(s) || /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
+    /<!DOCTYPE/i.test(s) ||
+    /<html[\s>]/i.test(s) ||
+    /<script[\s>]/i.test(s) ||
+    /<iframe[\s>]/i.test(s) ||
+    /<\/?[a-z][a-z0-9-]*[\s>]/i.test(s)
   );
 }
 
@@ -239,12 +265,17 @@ function isWrapper(url: string): boolean {
   try {
     const h = new URL(url).hostname.toLowerCase();
     return WRAPPER_HOSTS.some((w) => h === w || h.endsWith('.' + w));
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 function parseResolution(label: string | null): string | null {
   if (!label) return null;
-  const m = label.match(/\b(\d{3,4})p\b/i);
+  // ✅ FIX: support "[720P]" juga
+  const m =
+    label.match(/\b(\d{3,4})p\b/i) ??
+    label.match(/\[\s*(\d{3,4})p\s*\]/i);
   return m && m[1] ? `${m[1]}p` : null;
 }
 
@@ -253,6 +284,10 @@ function parseServerName(label: string | null): string | null {
 
   const cleaned = label
     .toLowerCase()
+    // ✅ NEW: strip "[720P] " prefix
+    .replace(/^\s*\[\s*\d{3,4}p\s*\]\s*/i, '')
+    // ✅ NEW: strip "720P " prefix tanpa bracket
+    .replace(/^\s*\d{3,4}p\s+/i, '')
     .replace(/\s+\d{3,4}p\s*$/i, '')
     .replace(/\s*[-_]\s*\d+$/i, '')
     .replace(/\s+\d+$/i, '')
@@ -269,12 +304,14 @@ function resolutionRank(r: string | null): number {
 }
 
 function slugify(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/\.(html?|txt|json)$/i, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40) || `file-${Date.now()}`;
+  return (
+    s
+      .toLowerCase()
+      .replace(/\.(html?|txt|json)$/i, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40) || `file-${Date.now()}`
+  );
 }
 
 function parseEpisodeNumber(
@@ -287,7 +324,7 @@ function parseEpisodeNumber(
 
   const isValid = (n: number): boolean =>
     n > 0 && n < 10000 && !RESOLUTIONS.has(n);
-  
+
   if (filename) {
     const m = filename.match(/\b(?:ep|eps|episode|e)\s*[-_.]?\s*0*(\d+)\b/i);
     if (m && m[1]) {
@@ -321,7 +358,10 @@ function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
   const cleaned = htmlDecode(s);
   const trimmed = cleaned.trim();
-  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) { found.add(trimmed); return [...found]; }
+  if (/^https?:\/\/[^\s]+$/i.test(trimmed)) {
+    found.add(trimmed);
+    return [...found];
+  }
 
   for (const m of cleaned.matchAll(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi)) {
     const u = htmlDecode(m[1] ?? '');
@@ -351,8 +391,31 @@ function extractUrlsFromDecoded(s: string): string[] {
 function expandUrlParams(url: string, depth = 0): string[] {
   const out = new Set<string>([url]);
   if (depth > MAX_PARAM_DEPTH) return [...out];
+
   let parsed: URL;
-  try { parsed = new URL(url); } catch { return [...out]; }
+  try {
+    parsed = new URL(url);
+  } catch {
+    return [...out];
+  }
+
+  // ✅ NEW: scan path segments untuk base64 (mis. /embed/aHR0cHM6...)
+  for (const seg of parsed.pathname.split('/')) {
+    if (seg.length < 20 || seg.length > 800) continue;
+    let dec = seg;
+    try {
+      dec = decodeURIComponent(seg);
+    } catch {
+      /* ignore */
+    }
+    if (!isLikelyBase64(dec)) continue;
+    const decoded = decodeBase64(dec);
+    if (!decoded || !isPrintable(decoded)) continue;
+    const trimmed = decoded.trim();
+    if (/^https?:\/\//i.test(trimmed)) {
+      for (const sub of expandUrlParams(trimmed, depth + 1)) out.add(sub);
+    }
+  }
 
   for (const [key, value] of parsed.searchParams.entries()) {
     if (!value || value.length < 12) continue;
@@ -368,7 +431,9 @@ function expandUrlParams(url: string, depth = 0): string[] {
         if (/^https?:\/\//i.test(dec)) {
           for (const sub of expandUrlParams(dec, depth + 1)) out.add(sub);
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
     if (isLikelyBase64(value)) {
       const decoded = decodeBase64(value);
@@ -407,13 +472,46 @@ function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
+// ✅ NEW: ekstrak embed dari Next.js RSC payload
+function extractNextJsEmbeds(html: string): RawEntry[] {
+  const out: RawEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const m of html.matchAll(RSC_EMBED_RE)) {
+    const quality = m[1];
+    const mirror = m[2];
+    let link = m[3];
+
+    // unescape \u002F, \/ etc
+    link = link
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\\//g, '/');
+
+    if (!/^https?:\/\//i.test(link)) continue;
+    if (seen.has(link)) continue;
+    seen.add(link);
+
+    out.push({
+      url: link,
+      label: `[${quality.toUpperCase()}] ${mirror.toUpperCase()}`,
+    });
+  }
+  return out;
+}
+
 function extractEntries(html: string): RawEntry[] {
   const entries: RawEntry[] = [];
   const seen = new Set<string>();
 
-  for (const m of html.matchAll(
-    /<button\b([^>]*?)>/gi
-  )) {
+  // ✅ NEW: Next.js RSC — jalankan DULU biar tidak kalah sama fallback base64
+  for (const e of extractNextJsEmbeds(html)) {
+    const key = e.url!;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push(e);
+  }
+
+  for (const m of html.matchAll(/<button\b([^>]*?)>/gi)) {
     const attrs = m[1] ?? '';
     const labelMatch = attrs.match(/\bdata-label\s*=\s*["']([^"']*)["']/i);
     const embedMatch = attrs.match(/\bdata-embed\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i);
@@ -427,11 +525,17 @@ function extractEntries(html: string): RawEntry[] {
     entries.push({ base64: b64, label: label || null });
   }
 
-  for (const m of html.matchAll(
-    /<option\b[^>]*?\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["'][^>]*?>([^<]*)<\/option>/gi
-  )) {
-    const b64 = m[1];
+  // ✅ FIX: option — ambil base64 dari value= dulu, fallback ke data-*=
+  for (const m of html.matchAll(/<option\b([^>]*?)>([^<]*)<\/option>/gi)) {
+    const attrs = m[1] ?? '';
     const label = (m[2] ?? '').trim();
+
+    const b64Match =
+      attrs.match(/\bvalue\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i) ??
+      attrs.match(/\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i);
+
+    if (!b64Match) continue;
+    const b64 = b64Match[1];
     if (!b64 || seen.has(b64)) continue;
     seen.add(b64);
     entries.push({ base64: b64, label: label || null });
@@ -459,13 +563,21 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   const resolved = new Map<string, { resolution: string | null; server: string | null }>();
   const unresolved = new Map<string, { resolution: string | null; server: string | null }>();
 
-  function resolve(url: string, resolution: string | null, server: string | null, depth: number, seen: Set<string>): void {
+  function resolve(
+    url: string,
+    resolution: string | null,
+    server: string | null,
+    depth: number,
+    seen: Set<string>
+  ): void {
     if (depth > 4 || seen.has(url)) return;
     seen.add(url);
     const children = expandUrlParams(url).filter((u) => u !== url);
     if (isWrapper(url)) {
       if (children.length === 0) {
-        if (!resolved.has(url) && !unresolved.has(url)) unresolved.set(url, { resolution, server });
+        if (!resolved.has(url) && !unresolved.has(url)) {
+          unresolved.set(url, { resolution, server });
+        }
       } else {
         for (const c of children) resolve(c, resolution, server, depth + 1, seen);
       }
@@ -476,20 +588,40 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   }
 
   for (const e of entries) {
-    const dec = multiLayerDecode(e.base64);
-    if (!dec || dec.urls.length === 0) continue;
     const resolution = parseResolution(e.label);
     const server = parseServerName(e.label);
+
+    // ✅ NEW: entry sudah punya URL plain (dari RSC) — langsung resolve
+    if (e.url) {
+      resolve(e.url, resolution, server, 0, new Set());
+      continue;
+    }
+
+    if (!e.base64) continue;
+    const dec = multiLayerDecode(e.base64);
+    if (!dec || dec.urls.length === 0) continue;
     for (const url of dec.urls) resolve(url, resolution, server, 0, new Set());
   }
 
   const final: ResolvedEntry[] = [];
   for (const [url, info] of resolved) {
-    if (isVideoUrl(url)) final.push({ url, resolution: info.resolution, server: info.server });
+    if (isVideoUrl(url)) {
+      final.push({ url, resolution: info.resolution, server: info.server });
+    }
+  }
+
+  // ✅ FIX: fallback ke resolved dulu (bug lama: fallback ke unresolved yang isinya kosong)
+  if (final.length === 0) {
+    for (const [url, info] of resolved) {
+      final.push({ url, resolution: info.resolution, server: info.server });
+    }
   }
   if (final.length === 0) {
-    for (const [url, info] of unresolved) final.push({ url, resolution: info.resolution, server: info.server });
+    for (const [url, info] of unresolved) {
+      final.push({ url, resolution: info.resolution, server: info.server });
+    }
   }
+
   final.sort((a, b) => {
     const ra = resolutionRank(a.resolution);
     const rb = resolutionRank(b.resolution);
@@ -520,10 +652,7 @@ function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
     servers: byQuality.get(q)!,
   }));
 
-  const payload = {
-    number: episodeNumber,
-    streams,
-  };
+  const payload = { number: episodeNumber, streams };
 
   return JSON.stringify(payload, null, 2) + '\n';
 }
@@ -579,8 +708,7 @@ async function sendDocumentViaApi(
   content: string,
   caption: string
 ): Promise<void> {
-  const boundary =
-    '----YukioDecode' + Math.random().toString(36).slice(2, 12);
+  const boundary = '----YukioDecode' + Math.random().toString(36).slice(2, 12);
 
   const encoder = new TextEncoder();
   const CRLF = '\r\n';
@@ -624,17 +752,13 @@ async function sendDocumentViaApi(
   const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-    },
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
     body,
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(
-      `sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`
-    );
+    throw new Error(`sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`);
   }
 }
 
@@ -680,13 +804,7 @@ async function sendResult(
     `<i>Rename & save ke <code>${escapeHtml(targetPath)}</code></i>`;
 
   try {
-    await sendDocumentViaApi(
-      env.TELEGRAM_BOT_TOKEN,
-      ctx.chat!.id,
-      filename,
-      json,
-      caption
-    );
+    await sendDocumentViaApi(env.TELEGRAM_BOT_TOKEN, ctx.chat!.id, filename, json, caption);
   } catch (err) {
     console.warn('[Decode] sendDocument failed, fallback inline:', err);
     await ctx.reply(
@@ -737,10 +855,9 @@ async function downloadByFileId(
         )
         .catch(() => {});
     } else {
-      await ctx.reply(
-        `❌ Gagal ambil file: <code>${escapeHtml(msg)}</code>`,
-        { parse_mode: 'HTML' }
-      );
+      await ctx.reply(`❌ Gagal ambil file: <code>${escapeHtml(msg)}</code>`, {
+        parse_mode: 'HTML',
+      });
     }
     return null;
   }
@@ -756,7 +873,9 @@ async function downloadDocText(
   const size = doc.file_size ?? 0;
   if (size > MAX_FILE_BYTES) {
     await ctx.reply(
-      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${MAX_FILE_BYTES / 1024 / 1024} MB).\n\n<i>Potong dulu HTML-nya.</i>`,
+      `❌ File terlalu besar: <b>${(size / 1024).toFixed(0)} KB</b> (max ${
+        MAX_FILE_BYTES / 1024 / 1024
+      } MB).\n\n<i>Potong dulu HTML-nya.</i>`,
       { parse_mode: 'HTML' }
     );
     return null;
@@ -764,9 +883,13 @@ async function downloadDocText(
 
   const name = doc.file_name ?? '';
   const mime = doc.mime_type ?? '';
-  const ok = /\.(html?|txt|json|js|css)$/i.test(name) || /^text\/|json|javascript/i.test(mime);
+  const ok =
+    /\.(html?|txt|json|js|css)$/i.test(name) || /^text\/|json|javascript/i.test(mime);
   if (!ok) {
-    await ctx.reply(`❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`, { parse_mode: 'HTML' });
+    await ctx.reply(
+      `❌ Tipe tidak didukung: <code>${escapeHtml(name || mime)}</code>`,
+      { parse_mode: 'HTML' }
+    );
     return null;
   }
 
@@ -802,7 +925,7 @@ function processText(
   const entries =
     sourceType === 'html'
       ? extractEntries(input)
-      : [{ base64: input, label: null }];
+      : [{ base64: input, label: null } as RawEntry];
   if (entries.length === 0) return null;
   const videos = collectResolvedVideos(entries);
   if (videos.length === 0) return null;
@@ -868,10 +991,7 @@ interface ProxyResponse {
   truncated?: boolean;
 }
 
-async function fetchUrlViaProxy(
-  env: Env,
-  url: string
-): Promise<string | null> {
+async function fetchUrlViaProxy(env: Env, url: string): Promise<string | null> {
   try {
     const res = await fetch(env.VAL_TOWN_FETCH_URL, {
       method: 'POST',
@@ -902,15 +1022,11 @@ async function fetchUrlViaProxy(
   }
 }
 
-async function handleUrlAuto(
-  ctx: Context,
-  env: Env,
-  url: string
-): Promise<void> {
-  const loading = await ctx.reply(
-    `🌐 Fetch URL:\n<code>${escapeHtml(url)}</code>`,
-    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-  );
+async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void> {
+  const loading = await ctx.reply(`🌐 Fetch URL:\n<code>${escapeHtml(url)}</code>`, {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
 
   try {
     const html = await fetchUrlViaProxy(env, url);
@@ -944,18 +1060,10 @@ async function handleUrlAuto(
 
     await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
 
-    const urlSlug = slugify(
-      url.split('/').filter(Boolean).pop() ?? 'url'
-    );
+    const urlSlug = slugify(url.split('/').filter(Boolean).pop() ?? 'url');
 
-    await sendResult(
-      ctx,
-      env,
-      processed.videos,
-      urlSlug,
-      processed.labels,
-      null
-    );
+    // ✅ FIX: pakai urlSlug sebagai sourceFilename biar episodeNumber terdeteksi
+    await sendResult(ctx, env, processed.videos, urlSlug, processed.labels, urlSlug);
   } catch (err: any) {
     console.error('[Decode] url error:', err);
     await ctx.api
@@ -1038,14 +1146,17 @@ export const decodeCommand: CommandDefinition = {
         return;
       }
     }
-    
+
     if (/^https?:\/\//i.test(input)) {
       await handleUrlAuto(ctx, env, input);
       return;
     }
 
     if (input.length > MAX_INPUT_LEN) {
-      await ctx.reply(`❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`, { parse_mode: 'HTML' });
+      await ctx.reply(
+        `❌ Terlalu panjang: ${input.length} char. Kirim sebagai file.`,
+        { parse_mode: 'HTML' }
+      );
       return;
     }
 
@@ -1085,9 +1196,10 @@ export const listCommand: CommandDefinition = {
   handler: async (ctx, env) => {
     const rows = await listFileRefs(env.DB, 30);
     if (rows.length === 0) {
-      await ctx.reply('📭 Belum ada file tersimpan.\n\n<i>Kirim file .html/.txt ke bot untuk mulai.</i>', {
-        parse_mode: 'HTML',
-      });
+      await ctx.reply(
+        '📭 Belum ada file tersimpan.\n\n<i>Kirim file .html/.txt ke bot untuk mulai.</i>',
+        { parse_mode: 'HTML' }
+      );
       return;
     }
 
@@ -1095,7 +1207,8 @@ export const listCommand: CommandDefinition = {
     lines.push(`📚 <b>File Tersimpan (${rows.length})</b>\n`);
     for (const r of rows) {
       const days = Math.floor((Date.now() - r.last_accessed) / 86400000);
-      const age = days === 0 ? 'hari ini' : days === 1 ? '1 hari lalu' : `${days} hari lalu`;
+      const age =
+        days === 0 ? 'hari ini' : days === 1 ? '1 hari lalu' : `${days} hari lalu`;
       const fname = r.filename ? ` — <i>${escapeHtml(r.filename)}</i>` : '';
       lines.push(`• <code>${escapeHtml(r.label)}</code>${fname} — <i>${age}</i>`);
     }
@@ -1129,7 +1242,9 @@ export const deleteCommand: CommandDefinition = {
         { parse_mode: 'HTML' }
       );
     } else {
-      await ctx.reply(`❌ Tidak ada: <code>${escapeHtml(arg)}</code>`, { parse_mode: 'HTML' });
+      await ctx.reply(`❌ Tidak ada: <code>${escapeHtml(arg)}</code>`, {
+        parse_mode: 'HTML',
+      });
     }
   },
 };
