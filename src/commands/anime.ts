@@ -20,6 +20,21 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 /* ═══════════════════════════════════════════════
+   SLUGIFY
+   ═══════════════════════════════════════════════ */
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/* ═══════════════════════════════════════════════
    DB: TEMP SESSIONS
    ═══════════════════════════════════════════════ */
 
@@ -43,11 +58,20 @@ async function ensureDb(db: D1Database): Promise<void> {
             ai_used      TEXT NOT NULL,
             cover        TEXT,
             source_label TEXT,
+            slug         TEXT,
             created_at   INTEGER NOT NULL,
             expires_at   INTEGER NOT NULL
           )`
         )
         .run();
+
+      // Migration: tambah kolom slug kalau belum ada
+      try {
+        await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
+      } catch {
+        // already exists
+      }
+
       dbReady = true;
     } catch (err) {
       console.error('[Anime] DB init error:', err);
@@ -69,6 +93,7 @@ async function saveSession(
     aiUsed: string[];
     cover: string | null;
     sourceLabel: string | null;
+    slug: string;
   }
 ): Promise<string> {
   await ensureDb(db);
@@ -79,8 +104,8 @@ async function saveSession(
   await db
     .prepare(
       `INSERT INTO temp_anime
-         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, slug, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
@@ -91,6 +116,7 @@ async function saveSession(
       JSON.stringify(data.aiUsed),
       data.cover,
       data.sourceLabel,
+      data.slug,
       now,
       now + SESSION_TTL_MS
     )
@@ -108,6 +134,7 @@ interface SessionRow {
   ai_used: string;
   cover: string | null;
   source_label: string | null;
+  slug: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -327,7 +354,6 @@ export const animeCommand: CommandDefinition = {
             releaseDate: media.startDate?.year
               ? `${media.startDate.year}-01-01`
               : null,
-            // Kirim raw description — AI akan rewrite (Russian → Indonesia, dll)
             originalSynopsis: media.description,
           },
           need
@@ -366,6 +392,8 @@ export const animeCommand: CommandDefinition = {
         enriched
       );
 
+      const slug = slugify(pickTitle(media));
+
       const sessionId = await saveSession(env.DB, ctx.from!.id, {
         yaml,
         body,
@@ -373,6 +401,7 @@ export const animeCommand: CommandDefinition = {
         aiUsed,
         cover: media.coverImage.extraLarge || media.coverImage.large || null,
         sourceLabel: sourceLabel || null,
+        slug,
       });
 
       const keyboard = new InlineKeyboard()
@@ -411,10 +440,6 @@ export const animeCommand: CommandDefinition = {
     }
   },
 };
-
-/* ═══════════════════════════════════════════════
-   CALLBACK HANDLERS
-   ═══════════════════════════════════════════════ */
 
 export function setupAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^an:y:([a-f0-9]+)$/, async (ctx) => {
@@ -468,6 +493,13 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         link_preview_options: { is_disabled: true },
       });
     }
+
+    const slug = session.slug ?? 'unknown';
+    await ctx.reply(
+      `🆔 <b>Slug</b>\n<i>Buat file: <code>${escapeHtml(slug)}.md</code></i>\n\n` +
+        `<pre>${escapeHtml(slug)}</pre>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
 
     await ctx.reply(
       `📋 <b>YAML Frontmatter</b>\n\n<pre>${escapeHtml(session.yaml)}</pre>`,
