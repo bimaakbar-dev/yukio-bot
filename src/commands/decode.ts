@@ -24,6 +24,22 @@ const VIDEO_HOSTS = [
   'mixdrop', 'iixdrop', 'abyss', 'abyssplayer',
   'framezi', 'kturbo',
   'pixeldrain', 'vikingfile', 'buzzheavier', 'mega.nz', 'doply',
+  'xtwap.top',
+  'otakudesu',
+  'kuramanime',
+  'anoboy',
+  'oploverz',
+  'blogspot',
+  'desustream',
+  'kuragebunch',
+  'streamsb',
+  'filemoon.sx',
+  'vidhide',
+  'vidcloud',
+  'hxfile',
+  'krakenfiles',
+  'gofile',
+  'acefile',
 ];
 
 const WRAPPER_HOSTS = ['animesail.xyz', '154999000.xyz'];
@@ -233,7 +249,14 @@ function parseResolution(label: string | null): string | null {
 
 function parseServerName(label: string | null): string | null {
   if (!label) return null;
-  const cleaned = label.toLowerCase().replace(/\s+\d{3,4}p\s*$/i, '').trim();
+
+  const cleaned = label
+    .toLowerCase()
+    .replace(/\s+\d{3,4}p\s*$/i, '')
+    .replace(/\s*[-_]\s*\d+$/i, '')
+    .replace(/\s+\d+$/i, '')
+    .trim();
+
   if (!cleaned) return null;
   return SERVER_ALIASES[cleaned] ?? cleaned;
 }
@@ -253,10 +276,6 @@ function slugify(s: string): string {
     .slice(0, 40) || `file-${Date.now()}`;
 }
 
-/* ============================================================
-   EPISODE NUMBER DETECTION
-   ============================================================ */
-
 function parseEpisodeNumber(
   filename: string | null,
   labels: (string | null)[]
@@ -267,8 +286,7 @@ function parseEpisodeNumber(
 
   const isValid = (n: number): boolean =>
     n > 0 && n < 10000 && !RESOLUTIONS.has(n);
-
-  // Pass 1: filename
+  
   if (filename) {
     const m = filename.match(/\b(?:ep|eps|episode|e)\s*[-_.]?\s*0*(\d+)\b/i);
     if (m && m[1]) {
@@ -277,7 +295,6 @@ function parseEpisodeNumber(
     }
   }
 
-  // Pass 2: label "Episode N"
   for (const label of labels) {
     if (!label) continue;
     const m = label.match(/\b(?:episode|eps|ep)\s*0*(\d+)\b/i);
@@ -287,7 +304,6 @@ function parseEpisodeNumber(
     }
   }
 
-  // Pass 3: label murni angka
   for (const label of labels) {
     if (!label) continue;
     const m = label.trim().match(/^0*(\d+)$/);
@@ -299,10 +315,6 @@ function parseEpisodeNumber(
 
   return 1;
 }
-
-/* ============================================================
-   URL EXTRACTION
-   ============================================================ */
 
 function extractUrlsFromDecoded(s: string): string[] {
   const found = new Set<string>();
@@ -399,6 +411,22 @@ function extractEntries(html: string): RawEntry[] {
   const seen = new Set<string>();
 
   for (const m of html.matchAll(
+    /<button\b([^>]*?)>/gi
+  )) {
+    const attrs = m[1] ?? '';
+    const labelMatch = attrs.match(/\bdata-label\s*=\s*["']([^"']*)["']/i);
+    const embedMatch = attrs.match(/\bdata-embed\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["']/i);
+    if (!embedMatch) continue;
+
+    const b64 = embedMatch[1];
+    if (!b64 || seen.has(b64)) continue;
+    seen.add(b64);
+
+    const label = labelMatch ? labelMatch[1].trim() : null;
+    entries.push({ base64: b64, label: label || null });
+  }
+
+  for (const m of html.matchAll(
     /<option\b[^>]*?\bdata-[a-z0-9-]+\s*=\s*["']([A-Za-z0-9+/=\-_]{20,})["'][^>]*?>([^<]*)<\/option>/gi
   )) {
     const b64 = m[1];
@@ -470,22 +498,6 @@ function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
   return final;
 }
 
-/* ============================================================
-   BUILD OUTPUT — SINGLE EPISODE JSON
-   ============================================================ */
-
-/**
- * Build JSON untuk 1 episode — struktur final:
- *   src/data/anime/{slug}/episodes/{number}.json
- *
- * Output:
- *   {
- *     "number": N,
- *     "streams": [
- *       { "quality": "1080p", "servers": [{ "name": "...", "url": "..." }] }
- *     ]
- *   }
- */
 function buildJson(items: ResolvedEntry[], episodeNumber: number): string {
   const byQuality = new Map<string, { name: string; url: string }[]>();
 
@@ -559,10 +571,6 @@ function splitMessage(text: string, budget = MSG_BUDGET): string[] {
   return parts;
 }
 
-/* ============================================================
-   TELEGRAM DOCUMENT UPLOAD
-   ============================================================ */
-
 async function sendDocumentViaApi(
   botToken: string,
   chatId: number,
@@ -629,14 +637,6 @@ async function sendDocumentViaApi(
   }
 }
 
-/**
- * Kirim hasil decode:
- *   1. URL list (inline, sebagai info)
- *   2. JSON — inline <pre> kalau kecil, file .json kalau besar
- *
- * Target save user:
- *   src/data/anime/{slug}/episodes/{number}.json
- */
 async function sendResult(
   ctx: Context,
   env: Env,
@@ -645,7 +645,6 @@ async function sendResult(
   sourceLabels: (string | null)[],
   sourceFilename: string | null
 ): Promise<void> {
-  // URL list untuk info
   const urlList = buildUrlList(items, label);
   for (const part of splitMessage(urlList)) {
     await ctx.reply(part, {
@@ -654,10 +653,7 @@ async function sendResult(
     });
   }
 
-  // Detect nomor episode
   const episodeNumber = parseEpisodeNumber(sourceFilename, sourceLabels);
-
-  // Build JSON (single episode)
   const json = buildJson(items, episodeNumber);
 
   console.log(
@@ -666,7 +662,6 @@ async function sendResult(
 
   const targetPath = `src/data/anime/{slug}/episodes/${episodeNumber}.json`;
 
-  // Kecil → inline <pre>
   if (json.length <= JSON_INLINE_THRESHOLD) {
     await ctx.reply(
       `📋 <b>Episode ${episodeNumber}</b>\n` +
@@ -677,7 +672,6 @@ async function sendResult(
     return;
   }
 
-  // Besar → file attachment
   const filename = `ep-${episodeNumber}.json`;
 
   const caption =
@@ -700,10 +694,6 @@ async function sendResult(
     );
   }
 }
-
-/* ============================================================
-   FILE DOWNLOAD
-   ============================================================ */
 
 async function downloadByFileId(
   ctx: Context,
@@ -818,10 +808,6 @@ function processText(
   const labels = entries.map((e) => e.label);
   return { videos, labels };
 }
-
-/* ============================================================
-   PUBLIC HANDLERS
-   ============================================================ */
 
 export async function handleDocumentAuto(ctx: Context, env: Env): Promise<void> {
   const result = await downloadDocText(ctx, env);
