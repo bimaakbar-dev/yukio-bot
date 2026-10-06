@@ -18,10 +18,6 @@ export interface YukionimeAnime {
   synopsis?: string | null;
 }
 
-/**
- * Cari anime di yukionime berdasarkan judul.
- * Return null kalau tidak ada.
- */
 export async function searchYukionime(
   query: string
 ): Promise<YukionimeAnime | null> {
@@ -51,9 +47,6 @@ export async function searchYukionime(
   }
 }
 
-/**
- * Fetch detail + synopsis dari HTML page (scrape id="synopsis").
- */
 export async function getYukionimeDetail(
   slug: string
 ): Promise<YukionimeAnime | null> {
@@ -65,13 +58,17 @@ export async function getYukionimeDetail(
     const html = await res.text();
     const synopsis = extractSynopsis(html);
 
-    // Ambil detail dari API (metadata)
     const apiRes = await fetch(`${YUKIONIME_BASE}/api/v1/anime/${slug}.json`);
-    const apiJson = apiRes.ok ? await apiRes.json() : null;
-
-    const data = (apiJson?.data ?? {}) as YukionimeAnime;
+    const apiJson = apiRes.ok
+      ? ((await apiRes.json()) as { data?: YukionimeAnime })
+      : null;
+    
+    const data: YukionimeAnime = apiJson?.data ?? {
+      id: slug,
+      title: '',
+    };
     data.synopsis = synopsis;
-
+    
     return data;
   } catch (err) {
     console.warn('[Yukionime] detail fetch failed:', err);
@@ -79,12 +76,7 @@ export async function getYukionimeDetail(
   }
 }
 
-/* ============================================================
-   EXTRACT SYNOPSIS
-   ============================================================ */
-
 function extractSynopsis(html: string): string | null {
-  // Cari <div id="synopsis">...</div>
   const match = html.match(
     /<div[^>]*\bid=["']synopsis["'][^>]*>([\s\S]*?)<\/div>/i
   );
