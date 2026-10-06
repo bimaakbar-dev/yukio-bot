@@ -15,13 +15,16 @@ import {
   buildMetadataYaml,
   getSynopsisRaw,
 } from '../services/qimochi-yaml';
-
 import { askAI } from '../services/ai';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MSG_LIMIT = 3500;
 const AI_TIMEOUT_MS = 12000;
 const BATCH_OVERHEAD = 300;
+
+/* ============================================================
+   DB: SESSION
+   ============================================================ */
 
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
@@ -50,6 +53,20 @@ async function ensureDb(db: D1Database): Promise<void> {
           )`
         )
         .run();
+
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS voice_actors (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            nameNative      TEXT,
+            image           TEXT,
+            defaultLanguage TEXT,
+            created_at      INTEGER NOT NULL
+          )`
+        )
+        .run();
+
       dbReady = true;
     } catch (err) {
       console.error('[DBA] DB init error:', err);
@@ -156,6 +173,101 @@ async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
   }
 }
 
+/* ============================================================
+   VOICE ACTORS — D1 STORE
+   ============================================================ */
+
+interface VoiceActorRow {
+  id: string;
+  name: string;
+  nameNative: string | null;
+  image: string | null;
+  defaultLanguage: string | null;
+}
+
+interface VoiceActorInput {
+  id: string;
+  name: string;
+  nameNative?: string;
+  image?: string;
+  defaultLanguage?: string;
+}
+
+/**
+ * Simpan VA ke D1 (skip yang sudah ada).
+ * Tidak return apa-apa — silent save.
+ */
+async function saveVoiceActors(
+  db: D1Database,
+  vas: VoiceActorInput[]
+): Promise<void> {
+  if (vas.length === 0) return;
+
+  await ensureDb(db);
+
+  const ids = vas.map((v) => v.id);
+  const placeholders = ids.map(() => '?').join(',');
+  const existing = await db
+    .prepare(`SELECT id FROM voice_actors WHERE id IN (${placeholders})`)
+    .bind(...ids)
+    .all<{ id: string }>();
+
+  const existingSet = new Set((existing.results ?? []).map((r) => r.id));
+  const newVAs = vas.filter((v) => !existingSet.has(v.id));
+
+  if (newVAs.length === 0) {
+    console.log(`[DBA] VA: ${vas.length} total, semua sudah ada`);
+    return;
+  }
+
+  const now = Date.now();
+  const stmts = newVAs.map((v) =>
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO voice_actors
+         (id, name, nameNative, image, defaultLanguage, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        v.id,
+        v.name,
+        v.nameNative ?? null,
+        v.image ?? null,
+        v.defaultLanguage ?? 'Japanese',
+        now
+      )
+  );
+
+  await db.batch(stmts);
+
+  console.log(
+    `[DBA] VA: ${newVAs.length} baru disimpan, ${vas.length - newVAs.length} sudah ada`
+  );
+}
+
+/**
+ * Ambil SEMUA VA dari D1 (sorted by id).
+ */
+async function getAllVoiceActors(
+  db: D1Database
+): Promise<VoiceActorRow[]> {
+  await ensureDb(db);
+
+  const res = await db
+    .prepare(
+      `SELECT id, name, nameNative, image, defaultLanguage
+       FROM voice_actors
+       ORDER BY id ASC`
+    )
+    .all<VoiceActorRow>();
+
+  return res.results ?? [];
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -256,12 +368,6 @@ async function sendJsonSection<T>(
     const batch = items.slice(start, end);
     const batchJson = JSON.stringify(batch, null, 2);
 
-    if (batchJson.length > MSG_LIMIT) {
-      console.warn(
-        `[DBA] Batch ${i + 1}/${totalBatches} terlalu besar (${batchJson.length} char)`
-      );
-    }
-
     const header =
       `📋 <b>${escapeHtml(label)}</b> [${i + 1}/${totalBatches}]\n` +
       `<i>Item ${start + 1}-${end} dari ${items.length}</i>\n\n`;
@@ -285,8 +391,9 @@ function buildKeyboard(sessionId: string): InlineKeyboard {
     .text('🎬 Episodes', `qd:e:${sessionId}`)
     .text('🔗 Franchises', `qd:f:${sessionId}`)
     .row()
-    .text('📝 Summary', `qd:s:${sessionId}`)
+    .text('🎤 Voice Actors', `qd:v:${sessionId}`)
     .row()
+    .text('📝 Summary', `qd:s:${sessionId}`)
     .text('❌ Batal', `qd:x:${sessionId}`);
 }
 
@@ -321,76 +428,6 @@ function safeFetch<T>(
   ]);
 }
 
-interface VoiceActorRow {
-  id: string;
-  name: string;
-  nameNative: string | null;
-  image: string | null;
-  defaultLanguage: string | null;
-}
-
-async function ensureVoiceActorsTable(db: D1Database): Promise<void> {
-  await db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS voice_actors (
-        id              TEXT PRIMARY KEY,
-        name            TEXT NOT NULL,
-        nameNative      TEXT,
-        image           TEXT,
-        defaultLanguage TEXT,
-        created_at      INTEGER NOT NULL
-      )`
-    )
-    .run();
-}
-
-async function filterAndSaveNewVoiceActors(
-  db: D1Database,
-  vas: { id: string; name: string; nameNative?: string; image?: string; defaultLanguage?: string }[]
-): Promise<typeof vas> {
-  if (vas.length === 0) return [];
-
-  await ensureVoiceActorsTable(db);
-
-  const ids = vas.map((v) => v.id);
-  const placeholders = ids.map(() => '?').join(',');
-  const existing = await db
-    .prepare(`SELECT id FROM voice_actors WHERE id IN (${placeholders})`)
-    .bind(...ids)
-    .all<{ id: string }>();
-
-  const existingSet = new Set((existing.results ?? []).map((r) => r.id));
-  const newVAs = vas.filter((v) => !existingSet.has(v.id));
-
-  if (newVAs.length === 0) return [];
-
-  const now = Date.now();
-  const stmts = newVAs.map((v) =>
-    db
-      .prepare(
-        `INSERT OR IGNORE INTO voice_actors
-         (id, name, nameNative, image, defaultLanguage, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        v.id,
-        v.name,
-        v.nameNative ?? null,
-        v.image ?? null,
-        v.defaultLanguage ?? 'Japanese',
-        now
-      )
-  );
-
-  await db.batch(stmts);
-
-  console.log(
-    `[DBA] Voice actors: ${newVAs.length} baru, ${vas.length - newVAs.length} sudah ada`
-  );
-
-  return newVAs;
-}
-
 function fallbackJson(errors: string[]): string {
   return JSON.stringify(
     { error: true, message: 'Semua sumber gagal', errors },
@@ -398,6 +435,10 @@ function fallbackJson(errors: string[]): string {
     2
   );
 }
+
+/* ============================================================
+   AI SYNOPSIS
+   ============================================================ */
 
 async function rewriteSynopsis(
   env: Env,
@@ -431,6 +472,10 @@ async function rewriteSynopsis(
     return null;
   }
 }
+
+/* ============================================================
+   COMMAND HANDLER
+   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -531,6 +576,10 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
+/* ============================================================
+   CALLBACK HANDLERS
+   ============================================================ */
+
 function buildChainContext(session: SessionRow): ChainContext {
   return {
     malId: session.mal_id,
@@ -540,7 +589,7 @@ function buildChainContext(session: SessionRow): ChainContext {
 }
 
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
-  bot.callbackQuery(/^qd:([mcefsx]):(q_[a-f0-9]+)$/, async (ctx) => {
+  bot.callbackQuery(/^qd:([mcefsvx]):(q_[a-f0-9]+)$/, async (ctx) => {
     const match = ctx.match as RegExpMatchArray;
     const action = match[1];
     const sessionId = match[2];
@@ -612,59 +661,76 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      /* ---------- CHARACTERS ---------- */
-	  if (action === 'c') {
-  	  const { data: result, error } = await safeFetch(
-    	  () => chainCharacters(chainCtx),
-    	  25000
-  	  );
+      /* ---------- CHARACTERS (simpan VA silent) ---------- */
+      if (action === 'c') {
+        const { data: result, error } = await safeFetch(
+          () => chainCharacters(chainCtx),
+          25000
+        );
 
-  	  if (!result || !result.data || result.data.length === 0) {
-    	  const errs = result?.errors ?? [error ?? 'unknown'];
-    	  await sendTextSection(
-      	  ctx,
-      	  `Characters — ${session.title} [FAILED]`,
-      	  fallbackJson(errs)
-    	  );
-    	  return;
-  	  }
+        if (!result || !result.data || result.data.length === 0) {
+          const errs = result?.errors ?? [error ?? 'unknown'];
+          await sendTextSection(
+            ctx,
+            `Characters — ${session.title} [FAILED]`,
+            fallbackJson(errs)
+          );
+          return;
+        }
 
-  	  const chars = result.data;
-  	  const vas = result.voiceActors;
-  	  const source = result.source;
+        const chars = result.data;
+        const vas = result.voiceActors;
+        const source = result.source;
 
-  	  // Characters
-  	  await sendJsonSection(
-    	  ctx,
-    	  `Characters — ${session.title} [${source}]`,
-    	  chars
-  	  );
+        // Simpan VA ke D1 (silent)
+        if (vas.length > 0) {
+          try {
+            await saveVoiceActors(env.DB, vas);
+          } catch (err) {
+            console.warn('[DBA] Gagal simpan VA:', err);
+          }
+        }
 
-  	  // Voice Actors
-  	  if (vas.length > 0) {
-    	  const newVAs = await filterAndSaveNewVoiceActors(env.DB, vas);
+        // Kirim HANYA characters
+        await sendJsonSection(
+          ctx,
+          `Characters — ${session.title} [${source}]`,
+          chars
+        );
 
-    	  if (newVAs.length > 0) {
-      	  await sendJsonSection(
-        	  ctx,
-        	  `Voice Actors BARU (${newVAs.length} dari ${vas.length}) — append ke voice-actors.json`,
-        	  newVAs
-      	  );
-    	  } else {
-      	  await ctx.reply(
-        	  `ℹ️ <i>Semua ${vas.length} voice actor sudah ada di database (skip).</i>`,
-        	  { parse_mode: 'HTML' }
-      	  );
-    	  }
-  	  } else {
-    	  await ctx.reply(
-      	  'ℹ️ <i>Tidak ada data voice actor dari sumber.</i>',
-      	  { parse_mode: 'HTML' }
-    	  );
-  	  }
+        // Notif kecil: VA tersimpan
+        if (vas.length > 0) {
+          await ctx.reply(
+            `ℹ️ <i>${vas.length} voice actor tersimpan ke DB. ` +
+              `Klik <b>🎤 Voice Actors</b> untuk lihat semua.</i>`,
+            { parse_mode: 'HTML' }
+          );
+        }
 
-  	  return;
-	  }
+        return;
+      }
+
+      /* ---------- VOICE ACTORS (baca dari D1) ---------- */
+      if (action === 'v') {
+        const vas = await getAllVoiceActors(env.DB);
+
+        if (vas.length === 0) {
+          await ctx.reply(
+            '📭 <i>Belum ada voice actor di DB.</i>\n\n' +
+              'Klik <b>👥 Characters</b> dulu untuk fetch dari sumber.',
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        await sendJsonSection(
+          ctx,
+          `Voice Actors (${vas.length}) — voice-actors.json`,
+          vas
+        );
+
+        return;
+      }
 
       /* ---------- EPISODES ---------- */
       if (action === 'e') {
@@ -719,7 +785,7 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      /* ---------- SUMMARY (text) ---------- */
+      /* ---------- SUMMARY ---------- */
       if (action === 's') {
         let result;
         try {
