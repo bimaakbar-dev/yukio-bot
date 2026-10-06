@@ -5,6 +5,7 @@ import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../types/anime';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import { searchYukionime, getYukionimeDetail } from '../services/yukionime';
 import { getCache, setCache } from '../lib/cache';
 import {
   searchAnime,
@@ -19,10 +20,6 @@ import {
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
-/* ═══════════════════════════════════════════════
-   SLUGIFY
-   ═══════════════════════════════════════════════ */
-
 function slugify(str: string): string {
   return str
     .toLowerCase()
@@ -33,10 +30,6 @@ function slugify(str: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
 }
-
-/* ═══════════════════════════════════════════════
-   DB: TEMP SESSIONS
-   ═══════════════════════════════════════════════ */
 
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
@@ -65,12 +58,9 @@ async function ensureDb(db: D1Database): Promise<void> {
         )
         .run();
 
-      // Migration: tambah kolom slug kalau belum ada
       try {
         await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
-      } catch {
-        // already exists
-      }
+      } catch {}
 
       dbReady = true;
     } catch (err) {
@@ -178,10 +168,6 @@ async function deleteSession(
   }
 }
 
-/* ═══════════════════════════════════════════════
-   HELPERS
-   ═══════════════════════════════════════════════ */
-
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -240,14 +226,57 @@ function extractTitleFromMALUrl(url: string): string | null {
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
 
-/* ═══════════════════════════════════════════════
+/* ============================================================
+   YUKIONIME CHECK
+   ============================================================ */
+
+async function checkYukionime(
+  ctx: any,
+  query: string
+): Promise<void> {
+  const match = await searchYukionime(query);
+  if (!match) return;
+
+  const detail = await getYukionimeDetail(match.id);
+
+  const synopsisPreview = detail?.synopsis
+    ? detail.synopsis.slice(0, 300) +
+      (detail.synopsis.length > 300 ? '…' : '')
+    : null;
+
+  const lines: string[] = [];
+  lines.push('⚠️ <b>Sudah ada di database Yukionime!</b>');
+  lines.push('');
+  lines.push(`🆔 <b>Slug:</b> <code>${escapeHtml(match.id)}</code>`);
+  lines.push(`📌 <b>Judul:</b> ${escapeHtml(match.title)}`);
+
+  if (match.year) lines.push(`📅 <b>Tahun:</b> ${match.year}`);
+  if (match.type) lines.push(`🎬 <b>Tipe:</b> ${escapeHtml(match.type)}`);
+  if (match.status) lines.push(`📊 <b>Status:</b> ${escapeHtml(match.status)}`);
+
+  if (synopsisPreview) {
+    lines.push('');
+    lines.push('📝 <b>Sinopsis (preview):</b>');
+    lines.push(`<i>${escapeHtml(synopsisPreview)}</i>`);
+  }
+
+  lines.push('');
+  lines.push('🔗 <a href="https://qimochi.pages.dev/anime/' + escapeHtml(match.id) + '/">Lihat halaman</a>');
+
+  await ctx.reply(lines.join('\n'), {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
+}
+
+/* ============================================================
    COMMAND
-   ═══════════════════════════════════════════════ */
+   ============================================================ */
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime → tombol convert YAML',
-  usage: '/anime jujutsu kaisen',
+  usage: '/anime nama anime',
   adminOnly: true,
 
   handler: async (ctx, env) => {
@@ -282,6 +311,14 @@ export const animeCommand: CommandDefinition = {
         if (t) searchQuery = t;
       }
 
+      // === CEK YUKIONIME ===
+      try {
+        await checkYukionime(ctx, searchQuery);
+      } catch (err) {
+        console.warn('[Anime] yukionime check failed:', err);
+      }
+
+      // === LANJUT ANILIST ===
       const cacheKey = `anime:${searchQuery.toLowerCase().trim()}`;
       media = await getCache<AniListMedia>(env.DB, cacheKey);
 
