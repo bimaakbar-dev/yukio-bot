@@ -36,10 +36,6 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
 
-/* ============================================================
-   DB: INIT
-   ============================================================ */
-
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
 
@@ -70,15 +66,12 @@ async function ensureDb(db: D1Database): Promise<void> {
         )
         .run();
 
-      // Migration: tambah kolom baru kalau belum ada (untuk table existing)
       for (const col of ['metadata', 'fetched_sources']) {
         try {
           await db
             .prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
             .run();
-        } catch {
-          // Kolom sudah ada, ignore
-        }
+        } catch {}
       }
 
       await db
@@ -106,10 +99,6 @@ async function ensureDb(db: D1Database): Promise<void> {
 
   return dbInitPromise;
 }
-
-/* ============================================================
-   SESSION TYPES
-   ============================================================ */
 
 interface SessionRow {
   session_id: string;
@@ -251,10 +240,6 @@ async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
   }
 }
 
-/* ============================================================
-   METADATA: DETECT MISSING + MERGE
-   ============================================================ */
-
 interface MissingInfo {
   fields: string[];
   canShikimori: boolean;
@@ -315,42 +300,41 @@ function mergeMetadata(
   const merged: AniListMedia = JSON.parse(JSON.stringify(base));
   const filled: string[] = [];
 
-  // title.english
   if (!merged.title.english && incoming.title.english) {
     merged.title.english = incoming.title.english;
     filled.push('titleEnglish');
   }
-  // title.native
+
   if (!merged.title.native && incoming.title.native) {
     merged.title.native = incoming.title.native;
     filled.push('titleNative');
   }
-  // malId
+
   if (!merged.myanimelistId && incoming.myanimelistId) {
     merged.myanimelistId = incoming.myanimelistId;
     filled.push('malId');
   }
-  // source
+
   if (!merged.source && incoming.source) {
     merged.source = incoming.source;
     filled.push('source');
   }
-  // duration
+
   if (!merged.duration && incoming.duration) {
     merged.duration = incoming.duration;
     filled.push('duration');
   }
-  // rating
+
   if (!merged.rating && incoming.rating) {
     merged.rating = incoming.rating;
     filled.push('rating');
   }
-  // end date
+
   if (!merged.endDate && incoming.endDate) {
     merged.endDate = incoming.endDate;
     filled.push('aired.to');
   }
-  // genres
+
   if (
     (!merged.genres || merged.genres.length === 0) &&
     incoming.genres?.length
@@ -358,27 +342,27 @@ function mergeMetadata(
     merged.genres = incoming.genres;
     filled.push('genres');
   }
-  // studios
+
   if (!merged.studios?.nodes?.length && incoming.studios?.nodes?.length) {
     merged.studios = incoming.studios;
     filled.push('studios');
   }
-  // banner
+
   if (!merged.banner && incoming.banner) {
     merged.banner = incoming.banner;
     filled.push('banner');
   }
-  // trailer
+
   if (!merged.trailer && incoming.trailer) {
     merged.trailer = incoming.trailer;
     filled.push('trailer');
   }
-  // score
+
   if (!merged.averageScore && incoming.averageScore) {
     merged.averageScore = incoming.averageScore;
     filled.push('stats.score');
   }
-  // cover (fallback kalau AniList kosong — jarang)
+
   if (!merged.coverImage.extraLarge && incoming.coverImage.extraLarge) {
     merged.coverImage.extraLarge = incoming.coverImage.extraLarge;
     merged.coverImage.large = incoming.coverImage.large;
@@ -392,10 +376,6 @@ function mergeMetadata(
   return { merged, filled };
 }
 
-/* ============================================================
-   VOICE ACTORS STORE
-   ============================================================ */
-
 interface VoiceActorInput {
   id: string;
   name: string;
@@ -407,52 +387,67 @@ interface VoiceActorInput {
 async function saveVoiceActors(
   db: D1Database,
   vas: VoiceActorInput[]
-): Promise<void> {
-  if (vas.length === 0) return;
+): Promise<{ newCount: number; skippedCount: number }> {
+  if (vas.length === 0) return { newCount: 0, skippedCount: 0 };
+
   await ensureDb(db);
 
-  const ids = vas.map((v) => v.id);
-  const placeholders = ids.map(() => '?').join(',');
-  const existing = await db
-    .prepare(`SELECT id FROM voice_actors WHERE id IN (${placeholders})`)
-    .bind(...ids)
-    .all<{ id: string }>();
+  const CHUNK = 100;
 
-  const existingSet = new Set((existing.results ?? []).map((r) => r.id));
+  const existingSet = new Set<string>();
+
+  for (let i = 0; i < vas.length; i += CHUNK) {
+    const slice = vas.slice(i, i + CHUNK);
+    const ids = slice.map((v) => v.id);
+    const placeholders = ids.map(() => '?').join(',');
+    const res = await db
+      .prepare(`SELECT id FROM voice_actors WHERE id IN (${placeholders})`)
+      .bind(...ids)
+      .all<{ id: string }>();
+    for (const r of res.results ?? []) {
+      existingSet.add(r.id);
+    }
+  }
+
   const newVAs = vas.filter((v) => !existingSet.has(v.id));
 
   if (newVAs.length === 0) {
     console.log(`[DBA] VA: ${vas.length} total, semua sudah ada`);
-    return;
+    return { newCount: 0, skippedCount: vas.length };
   }
 
   const now = Date.now();
-  const stmts = newVAs.map((v) =>
-    db
-      .prepare(
-        `INSERT OR IGNORE INTO voice_actors
-         (id, name, nameNative, image, defaultLanguage, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
-      )
-      .bind(
-        v.id,
-        v.name,
-        v.nameNative ?? null,
-        v.image ?? null,
-        v.defaultLanguage ?? 'Japanese',
-        now
-      )
-  );
 
-  await db.batch(stmts);
+  for (let i = 0; i < newVAs.length; i += CHUNK) {
+    const slice = newVAs.slice(i, i + CHUNK);
+    const stmts = slice.map((v) =>
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO voice_actors
+           (id, name, nameNative, image, defaultLanguage, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          v.id,
+          v.name,
+          v.nameNative ?? null,
+          v.image ?? null,
+          v.defaultLanguage ?? 'Japanese',
+          now
+        )
+    );
+    await db.batch(stmts);
+  }
+
   console.log(
     `[DBA] VA: ${newVAs.length} baru disimpan, ${vas.length - newVAs.length} sudah ada`
   );
-}
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
+  return {
+    newCount: newVAs.length,
+    skippedCount: vas.length - newVAs.length,
+  };
+}
 
 function getFetchedSources(session: SessionRow): string[] {
   if (!session.fetched_sources) return [];
@@ -599,10 +594,6 @@ function fallbackJson(errors: string[]): string {
   );
 }
 
-/* ============================================================
-   AI SYNOPSIS
-   ============================================================ */
-
 async function rewriteSynopsis(
   env: Env,
   title: string,
@@ -635,10 +626,6 @@ async function rewriteSynopsis(
     return null;
   }
 }
-
-/* ============================================================
-   COMMAND: /dba
-   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -747,10 +734,6 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
-/* ============================================================
-   COMMAND: /end
-   ============================================================ */
-
 export const endCommand: CommandDefinition = {
   name: 'end',
   description: 'Hapus semua pesan session /dba aktif',
@@ -793,10 +776,6 @@ export const endCommand: CommandDefinition = {
   },
 };
 
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
-
 function buildChainContext(session: SessionRow): ChainContext {
   return {
     malId: session.mal_id,
@@ -805,9 +784,6 @@ function buildChainContext(session: SessionRow): ChainContext {
   };
 }
 
-/**
- * Handler Metadata utama: fetch AniList (kalau belum) atau tampil dari session.
- */
 async function handleMetadataShow(
   ctx: Context,
   env: Env,
@@ -849,9 +825,6 @@ async function handleMetadataShow(
   await tracker(msg.message_id);
 }
 
-/**
- * Handler merge: fetch source, merge, tampil ulang.
- */
 async function handleMetadataMerge(
   ctx: Context,
   env: Env,
