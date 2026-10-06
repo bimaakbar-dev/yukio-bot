@@ -1057,7 +1057,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             const msg = await ctx.reply(text, { parse_mode: 'HTML' });
             await tracker(msg.message_id);
           }
-        }
           return;
         }
 
