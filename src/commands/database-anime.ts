@@ -1029,9 +1029,11 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           const vas = result.voiceActors;
           const source = result.source;
 
+          let vaResult = { newCount: 0, skippedCount: 0 };
+
           if (vas.length > 0) {
             try {
-              await saveVoiceActors(env.DB, vas);
+              vaResult = await saveVoiceActors(env.DB, vas);
             } catch (err) {
               console.warn('[DBA] Gagal simpan VA:', err);
             }
@@ -1045,13 +1047,17 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           );
 
           if (vas.length > 0) {
-            const msg = await ctx.reply(
-              `ℹ️ <i>${vas.length} voice actor tersimpan ke DB. ` +
-                `Ketik /va untuk kelola.</i>`,
-              { parse_mode: 'HTML' }
-            );
+            const text =
+              vaResult.newCount > 0
+                ? `ℹ️ <i>${vaResult.newCount} VA baru tersimpan ` +
+                  `(${vaResult.skippedCount} skip dari ${vas.length} total). ` +
+                  `Ketik /va untuk kelola.</i>`
+                : `ℹ️ <i>Semua ${vas.length} VA sudah ada di DB (skip).</i>`;
+
+            const msg = await ctx.reply(text, { parse_mode: 'HTML' });
             await tracker(msg.message_id);
           }
+        }
           return;
         }
 
