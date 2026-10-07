@@ -13,6 +13,8 @@ import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
 import { setupPublishCallbacks } from './commands/publish';
 import { setupPostCallbacks } from './commands/post';
 import { setupKillCallbacks } from './commands/kill';
+import { setupEditCallbacks } from './commands/edit/callbacks';
+import { handleEditTextInput } from './commands/edit';
 import { COMMANDS } from './commands/list';
 
 const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
@@ -41,6 +43,20 @@ function createBot(env: Env): Bot {
   setupPublishCallbacks(bot, env);
   setupPostCallbacks(bot, env);
   setupKillCallbacks(bot, env);
+  setupEditCallbacks(bot, env);
+
+  // Handler teks bebas — buat input slug / value di flow /edit
+  bot.on('message:text', async (ctx) => {
+    if (!isAdmin(ctx.from?.id, env)) return;
+    if (ctx.chat?.type !== 'private') return;
+
+    try {
+      const handled = await handleEditTextInput(ctx, env);
+      void handled;
+    } catch (err) {
+      console.error('[Edit] text handler error:', err);
+    }
+  });
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
