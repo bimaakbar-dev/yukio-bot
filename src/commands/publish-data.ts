@@ -1,7 +1,7 @@
 // src/commands/publish-data.ts
 import type { CommandDefinition } from './registry';
-import type { Context } from 'grammy';
-import { InlineKeyboard, type Bot } from 'grammy';
+import type { Bot } from 'grammy';
+import { InlineKeyboard } from 'grammy';
 import type { Env } from '../types/env';
 
 function escapeHtml(s: string): string {
@@ -42,7 +42,7 @@ async function getSession(
     .first<SessionRow>();
 }
 
-export function setupPublishDataCallbacks(bot: Bot, env: Env): void {
+export function setupPublishDataCallbacks(bot: Bot, _env: Env): void {
   bot.callbackQuery(/^pd:(meta|chars|eps|fr|va):([a-z0-9-]+)$/, async (ctx) => {
     const section = ctx.match[1] ?? '';
     const slug = ctx.match[2] ?? '';
