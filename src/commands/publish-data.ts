@@ -216,6 +216,27 @@ function buildPendingFiles(
   return files;
 }
 
+async function countExistingFiles(
+  env: Env,
+  files: PendingFile[],
+  target: 'yukio-data' | 'qimochi' | 'yukionime'
+): Promise<number> {
+  const results = await Promise.allSettled(
+    files.map((f) =>
+      Promise.race([
+        githubGetFile(env, f.path, target),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+      ])
+    )
+  );
+
+  let count = 0;
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) count++;
+  }
+  return count;
+}
+
 async function previewAndSave(
   ctx: any,
   env: Env,
@@ -240,7 +261,22 @@ async function previewAndSave(
     total_size: totalSize,
   });
 
-  const existingCount = await countExistingFiles(env, files, 'yukio-data');
+  await ctx.api
+    .editMessageText(
+      ctx.chat.id,
+      loadingMessageId,
+      '🔍 Cek file existing...',
+      { parse_mode: 'HTML' }
+    )
+    .catch(() => {});
+
+  let existingCount = 0;
+  try {
+    existingCount = await countExistingFiles(env, files, 'yukio-data');
+  } catch (err) {
+    console.warn('[PublishData] countExistingFiles error:', err);
+  }
+
   const sizeKB = Math.max(1, Math.round(totalSize / 1024));
 
   const lines: string[] = [];
@@ -286,21 +322,6 @@ async function previewAndSave(
   );
 }
 
-async function countExistingFiles(
-  env: Env,
-  files: PendingFile[],
-  target: 'yukio-data' | 'qimochi' | 'yukionime'
-): Promise<number> {
-  let count = 0;
-  for (const f of files) {
-    try {
-      const existing = await githubGetFile(env, f.path, target);
-      if (existing) count++;
-    } catch {}
-  }
-  return count;
-}
-
 async function doPublishCharacters(
   ctx: any,
   env: Env,
@@ -309,200 +330,241 @@ async function doPublishCharacters(
 ): Promise<void> {
   const loading = await ctx.reply('🔍 Cek characters dari session...');
 
-  let cacheRow: { data: string; total: number; source: string } | null = null;
-
   try {
-    cacheRow = await env.DB
-      .prepare(
-        `SELECT data, total, source FROM qimochi_char_cache
-         WHERE session_id = ?`
+    let cacheRow: { data: string; total: number; source: string } | null = null;
+
+    try {
+      cacheRow = await env.DB
+        .prepare(
+          `SELECT data, total, source FROM qimochi_char_cache
+           WHERE session_id = ?`
+        )
+        .bind(session.session_id)
+        .first<{ data: string; total: number; source: string }>();
+    } catch (err) {
+      console.warn('[PublishData] char cache query error:', err);
+    }
+
+    if (!cacheRow) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        `❌ <b>Characters belum ada di cache.</b>\n\n` +
+          `Buka <code>/dba</code> → klik <b>👥 Characters</b> dulu,\n` +
+          `lalu jalankan <code>/publish_data</code> lagi.\n\n` +
+          `<i>Cache expired setelah 30 menit.</i>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    let characters: unknown[] = [];
+
+    try {
+      const parsed = JSON.parse(cacheRow.data);
+      if (Array.isArray(parsed)) characters = parsed;
+    } catch {
+      characters = [];
+    }
+
+    if (characters.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        '❌ Characters kosong di cache.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await previewAndSave(
+      ctx,
+      env,
+      session,
+      slug,
+      'characters',
+      characters,
+      `data/anime/${slug}/characters`,
+      CHAR_PART_SIZE,
+      loading.message_id,
+      `📡 Sumber: ${escapeHtml(cacheRow.source ?? 'unknown')}`
+    );
+  } catch (err: any) {
+    console.error('[PublishData] doPublishCharacters error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        `❌ <b>Gagal prepare characters</b>\n\n` +
+          `<code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+        { parse_mode: 'HTML' }
       )
-      .bind(session.session_id)
-      .first<{ data: string; total: number; source: string }>();
-  } catch (err) {
-    console.warn('[PublishData] char cache query error:', err);
+      .catch(() => {});
   }
-
-  if (!cacheRow) {
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      loading.message_id,
-      `❌ <b>Characters belum ada di cache.</b>\n\n` +
-        `Buka <code>/dba</code> → klik <b>👥 Characters</b> dulu,\n` +
-        `lalu jalankan <code>/publish_data</code> lagi.\n\n` +
-        `<i>Cache expired setelah 30 menit.</i>`,
-      { parse_mode: 'HTML' }
-    );
-    return;
-  }
-
-  let characters: unknown[] = [];
-
-  try {
-    const parsed = JSON.parse(cacheRow.data);
-    if (Array.isArray(parsed)) characters = parsed;
-  } catch {
-    characters = [];
-  }
-
-  if (characters.length === 0) {
-    await ctx.api.editMessageText(
-      ctx.chat.id,
-      loading.message_id,
-      '❌ Characters kosong di cache.',
-      { parse_mode: 'HTML' }
-    );
-    return;
-  }
-
-  await previewAndSave(
-    ctx,
-    env,
-    session,
-    slug,
-    'characters',
-    characters,
-    `data/anime/${slug}/characters`,
-    CHAR_PART_SIZE,
-    loading.message_id,
-    `📡 Sumber: ${escapeHtml(cacheRow.source ?? 'unknown')}`
-  );
 }
 
 export function setupPublishDataCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^pd:(chars|eps|fr|va):([a-z0-9-]+)$/, async (ctx) => {
-    const section = ctx.match[1] ?? '';
-    const slug = ctx.match[2] ?? '';
-
-    const userId = ctx.from?.id;
-    if (!userId) return;
-
-    const session = await getSession(env, userId);
-
-    if (!session) {
-      await ctx.answerCallbackQuery({
-        text: '⏱️ Session kadaluarsa. Ulangi /dba.',
-        show_alert: true,
-      });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: `⏳ ${section}...` });
-
-    if (section === 'chars') {
-      await doPublishCharacters(ctx, env, session, slug);
-      return;
-    }
-
-    await ctx.reply(
-      `🚧 <b>Section ${escapeHtml(section)}</b> belum diimplementasi.\n\n` +
-        `Slug: <code>${escapeHtml(slug)}</code>`,
-      { parse_mode: 'HTML' }
-    );
-  });
-
-  bot.callbackQuery(/^pd:push:(pd_[a-z0-9]+)$/, async (ctx) => {
-    const pendingId = ctx.match[1] ?? '';
-    if (!pendingId) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-
-    const pending = await getPending(env.DB, pendingId);
-    if (!pending) {
-      await ctx.answerCallbackQuery({
-        text: '⏱️ Kadaluarsa. Ulangi /publish_data.',
-        show_alert: true,
-      });
-      return;
-    }
-
-    if (ctx.from?.id !== pending.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
-
-    let files: PendingFile[] = [];
     try {
-      files = JSON.parse(pending.files_json) as PendingFile[];
-    } catch {
-      files = [];
-    }
+      const section = ctx.match[1] ?? '';
+      const slug = ctx.match[2] ?? '';
 
-    if (files.length === 0) {
-      await ctx
-        .reply('❌ Tidak ada file untuk di-push.')
-        .catch(() => {});
-      return;
-    }
+      const userId = ctx.from?.id;
+      if (!userId) return;
 
-    const message = `feat(${pending.section}): add for ${pending.slug}`;
+      const session = await getSession(env, userId);
 
-    let result: { ok: boolean; sha?: string; commitUrl?: string; error?: string };
+      if (!session) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Session kadaluarsa. Ulangi /dba.',
+          show_alert: true,
+        });
+        return;
+      }
 
-    if (files.length === 1) {
-      result = await githubCommitFile(
-        env,
-        files[0]!.path,
-        files[0]!.content,
-        message,
-        'yukio-data'
+      await ctx.answerCallbackQuery({ text: `⏳ ${section}...` });
+
+      if (section === 'chars') {
+        await doPublishCharacters(ctx, env, session, slug);
+        return;
+      }
+
+      await ctx.reply(
+        `🚧 <b>Section ${escapeHtml(section)}</b> belum diimplementasi.\n\n` +
+          `Slug: <code>${escapeHtml(slug)}</code>`,
+        { parse_mode: 'HTML' }
       );
-    } else {
-      const payload: FileToCommit[] = files.map((f) => ({
-        path: f.path,
-        content: f.content,
-      }));
-      result = await githubCommitMultipleFiles(
-        env,
-        payload,
-        message,
-        'yukio-data'
-      );
-    }
-
-    if (!result.ok) {
+    } catch (err: any) {
+      console.error('[PublishData] callback error:', err);
       await ctx
         .reply(
-          `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+          `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
           { parse_mode: 'HTML' }
         )
         .catch(() => {});
-      return;
     }
+  });
 
-    await deletePending(env.DB, pendingId);
+  bot.callbackQuery(/^pd:push:(pd_[a-z0-9]+)$/, async (ctx) => {
+    try {
+      const pendingId = ctx.match[1] ?? '';
+      if (!pendingId) {
+        await ctx.answerCallbackQuery({ text: '❌' });
+        return;
+      }
 
-    const commitShort = result.sha?.slice(0, 7) ?? '?';
+      const pending = await getPending(env.DB, pendingId);
+      if (!pending) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Kadaluarsa. Ulangi /publish_data.',
+          show_alert: true,
+        });
+        return;
+      }
 
-    await ctx
-      .editMessageText(
-        `✅ <b>Published!</b>\n\n` +
-          `📁 <code>data/anime/${escapeHtml(pending.slug)}/${escapeHtml(pending.section)}/</code>\n` +
-          `📦 ${pending.file_count} file · ${pending.total_items} item\n` +
-          `🔗 Commit: <code>${commitShort}</code>\n` +
-          `⏳ Deploy ~2 menit`,
-        {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          reply_markup: undefined,
-        }
-      )
-      .catch(() => {});
+      if (ctx.from?.id !== pending.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+      let files: PendingFile[] = [];
+      try {
+        files = JSON.parse(pending.files_json) as PendingFile[];
+      } catch {
+        files = [];
+      }
+
+      if (files.length === 0) {
+        await ctx.reply('❌ Tidak ada file untuk di-push.').catch(() => {});
+        return;
+      }
+
+      const message = `feat(${pending.section}): add for ${pending.slug}`;
+
+      let result: {
+        ok: boolean;
+        sha?: string;
+        commitUrl?: string;
+        error?: string;
+      };
+
+      if (files.length === 1) {
+        const f = files[0]!;
+        result = await githubCommitFile(
+          env,
+          f.path,
+          f.content,
+          message,
+          'yukio-data'
+        );
+      } else {
+        const payload: FileToCommit[] = files.map((f) => ({
+          path: f.path,
+          content: f.content,
+        }));
+        result = await githubCommitMultipleFiles(
+          env,
+          payload,
+          message,
+          'yukio-data'
+        );
+      }
+
+      if (!result.ok) {
+        await ctx
+          .reply(
+            `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+            { parse_mode: 'HTML' }
+          )
+          .catch(() => {});
+        return;
+      }
+
+      await deletePending(env.DB, pendingId);
+
+      const commitShort = result.sha?.slice(0, 7) ?? '?';
+
+      await ctx
+        .editMessageText(
+          `✅ <b>Published!</b>\n\n` +
+            `📁 <code>data/anime/${escapeHtml(pending.slug)}/${escapeHtml(pending.section)}/</code>\n` +
+            `📦 ${pending.file_count} file · ${pending.total_items} item\n` +
+            `🔗 Commit: <code>${commitShort}</code>\n` +
+            `⏳ Deploy ~2 menit`,
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: undefined,
+          }
+        )
+        .catch(() => {});
+    } catch (err: any) {
+      console.error('[PublishData] push error:', err);
+      await ctx
+        .reply(
+          `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    }
   });
 
   bot.callbackQuery(/^pd:cancel:(pd_[a-z0-9]+)$/, async (ctx) => {
-    const pendingId = ctx.match[1] ?? '';
-    if (pendingId) await deletePending(env.DB, pendingId);
-    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
-    await ctx
-      .editMessageText('❌ <b>Dibatalkan.</b>', {
-        parse_mode: 'HTML',
-        reply_markup: undefined,
-      })
-      .catch(() => {});
+    try {
+      const pendingId = ctx.match[1] ?? '';
+      if (pendingId) await deletePending(env.DB, pendingId);
+      await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+      await ctx
+        .editMessageText('❌ <b>Dibatalkan.</b>', {
+          parse_mode: 'HTML',
+          reply_markup: undefined,
+        })
+        .catch(() => {});
+    } catch (err) {
+      console.error('[PublishData] cancel error:', err);
+    }
   });
 }
 
