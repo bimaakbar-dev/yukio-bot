@@ -86,9 +86,12 @@ export function buildDayPrompt(): string {
 export function buildHourPrompt(day: string): string {
   return (
     `<b>Step 5/5</b> · Hari: <b>${escapeHtml(day)}</b>\n\n` +
-    'Kirim <b>jam rilis</b> format 24 jam (WIB).\n\n' +
-    '<i>Contoh: <code>18</code> = jam 18:00 WIB</i>\n' +
-    '<i>Bot akan cek mulai jam 19:00 (buffer +60 menit).</i>'
+    'Kirim <b>jam rilis</b> (WIB) format 24 jam.\n\n' +
+    '<b>Format:</b>\n' +
+    '• <code>18</code> → jam 18:00 WIB\n' +
+    '• <code>18:30</code> → jam 18:30 WIB\n' +
+    '• <code>18:15</code> → jam 18:15 WIB\n\n' +
+    '<i>Bot akan cek mulai jam tersebut + buffer 60 menit (jadi 19:00 / 19:30).</i>'
   );
 }
 
@@ -96,6 +99,9 @@ export function buildSummary(
   session: TrackSessionRow,
   existsInRepo: boolean
 ): string {
+  const hh = String(session.schedule_hour ?? 0).padStart(2, '0');
+  const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
+
   const lines: string[] = [];
   lines.push('<b>📋 Konfirmasi Track</b>');
   lines.push('');
@@ -107,9 +113,7 @@ export function buildSummary(
     );
   }
   lines.push(
-    `📅 <b>Jadwal:</b> ${escapeHtml(session.schedule_day ?? '-')} ${String(
-      session.schedule_hour ?? 0
-    ).padStart(2, '0')}:00 WIB`
+    `📅 <b>Jadwal:</b> ${escapeHtml(session.schedule_day ?? '-')} ${hh}:${mm} WIB`
   );
   lines.push(`⏱️ <b>Buffer:</b> ${session.buffer_min} menit`);
   lines.push('');
