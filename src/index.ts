@@ -259,7 +259,7 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 
-    async scheduled(
+  async scheduled(
     event: ScheduledEvent,
     env: Env,
     _ctx: ExecutionContext
@@ -328,3 +328,4 @@ export default {
     }
     console.warn(`[Cron] unknown trigger: ${cron}`);
   },
+};
