@@ -1,6 +1,12 @@
 // src/commands/edit/state.ts
 import type { D1Database } from '@cloudflare/workers-types';
 import { createLazyInit } from '../../lib/lazy-init';
+import {
+  ensureTrackDb,
+  trackMessage,
+  clearTrackedSession,
+} from '../../lib/telegram-utils';
+import type { Api } from 'grammy';
 import type { EditState, EditTarget, PendingEditRow } from './types';
 
 const TTL_MS = 30 * 60 * 1000;
@@ -22,6 +28,7 @@ export const ensureEditDb = createLazyInit('Edit', async (db) => {
       )`
     )
     .run();
+  await ensureTrackDb(db);
 });
 
 export async function createEditSession(
@@ -135,4 +142,30 @@ export function parseEdits(row: PendingEditRow): Record<string, string> {
     }
   } catch {}
   return {};
+}
+
+export async function trackEditMessage(
+  db: D1Database,
+  sessionId: string,
+  messageId: number
+): Promise<void> {
+  await trackMessage(db, sessionId, messageId);
+}
+
+export async function clearEditMessages(
+  api: Api,
+  db: D1Database,
+  chatId: number,
+  sessionId: string
+): Promise<number> {
+  try {
+    return await clearTrackedSession(api, db, chatId, sessionId);
+  } catch (err) {
+    console.warn('[Edit] clearEditMessages error:', err);
+    return 0;
+  }
+}
+
+export function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
