@@ -1,7 +1,7 @@
 // src/commands/edit/callbacks.ts
 import { type Bot } from 'grammy';
 import type { Env } from '../../types/env';
-import { githubCommitFile } from '../../lib/github';
+import { githubCommitFile, githubGetFile } from '../../lib/github';
 import { escapeHtml } from '../../lib/utils';
 import { applyEdits } from './content';
 import {
@@ -9,6 +9,9 @@ import {
   deleteEditSession,
   getEditSession,
   parseEdits,
+  trackEditMessage,
+  clearEditMessages,
+  delay,
 } from './state';
 import {
   translateEdit,
@@ -23,6 +26,8 @@ import {
   resolveField,
 } from './flow';
 import type { EditTarget } from './types';
+
+const AUTO_DELETE_DELAY_MS = 5000;
 
 async function pushEditedContent(
   env: Env,
@@ -40,8 +45,28 @@ async function pushEditedContent(
   );
 }
 
+async function showSuccessAndCleanup(
+  ctx: any,
+  env: Env,
+  sessionId: string,
+  successText: string
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const sent = await ctx.reply(successText, {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
+
+  await delay(AUTO_DELETE_DELAY_MS);
+
+  await ctx.api.deleteMessage(chatId, sent.message_id).catch(() => {});
+
+  await clearEditMessages(ctx.api, env.DB, chatId, sessionId);
+}
+
 export function setupEditCallbacks(bot: Bot, env: Env): void {
-  /* ── Pilih target ─────────────────────────────── */
   bot.callbackQuery(/^ed:t:(qimochi|yukionime)$/, async (ctx) => {
     const target = (ctx.match[1] ?? '') as EditTarget;
     if (!target) {
@@ -61,7 +86,8 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
         `✏️ <b>Edit ${targetLabel(target)}</b>\n\n` +
           `Kirim <b>slug</b> anime yang mau diedit.\n\n` +
           `<i>Contoh: <code>jujutsu-kaisen</code></i>\n\n` +
-          `🆔 <code>${sessionId}</code>`,
+          `🆔 <code>${sessionId}</code>\n\n` +
+          `<i>Semua pesan akan dihapus otomatis setelah selesai.</i>`,
         {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
@@ -69,9 +95,16 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
         }
       )
       .catch(() => {});
+
+    if (ctx.callbackQuery?.message?.message_id) {
+      await trackEditMessage(
+        env.DB,
+        sessionId,
+        ctx.callbackQuery.message.message_id
+      );
+    }
   });
 
-  /* ── Pilih field ──────────────────────────────── */
   bot.callbackQuery(/^ed:f:(ed_[a-z0-9]+):([a-zA-Z._]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const fieldKey = ctx.match[2] ?? '';
@@ -106,7 +139,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await showValuePrompt(ctx, env, session, field);
   });
 
-  /* ── Pilih value preset (choice) ──────────────── */
   bot.callbackQuery(/^ed:v:(ed_[a-z0-9]+):(\d+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const idx = parseInt(ctx.match[2] ?? '-1', 10);
@@ -140,7 +172,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await applyValueAndReturn(ctx, env, session, field, value);
   });
 
-  /* ── Balik ke menu ────────────────────────────── */
   bot.callbackQuery(/^ed:b:(ed_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const session = await getEditSession(env.DB, sessionId);
@@ -160,7 +191,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await showFieldMenu(ctx, env, session);
   });
 
-  /* ── Post edit (1 repo) ───────────────────────── */
   bot.callbackQuery(/^ed:post:(ed_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const session = await getEditSession(env.DB, sessionId);
@@ -193,6 +223,7 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       `📤 <b>Push ke ${targetLabel(session.target)}...</b>\n\n📁 <code>${escapeHtml(filePathFor(session.slug))}</code>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
+    await trackEditMessage(env.DB, sessionId, loading.message_id);
 
     const result = await pushEditedContent(
       env,
@@ -216,21 +247,17 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await deleteEditSession(env.DB, sessionId);
 
     const short = result.sha?.slice(0, 7) ?? '?';
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        `✅ <b>Posted!</b>\n\n` +
-          `🆔 <code>${escapeHtml(session.slug)}</code>\n` +
-          `📦 ${Object.keys(edits).length} field diubah\n` +
-          `🔗 Commit: <code>${short}</code>\n` +
-          `⏳ Deploy ~2 menit`,
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      )
-      .catch(() => {});
+    const successText =
+      `✅ <b>Posted!</b>\n\n` +
+      `🆔 <code>${escapeHtml(session.slug)}</code>\n` +
+      `📦 ${Object.keys(edits).length} field diubah\n` +
+      `🔗 Commit: <code>${short}</code>\n` +
+      `⏳ Deploy ~2 menit\n\n` +
+      `<i>Chat akan dibersihkan dalam 5 detik...</i>`;
+
+    await showSuccessAndCleanup(ctx, env, sessionId, successText);
   });
 
-  /* ── Sync edit (2 repo) ───────────────────────── */
   bot.callbackQuery(/^ed:sync:(ed_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const session = await getEditSession(env.DB, sessionId);
@@ -260,11 +287,11 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     const loading = await ctx.reply('🔄 <b>Sync ke 2 repo...</b>', {
       parse_mode: 'HTML',
     });
+    await trackEditMessage(env.DB, sessionId, loading.message_id);
 
     const to = oppositeTarget(session.target);
     const path = filePathFor(session.slug);
 
-    // 1. Push target (source)
     const sourceContent = applyEdits(session.base_content, edits);
     const sourceResult = await pushEditedContent(
       env,
@@ -285,8 +312,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       return;
     }
 
-    // 2. Fetch file target lain
-    const { githubGetFile } = await import('../../lib/github');
     let oppositeFile: Awaited<ReturnType<typeof githubGetFile>> = null;
     try {
       oppositeFile = await githubGetFile(env, path, to);
@@ -318,7 +343,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       return;
     }
 
-    // 3. Translate edits & apply ke opposite
     const translated: Record<string, string> = {};
     const translatedInfo: string[] = [];
 
@@ -383,27 +407,50 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     }
     lines.push('');
     lines.push(`⏳ Deploy ~2 menit`);
+    lines.push('');
+    lines.push(`<i>Chat akan dibersihkan dalam 5 detik...</i>`);
 
-    await ctx.api
-      .editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-      })
-      .catch(() => {});
+    await showSuccessAndCleanup(ctx, env, sessionId, lines.join('\n'));
   });
 
-  /* ── Batal ────────────────────────────────────── */
   bot.callbackQuery(/^ed:x:(ed_[a-z0-9]+|noop)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
-    if (sessionId && sessionId !== 'noop') {
-      await deleteEditSession(env.DB, sessionId);
+    if (!sessionId || sessionId === 'noop') {
+      await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+      await ctx
+        .editMessageText('❌ <b>Edit dibatalkan.</b>', {
+          parse_mode: 'HTML',
+          reply_markup: undefined,
+        })
+        .catch(() => {});
+      return;
     }
+
     await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+
     await ctx
       .editMessageText('❌ <b>Edit dibatalkan.</b>', {
         parse_mode: 'HTML',
         reply_markup: undefined,
       })
       .catch(() => {});
+
+    if (ctx.callbackQuery?.message?.message_id) {
+      await trackEditMessage(
+        env.DB,
+        sessionId,
+        ctx.callbackQuery.message.message_id
+      );
+    }
+
+    await delay(2000);
+    await clearEditMessages(
+      ctx.api,
+      env.DB,
+      ctx.chat!.id,
+      sessionId
+    );
+
+    await deleteEditSession(env.DB, sessionId);
   });
 }
