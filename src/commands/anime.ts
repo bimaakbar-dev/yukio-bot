@@ -545,7 +545,9 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     const kb = new InlineKeyboard()
       .text('🔗 Ambil Franchises', `an:fr:${sessionId}`)
       .row()
-      .text('📤 Post ke qimochi', `pub:an:${sessionId}`)
+      .text('📤 Post markdown', `pub:an:${sessionId}`)
+      .text('📦 Post + Franchises', `pub:anall:${sessionId}`)
+      .row()
       .text('❌ Batal', `an:x:${sessionId}`);
 
     await ctx.reply(
