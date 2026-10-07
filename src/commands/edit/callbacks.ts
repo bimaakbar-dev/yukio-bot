@@ -53,31 +53,7 @@ async function pushEditedContent(
   );
 }
 
-async function buildSyncedContent(
-  session: PendingEditRow,
-  edits: Record<string, string>
-): Promise<{ content: string; count: number } | null> {
-  const to = oppositeTarget(session.target);
-  const path = filePathFor(session.slug);
-
-  let oppositeFile: Awaited<ReturnType<typeof import('../../lib/github').githubGetFile>> = null;
-  try {
-    const { githubGetFile } = await import('../../lib/github');
-    oppositeFile = await githubGetFile(env_get(), path, to);
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
-// helper supaya TS senang — nggak dipakai di production path
-function env_get(): never {
-  throw new Error('unused');
-}
-
 export function setupEditCallbacks(bot: Bot, env: Env): void {
-  /* ── Pilih target ─────────────────────────────── */
   bot.callbackQuery(/^ed:t:(qimochi|yukionime)$/, async (ctx) => {
     const target = (ctx.match[1] ?? '') as EditTarget;
     if (!target) {
@@ -106,8 +82,7 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       )
       .catch(() => {});
   });
-
-  /* ── Pilih field ──────────────────────────────── */
+  
   bot.callbackQuery(/^ed:f:(ed_[a-z0-9]+):([a-zA-Z._]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const fieldKey = ctx.match[2] ?? '';
@@ -142,7 +117,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await showValuePrompt(ctx, env, session, field);
   });
 
-  /* ── Pilih value preset (choice) ──────────────── */
   bot.callbackQuery(/^ed:v:(ed_[a-z0-9]+):(\d+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const idx = parseInt(ctx.match[2] ?? '-1', 10);
@@ -176,7 +150,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await applyValueAndReturn(ctx, env, session, field, value);
   });
 
-  /* ── Balik ke menu ────────────────────────────── */
   bot.callbackQuery(/^ed:b:(ed_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const session = await getEditSession(env.DB, sessionId);
@@ -196,7 +169,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     await showFieldMenu(ctx, env, session);
   });
 
-  /* ── Post edit (1 repo) ───────────────────────── */
   bot.callbackQuery(/^ed:post:(ed_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const session = await getEditSession(env.DB, sessionId);
@@ -266,7 +238,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       .catch(() => {});
   });
 
-  /* ── Sync edit (2 repo) ───────────────────────── */
   bot.callbackQuery(/^ed:sync:(ed_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const session = await getEditSession(env.DB, sessionId);
@@ -300,7 +271,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
     const to = oppositeTarget(session.target);
     const path = filePathFor(session.slug);
 
-    // 1. Push target (source)
     const sourceContent = applyEdits(session.base_content, edits);
     const sourceResult = await pushEditedContent(
       env,
@@ -321,7 +291,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       return;
     }
 
-    // 2. Fetch file target lain
     const { githubGetFile } = await import('../../lib/github');
     let oppositeFile: Awaited<ReturnType<typeof githubGetFile>> = null;
     try {
@@ -354,7 +323,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       return;
     }
 
-    // 3. Translate edits & apply ke opposite
     const translated: Record<string, string> = {};
     const translatedInfo: string[] = [];
 
@@ -429,7 +397,6 @@ export function setupEditCallbacks(bot: Bot, env: Env): void {
       .catch(() => {});
   });
 
-  /* ── Batal ────────────────────────────────────── */
   bot.callbackQuery(/^ed:x:(ed_[a-z0-9]+|noop)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (sessionId && sessionId !== 'noop') {
