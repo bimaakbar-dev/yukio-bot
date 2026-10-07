@@ -23,6 +23,10 @@ import { fetchLatestEpisodeNumber, fetchEpisode } from './fetcher';
 
 const MAX_ANIME_PER_RUN = 5;
 
+/* ============================================================
+   CHUNK HELPERS
+   ============================================================ */
+
 function chunkPath(slug: string, start: number, end: number): string {
   return `src/data/anime/${slug}/episodes/${start}-${end}.json`;
 }
@@ -47,7 +51,9 @@ async function buildNewChunk(
   const newChunkStart = isNewChunk ? newEpisode.number : currentChunkStart;
   const newChunkEnd = newEpisode.number;
 
-  const oldPath = isNewChunk ? null : chunkPath(slug, currentChunkStart, currentChunkEnd);
+  const oldPath = isNewChunk
+    ? null
+    : chunkPath(slug, currentChunkStart, currentChunkEnd);
   const newPath = chunkPath(slug, newChunkStart, newChunkEnd);
 
   let existingEpisodes: EpisodeObject[] = [];
@@ -75,6 +81,55 @@ async function buildNewChunk(
   };
 }
 
+/* ============================================================
+   UPDATE MD (updatedAt field)
+   ============================================================ */
+
+async function updateQimochiMd(
+  env: Env,
+  slug: string
+): Promise<FileToCommit | null> {
+  const mdPath = `src/content/anime/${slug}.md`;
+
+  try {
+    const mdFile = await githubGetFile(env, mdPath, 'qimochi');
+    if (!mdFile) return null;
+
+    const today = new Date().toISOString().split('T')[0] ?? '2026-01-01';
+    let mdContent = mdFile.content;
+
+    if (/^updatedAt:\s*.+$/m.test(mdContent)) {
+      mdContent = mdContent.replace(
+        /^updatedAt:\s*.+$/m,
+        `updatedAt: ${today}`
+      );
+    } else if (/^addedAt:\s*.+$/m.test(mdContent)) {
+      mdContent = mdContent.replace(
+        /^(addedAt:\s*.+)$/m,
+        `$1\nupdatedAt: ${today}`
+      );
+    } else {
+      mdContent = mdContent.replace(
+        /^---\s*$/m,
+        `updatedAt: ${today}\n---`
+      );
+    }
+
+    return {
+      path: mdPath,
+      content: mdContent,
+      target: 'qimochi',
+    };
+  } catch (err) {
+    console.warn('[Runner] update md updatedAt failed:', err);
+    return null;
+  }
+}
+
+/* ============================================================
+   PROCESS 1 ANIME
+   ============================================================ */
+
 interface ProcessResult {
   pushed: number;
   error: string | null;
@@ -90,7 +145,11 @@ async function processOneAnime(
   let usedSite: SiteKey = site;
 
   if (latestEp === null && fallback_site) {
-    latestEp = await fetchLatestEpisodeNumber(env, fallback_site, source_slug);
+    latestEp = await fetchLatestEpisodeNumber(
+      env,
+      fallback_site,
+      source_slug
+    );
     if (latestEp !== null) usedSite = fallback_site;
   }
 
@@ -121,7 +180,12 @@ async function processOneAnime(
 
     let episode = await fetchEpisode(env, usedSite, source_slug, ep);
     if (!episode && usedSite !== (fallback_site ?? site)) {
-      episode = await fetchEpisode(env, fallback_site as SiteKey, source_slug, ep);
+      episode = await fetchEpisode(
+        env,
+        fallback_site as SiteKey,
+        source_slug,
+        ep
+      );
       if (episode) usedSite = fallback_site as SiteKey;
     }
 
@@ -158,6 +222,11 @@ async function processOneAnime(
       });
     }
 
+    const mdFile = await updateQimochiMd(env, slug);
+    if (mdFile) {
+      files.push(mdFile);
+    }
+
     const message = `feat(episode): add ep ${ep} for ${slug}`;
     const result = await githubCommitMultipleFiles(
       env,
@@ -170,7 +239,7 @@ async function processOneAnime(
       lastError = `Commit gagal untuk ep ${ep}: ${result.error ?? 'unknown'}`;
       break;
     }
-    
+
     const { chunkStart, chunkEnd } = await updateTrackedChunkState(
       env.DB,
       slug,
@@ -192,6 +261,10 @@ async function processOneAnime(
   return { pushed, error: lastError };
 }
 
+/* ============================================================
+   RUNNER — dipanggil dari cron handler
+   ============================================================ */
+
 export interface CronRunResult {
   animeChecked: number;
   episodesFound: number;
@@ -202,6 +275,7 @@ export interface CronRunResult {
 export async function runCron(env: Env): Promise<CronRunResult> {
   const t0 = Date.now();
   const all = await listTrackedAnime(env.DB);
+
   const inWindow = all.filter(isInScheduleWindow);
   const batch = inWindow.slice(0, MAX_ANIME_PER_RUN);
 
@@ -247,6 +321,10 @@ export async function runCron(env: Env): Promise<CronRunResult> {
     errors,
   };
 }
+
+/* ============================================================
+   MANUAL CHECK — untuk /track check
+   ============================================================ */
 
 export async function runManualCheck(
   env: Env,
