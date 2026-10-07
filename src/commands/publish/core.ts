@@ -3,6 +3,7 @@ import type { Context } from 'grammy';
 import type { Env } from '../../types/env';
 import type { CommandDefinition } from '../registry';
 import type { FileToCommit } from '../../lib/github';
+import type { AniListMedia } from '../../types/anime';
 import { escapeHtml, slugify } from '../../lib/utils';
 import { getLatestSessionByUser } from '../../lib/dba-session';
 import {
@@ -12,6 +13,7 @@ import {
   buildEpisodeFiles,
   buildFranchiseFiles,
   buildActorFiles,
+  resolveSessionBody,
 } from './builders';
 import { buildPreviewLines, buildPreviewKeyboard } from './preview';
 import { savePendingPublish } from './state';
@@ -47,15 +49,22 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
     const summary = emptySummary();
 
     /* ── Metadata → yukionime + qimochi ──────── */
-    const metaFile = await buildMetadataFile(env, session, slug);
-    if (metaFile) {
-      files.push(metaFile);
-      summary.yukionime.metadata = true;
+    let media: AniListMedia | null = null;
+    if (session.metadata) {
+      try {
+        media = JSON.parse(session.metadata) as AniListMedia;
+      } catch {}
     }
 
-    // Auto-mirror markdown tipis ke qimochi
-    const qimochiMd = buildQimochiMarkdownFromDba(session, slug);
-    if (qimochiMd) {
+    if (media) {
+      // Resolve sinopsis SEKALI (share ke yukionime + qimochi)
+      const body = await resolveSessionBody(env, session, media);
+
+      const metaFile = buildMetadataFile(session, slug, media, body);
+      files.push(metaFile);
+      summary.yukionime.metadata = true;
+
+      const qimochiMd = buildQimochiMarkdownFromDba(slug, media, body);
       files.push(qimochiMd);
     }
 
