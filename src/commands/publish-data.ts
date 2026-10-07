@@ -4,9 +4,15 @@ import type { Bot } from 'grammy';
 import { InlineKeyboard } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
-import { githubCommitFile, githubGetFile } from '../lib/github';
+import {
+  githubCommitFile,
+  githubCommitMultipleFiles,
+  githubGetFile,
+  type FileToCommit,
+} from '../lib/github';
 
 const TTL_MS = 30 * 60 * 1000;
+const CHAR_PART_SIZE = 50;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -26,11 +32,18 @@ interface PendingRow {
   user_id: number;
   slug: string;
   section: string;
-  json_data: string;
-  item_count: number;
-  target_path: string;
+  files_json: string;
+  total_items: number;
+  file_count: number;
+  total_size: number;
   created_at: number;
   expires_at: number;
+}
+
+interface PendingFile {
+  path: string;
+  content: string;
+  items: number;
 }
 
 function slugify(str: string): string {
@@ -60,9 +73,10 @@ async function ensurePendingDb(db: D1Database): Promise<void> {
             user_id     INTEGER NOT NULL,
             slug        TEXT NOT NULL,
             section     TEXT NOT NULL,
-            json_data   TEXT NOT NULL,
-            item_count  INTEGER NOT NULL,
-            target_path TEXT NOT NULL,
+            files_json  TEXT NOT NULL,
+            total_items INTEGER NOT NULL,
+            file_count  INTEGER NOT NULL,
+            total_size  INTEGER NOT NULL,
             created_at  INTEGER NOT NULL,
             expires_at  INTEGER NOT NULL
           )`
@@ -81,7 +95,14 @@ async function ensurePendingDb(db: D1Database): Promise<void> {
 
 async function savePending(
   db: D1Database,
-  data: Omit<PendingRow, 'session_id' | 'created_at' | 'expires_at'>
+  data: {
+    user_id: number;
+    slug: string;
+    section: string;
+    files: PendingFile[];
+    total_items: number;
+    total_size: number;
+  }
 ): Promise<string> {
   await ensurePendingDb(db);
   const sessionId = 'pd_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
@@ -90,17 +111,18 @@ async function savePending(
   await db
     .prepare(
       `INSERT INTO pending_data_sections
-        (session_id, user_id, slug, section, json_data, item_count, target_path, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (session_id, user_id, slug, section, files_json, total_items, file_count, total_size, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
       data.user_id,
       data.slug,
       data.section,
-      data.json_data,
-      data.item_count,
-      data.target_path,
+      JSON.stringify(data.files),
+      data.total_items,
+      data.files.length,
+      data.total_size,
       now,
       now + TTL_MS
     )
@@ -163,6 +185,122 @@ async function getSession(
     .first<SessionRow>();
 }
 
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function buildPendingFiles(
+  items: unknown[],
+  basePath: string,
+  chunkSize: number
+): PendingFile[] {
+  const chunks = chunkArray(items, chunkSize);
+  const files: PendingFile[] = [];
+
+  let cursor = 1;
+  for (const chunk of chunks) {
+    const start = cursor;
+    const end = cursor + chunk.length - 1;
+    files.push({
+      path: `${basePath}/${start}-${end}.json`,
+      content: JSON.stringify(chunk, null, 2) + '\n',
+      items: chunk.length,
+    });
+    cursor = end + 1;
+  }
+
+  return files;
+}
+
+async function previewAndSave(
+  ctx: any,
+  env: Env,
+  session: SessionRow,
+  slug: string,
+  section: string,
+  items: unknown[],
+  basePath: string,
+  chunkSize: number,
+  loadingMessageId: number,
+  extraInfo?: string
+): Promise<void> {
+  const files = buildPendingFiles(items, basePath, chunkSize);
+  const totalSize = files.reduce((sum, f) => sum + f.content.length, 0);
+
+  const pendingId = await savePending(env.DB, {
+    user_id: session.user_id,
+    slug,
+    section,
+    files,
+    total_items: items.length,
+    total_size: totalSize,
+  });
+
+  const existingCount = await countExistingFiles(env, files, 'yukio-data');
+  const sizeKB = Math.max(1, Math.round(totalSize / 1024));
+
+  const lines: string[] = [];
+  lines.push(`📋 <b>Preview: ${escapeHtml(section)}</b>`);
+  lines.push('');
+  lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
+  lines.push(`📁 <code>${escapeHtml(basePath)}/</code>`);
+  lines.push(`📏 ${sizeKB} KB total`);
+  lines.push(`📊 ${items.length} item → ${files.length} file`);
+  if (extraInfo) lines.push(extraInfo);
+  lines.push('');
+
+  if (files.length <= 5) {
+    lines.push('<b>File:</b>');
+    for (const f of files) {
+      const name = f.path.slice(f.path.lastIndexOf('/') + 1);
+      lines.push(`• <code>${escapeHtml(name)}</code> (${f.items} item)`);
+    }
+    lines.push('');
+  }
+
+  if (existingCount === files.length && files.length > 0) {
+    lines.push('⚠️ <b>Semua file sudah ada.</b> Akan di-overwrite.');
+  } else if (existingCount > 0) {
+    lines.push(`⚠️ <b>${existingCount}/${files.length} file sudah ada.</b>`);
+  } else {
+    lines.push('✅ Semua file baru.');
+  }
+
+  const kb = new InlineKeyboard()
+    .text('📤 Push ke yukio-data', `pd:push:${pendingId}`)
+    .text('❌ Batal', `pd:cancel:${pendingId}`);
+
+  await ctx.api.editMessageText(
+    ctx.chat.id,
+    loadingMessageId,
+    lines.join('\n'),
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    }
+  );
+}
+
+async function countExistingFiles(
+  env: Env,
+  files: PendingFile[],
+  target: 'yukio-data' | 'qimochi' | 'yukionime'
+): Promise<number> {
+  let count = 0;
+  for (const f of files) {
+    try {
+      const existing = await githubGetFile(env, f.path, target);
+      if (existing) count++;
+    } catch {}
+  }
+  return count;
+}
+
 async function doPublishCharacters(
   ctx: any,
   env: Env,
@@ -187,7 +325,7 @@ async function doPublishCharacters(
 
   if (!cacheRow) {
     await ctx.api.editMessageText(
-      ctx.chat!.id,
+      ctx.chat.id,
       loading.message_id,
       `❌ <b>Characters belum ada di cache.</b>\n\n` +
         `Buka <code>/dba</code> → klik <b>👥 Characters</b> dulu,\n` +
@@ -209,7 +347,7 @@ async function doPublishCharacters(
 
   if (characters.length === 0) {
     await ctx.api.editMessageText(
-      ctx.chat!.id,
+      ctx.chat.id,
       loading.message_id,
       '❌ Characters kosong di cache.',
       { parse_mode: 'HTML' }
@@ -217,53 +355,18 @@ async function doPublishCharacters(
     return;
   }
 
-  const jsonData = JSON.stringify(characters, null, 2) + '\n';
-  const targetPath = `data/anime/${slug}/characters.json`;
-
-  const pendingId = await savePending(env.DB, {
-    user_id: session.user_id,
+  await previewAndSave(
+    ctx,
+    env,
+    session,
     slug,
-    section: 'characters',
-    json_data: jsonData,
-    item_count: characters.length,
-    target_path: targetPath,
-  });
-
-  let existing: Awaited<ReturnType<typeof githubGetFile>> = null;
-  try {
-    existing = await githubGetFile(env, targetPath, 'yukio-data');
-  } catch {}
-
-  const sizeKB = Math.max(1, Math.round(jsonData.length / 1024));
-
-  const lines: string[] = [];
-  lines.push(`📋 <b>Preview: Characters</b>`);
-  lines.push('');
-  lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
-  lines.push(`📁 <code>${escapeHtml(targetPath)}</code>`);
-  lines.push(`📏 ${sizeKB} KB`);
-  lines.push(`👥 ${characters.length} karakter`);
-  lines.push(`📡 Sumber: ${escapeHtml(cacheRow.source ?? 'unknown')}`);
-  lines.push('');
-
-  if (existing) {
-    lines.push(
-      `⚠️ <b>File sudah ada!</b> (${Math.max(1, Math.round(existing.content.length / 1024))} KB)`
-    );
-    lines.push('Akan di-overwrite.');
-  } else {
-    lines.push('✅ File baru.');
-  }
-
-  const kb = new InlineKeyboard()
-    .text('📤 Push ke yukio-data', `pd:push:${pendingId}`)
-    .text('❌ Batal', `pd:cancel:${pendingId}`);
-
-  await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: kb,
-  });
+    'characters',
+    characters,
+    `data/anime/${slug}/characters`,
+    CHAR_PART_SIZE,
+    loading.message_id,
+    `📡 Sumber: ${escapeHtml(cacheRow.source ?? 'unknown')}`
+  );
 }
 
 export function setupPublishDataCallbacks(bot: Bot, env: Env): void {
@@ -321,13 +424,44 @@ export function setupPublishDataCallbacks(bot: Bot, env: Env): void {
 
     await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
 
-    const result = await githubCommitFile(
-      env,
-      pending.target_path,
-      pending.json_data,
-      `feat(${pending.section}): add for ${pending.slug}`,
-      'yukio-data'
-    );
+    let files: PendingFile[] = [];
+    try {
+      files = JSON.parse(pending.files_json) as PendingFile[];
+    } catch {
+      files = [];
+    }
+
+    if (files.length === 0) {
+      await ctx
+        .reply('❌ Tidak ada file untuk di-push.')
+        .catch(() => {});
+      return;
+    }
+
+    const message = `feat(${pending.section}): add for ${pending.slug}`;
+
+    let result: { ok: boolean; sha?: string; commitUrl?: string; error?: string };
+
+    if (files.length === 1) {
+      result = await githubCommitFile(
+        env,
+        files[0]!.path,
+        files[0]!.content,
+        message,
+        'yukio-data'
+      );
+    } else {
+      const payload: FileToCommit[] = files.map((f) => ({
+        path: f.path,
+        content: f.content,
+      }));
+      result = await githubCommitMultipleFiles(
+        env,
+        payload,
+        message,
+        'yukio-data'
+      );
+    }
 
     if (!result.ok) {
       await ctx
@@ -346,8 +480,8 @@ export function setupPublishDataCallbacks(bot: Bot, env: Env): void {
     await ctx
       .editMessageText(
         `✅ <b>Published!</b>\n\n` +
-          `📁 <code>${escapeHtml(pending.target_path)}</code>\n` +
-          `📊 ${pending.item_count} item\n` +
+          `📁 <code>data/anime/${escapeHtml(pending.slug)}/${escapeHtml(pending.section)}/</code>\n` +
+          `📦 ${pending.file_count} file · ${pending.total_items} item\n` +
           `🔗 Commit: <code>${commitShort}</code>\n` +
           `⏳ Deploy ~2 menit`,
         {
