@@ -22,10 +22,6 @@ import {
   RELATION_FETCH_TIMEOUT_MS,
 } from './types';
 
-/* ============================================================
-   SANITIZERS
-   ============================================================ */
-
 function hasText(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0;
 }
@@ -89,10 +85,6 @@ function sanitizeActor(va: VoiceActorRow): CleanActor {
   return out;
 }
 
-/* ============================================================
-   AI REWRITE SYNOPSIS
-   ============================================================ */
-
 async function rewriteSynopsisToId(
   env: Env,
   title: string,
@@ -127,10 +119,6 @@ async function rewriteSynopsisToId(
   return null;
 }
 
-/* ============================================================
-   QIMOCHI YAML HELPERS
-   ============================================================ */
-
 function escapeQimochiYaml(s: string): string {
   const cleaned = s.replace(/\n/g, ' ').trim();
   const needsQuote =
@@ -141,48 +129,40 @@ function escapeQimochiYaml(s: string): string {
   return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
-/* ============================================================
-   BUILDERS — yukionime
-   ============================================================ */
-
-export async function buildMetadataFile(
+export async function resolveSessionBody(
   env: Env,
   session: DbaSessionRow,
-  slug: string
-): Promise<FileToCommit | null> {
-  if (!session.metadata) return null;
-
-  let media: AniListMedia;
-  try {
-    media = JSON.parse(session.metadata) as AniListMedia;
-  } catch {
-    return null;
+  media: AniListMedia
+): Promise<string> {
+  if (session.summary && session.summary.trim().length > 50) {
+    return session.summary.trim();
   }
 
+  const raw = media.description ?? '';
+  if (raw.length < 30) {
+    return '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.';
+  }
+
+  const clean = stripHtml(raw);
+  if (looksIndonesian(clean)) {
+    return clean;
+  }
+
+  const aiBody = await rewriteSynopsisToId(env, session.title, clean);
+  return aiBody ?? clean;
+}
+
+export function buildMetadataFile(
+  session: DbaSessionRow,
+  slug: string,
+  media: AniListMedia,
+  body: string
+): FileToCommit {
   const yaml = buildMetadataYaml({
     media,
     malId: session.mal_id ?? null,
     kitsuId: session.kitsu_id ?? null,
   });
-
-  let body: string;
-
-  if (session.summary && session.summary.trim().length > 50) {
-    body = session.summary.trim();
-  } else {
-    const raw = media.description ?? '';
-    if (raw.length < 30) {
-      body = '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.';
-    } else {
-      const clean = stripHtml(raw);
-      if (looksIndonesian(clean)) {
-        body = clean;
-      } else {
-        const aiBody = await rewriteSynopsisToId(env, session.title, clean);
-        body = aiBody ?? clean;
-      }
-    }
-  }
 
   return {
     path: `src/content/anime/${slug}.md`,
@@ -191,23 +171,11 @@ export async function buildMetadataFile(
   };
 }
 
-/* ============================================================
-   BUILDERS — qimochi (mirror tipis dari DBA)
-   ============================================================ */
-
 export function buildQimochiMarkdownFromDba(
-  session: DbaSessionRow,
-  slug: string
-): FileToCommit | null {
-  if (!session.metadata) return null;
-
-  let media: AniListMedia;
-  try {
-    media = JSON.parse(session.metadata) as AniListMedia;
-  } catch {
-    return null;
-  }
-
+  slug: string,
+  media: AniListMedia,
+  body: string
+): FileToCommit {
   const STATUS_MAP: Record<string, string> = {
     RELEASING: 'Ongoing',
     FINISHED: 'Completed',
@@ -264,14 +232,6 @@ export function buildQimochiMarkdownFromDba(
     '---',
   ];
 
-  let body: string;
-  if (session.summary && session.summary.trim().length > 50) {
-    body = session.summary.trim();
-  } else {
-    const raw = stripHtml(media.description ?? '');
-    body = raw.length >= 30 ? raw : '> ⚠️ Sinopsis belum tersedia.';
-  }
-
   return {
     path: `src/content/anime/${slug}.md`,
     content: `${yamlLines.join('\n')}\n\n${body}\n`,
@@ -279,10 +239,6 @@ export function buildQimochiMarkdownFromDba(
     itemCount: 1,
   };
 }
-
-/* ============================================================
-   BUILDERS — yukio-data
-   ============================================================ */
 
 export async function buildCharacterFiles(
   env: Env,
