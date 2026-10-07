@@ -1,0 +1,72 @@
+name: Patch wrangler.toml
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write wrangler.toml
+        run: |
+          cat > wrangler.toml << 'EOF'
+          name = "yukio-bot"
+          main = "src/index.ts"
+          compatibility_date = "2026-01-01"
+          compatibility_flags = ["nodejs_compat"]
+
+          [ai]
+          binding = "AI"
+
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "yukio-db"
+          database_id = "8b0b931d-b4f7-41c0-885b-6e90c11c8bb7"
+
+          [observability]
+          enabled = true
+
+          [triggers]
+          crons = ["0 3 * * *", "0 22 * * *", "0 6 * * *", "0 14 * * *", "0 17 * * *"]
+
+          [vars]
+          ADMIN_USER_ID = "1605070949"
+          BUSINESS_OWNER_ID = "1605070949"
+          DISCORD_PUBLIC_KEY = "27f6ff67480b1af5ab5d8cd34139ca28834a2b70c85ce09170f146e803822f21"
+          VAL_TOWN_FETCH_URL = "https://yukio-anime.val.run/"
+
+          GITHUB_REPO = "bimaakbar-dev/qimochi"
+          GITHUB_BRANCH = "main"
+
+          YUKIONIME_REPO = "bimaakbar-dev/yukionime"
+          YUKIONIME_BRANCH = "main"
+
+          YUKIO_DATA_REPO = "bimaakbar-dev/yukio-data"
+          YUKIO_DATA_BRANCH = "main"
+
+          GH_APP_ID = "5219871"
+          GH_APP_INSTALLATION_ID = "168750287"
+          EOF
+
+      - name: Verify
+        run: |
+          echo "=== New wrangler.toml ==="
+          cat wrangler.toml
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add wrangler.toml
+          if git diff --staged --quiet; then
+            echo "No changes."
+          else
+            git commit -m "chore: patch wrangler.toml crons [skip ci]"
+            git push
+          fi
