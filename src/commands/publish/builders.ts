@@ -22,6 +22,10 @@ import {
   RELATION_FETCH_TIMEOUT_MS,
 } from './types';
 
+/* ============================================================
+   SANITIZERS
+   ============================================================ */
+
 function hasText(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0;
 }
@@ -85,6 +89,10 @@ function sanitizeActor(va: VoiceActorRow): CleanActor {
   return out;
 }
 
+/* ============================================================
+   AI REWRITE SYNOPSIS
+   ============================================================ */
+
 async function rewriteSynopsisToId(
   env: Env,
   title: string,
@@ -118,6 +126,24 @@ async function rewriteSynopsisToId(
   if (data && data.length > 50) return data.trim();
   return null;
 }
+
+/* ============================================================
+   QIMOCHI YAML HELPERS
+   ============================================================ */
+
+function escapeQimochiYaml(s: string): string {
+  const cleaned = s.replace(/\n/g, ' ').trim();
+  const needsQuote =
+    /[:#&*!|>'"%@`{}\[\],]/.test(cleaned) ||
+    cleaned === '' ||
+    /^\d/.test(cleaned);
+  if (!needsQuote) return cleaned;
+  return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/* ============================================================
+   BUILDERS — yukionime
+   ============================================================ */
 
 export async function buildMetadataFile(
   env: Env,
@@ -164,6 +190,99 @@ export async function buildMetadataFile(
     target: 'yukionime',
   };
 }
+
+/* ============================================================
+   BUILDERS — qimochi (mirror tipis dari DBA)
+   ============================================================ */
+
+export function buildQimochiMarkdownFromDba(
+  session: DbaSessionRow,
+  slug: string
+): FileToCommit | null {
+  if (!session.metadata) return null;
+
+  let media: AniListMedia;
+  try {
+    media = JSON.parse(session.metadata) as AniListMedia;
+  } catch {
+    return null;
+  }
+
+  const STATUS_MAP: Record<string, string> = {
+    RELEASING: 'Ongoing',
+    FINISHED: 'Completed',
+    NOT_YET_RELEASED: 'Ongoing',
+    CANCELLED: 'Hiatus',
+    HIATUS: 'Hiatus',
+  };
+
+  const FORMAT_MAP: Record<string, string> = {
+    TV: 'TV',
+    TV_SHORT: 'TV',
+    MOVIE: 'Movie',
+    SPECIAL: 'Special',
+    OVA: 'OVA',
+    ONA: 'ONA',
+    MUSIC: 'Special',
+  };
+
+  const status = STATUS_MAP[media.status] ?? 'Ongoing';
+  const type = FORMAT_MAP[media.format] ?? 'TV';
+
+  const genres = (media.genres ?? [])
+    .filter((g) => g && g.trim())
+    .map((g) => g.charAt(0).toUpperCase() + g.slice(1));
+
+  const studio = media.studios?.nodes?.[0]?.name ?? 'Unknown';
+
+  const y = media.startDate?.year ?? media.seasonYear;
+  const mo = media.startDate?.month ?? 1;
+  const d = media.startDate?.day ?? 1;
+  const releaseDate = y
+    ? `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+    : new Date().toISOString().split('T')[0] ?? '2026-01-01';
+
+  const addedAt = new Date().toISOString().split('T')[0] ?? '2026-01-01';
+  const rating =
+    typeof media.averageScore === 'number' && media.averageScore > 0
+      ? (media.averageScore / 10).toFixed(1)
+      : '0.0';
+
+  const cover = media.coverImage.extraLarge || media.coverImage.large || '';
+
+  const yamlLines: string[] = [
+    '---',
+    `title: ${escapeQimochiYaml(media.title.romaji || 'Unknown')}`,
+    `cover: ${cover}`,
+    `status: ${status}`,
+    `type: ${type}`,
+    `genre: [${genres.join(', ')}]`,
+    `studio: ${escapeQimochiYaml(studio)}`,
+    `releaseDate: ${releaseDate}`,
+    `addedAt: ${addedAt}`,
+    `rating: ${rating}`,
+    '---',
+  ];
+
+  let body: string;
+  if (session.summary && session.summary.trim().length > 50) {
+    body = session.summary.trim();
+  } else {
+    const raw = stripHtml(media.description ?? '');
+    body = raw.length >= 30 ? raw : '> ⚠️ Sinopsis belum tersedia.';
+  }
+
+  return {
+    path: `src/content/anime/${slug}.md`,
+    content: `${yamlLines.join('\n')}\n\n${body}\n`,
+    target: 'qimochi',
+    itemCount: 1,
+  };
+}
+
+/* ============================================================
+   BUILDERS — yukio-data
+   ============================================================ */
 
 export async function buildCharacterFiles(
   env: Env,
