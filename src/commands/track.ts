@@ -161,11 +161,55 @@ export const trackCommand: CommandDefinition = {
       return;
     }
 
+        /* ── /track check <slug> ─────────────────── */
     if (sub === 'check') {
-      await ctx.reply(
-        '🚧 <i>Manual check akan tersedia di Fase B.</i>',
-        { parse_mode: 'HTML' }
+      const slug = parts[1];
+      if (!slug) {
+        await ctx.reply('Usage: <code>/track check &lt;slug&gt;</code>', {
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+
+      const loading = await ctx.reply(
+        `🔍 Cek <code>${escapeHtml(slug)}</code>...`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
+
+      try {
+        const { runManualCheck } = await import('../lib/cron/runner');
+        const result = await runManualCheck(env, slug);
+
+        const lines: string[] = [];
+        lines.push(`📡 <b>Manual Check: ${escapeHtml(slug)}</b>`);
+        lines.push('');
+        lines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
+        lines.push(`📼 Push: <b>${result.episodesPushed}</b> episode baru`);
+
+        if (result.errors.length > 0) {
+          lines.push('');
+          lines.push(`⚠️ <b>Error:</b>`);
+          for (const e of result.errors) {
+            lines.push(`• <code>${escapeHtml(e.slice(0, 200))}</code>`);
+          }
+        }
+
+        await ctx.api
+          .editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          })
+          .catch(() => {});
+      } catch (err: any) {
+        await ctx.api
+          .editMessageText(
+            ctx.chat!.id,
+            loading.message_id,
+            `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+            { parse_mode: 'HTML' }
+          )
+          .catch(() => {});
+      }
       return;
     }
 
