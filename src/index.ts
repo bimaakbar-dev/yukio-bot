@@ -273,6 +273,36 @@ return new Response(
       }
     }
 
+if (url.pathname === '/debug/gh-app') {
+  try {
+    const { getInstallationToken } = await import('./lib/github-app');
+    const token = await getInstallationToken(env);
+
+    return new Response(
+      JSON.stringify(
+        {
+          ok: true,
+          tokenPreview: token.slice(0, 20) + '...',
+          tokenLength: token.length,
+          appId: env.GH_APP_ID,
+          installationId: env.GH_APP_INSTALLATION_ID,
+        },
+        null,
+        2
+      ),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (err: any) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: err?.message ?? String(err),
+      }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+}
+
     if (url.pathname === '/discord/register') {
       return registerDiscordCommands(env);
     }
