@@ -17,11 +17,11 @@ import {
   publishAnimeCommand,
   publishBatchCommand,
   batchResetCommand,
-} from './publish-legacy';
+  publishCommand,
+} from './publish';
 import { publishFranchisesCommand } from './franchises';
 import { publishDbaCommand } from './publish-dba';
 import { publishDataCommand } from './publish-data';
-import { publishCommand } from './publish';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
