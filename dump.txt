@@ -1,6 +1,6 @@
 === REPO DUMP ===
-Generated: Tue Oct  6 19:19:26 UTC 2026
-Commit: bff7fc1
+Generated: Wed Oct  7 07:47:38 UTC 2026
+Commit: 63094f1
 
 === STRUCTURE ===
 .
@@ -26,9 +26,13 @@ Commit: bff7fc1
 ./src/commands/clearcache.ts
 ./src/commands/database-anime.ts
 ./src/commands/decode.ts
+./src/commands/franchises.ts
 ./src/commands/help.ts
 ./src/commands/list.ts
 ./src/commands/ping.ts
+./src/commands/publish-data.ts
+./src/commands/publish-dba.ts
+./src/commands/publish.ts
 ./src/commands/registry.ts
 ./src/commands/status.ts
 ./src/commands/va.ts
@@ -42,9 +46,12 @@ Commit: bff7fc1
 ./src/lib/cache.ts
 ./src/lib/dba-characters.ts
 ./src/lib/dba-common.ts
+./src/lib/dba-episodes.ts
 ./src/lib/dba-metadata.ts
 ./src/lib/dba-session.ts
 ./src/lib/dba-voice-actors.ts
+./src/lib/github-app.ts
+./src/lib/github.ts
 ./src/lib/http.ts
 ./src/lib/permissions.ts
 ./src/lib/telegram-utils.ts
@@ -830,7 +837,6 @@ async function checkYukionime(
     const detail = await getYukionimeDetail(match.id);
     const synopsis = detail?.synopsis ?? null;
 
-    // Merge: pakai detail (lebih lengkap) + synopsis dari scrape
     const merged: YukionimeAnime = {
       ...match,
       ...(detail ?? {}),
@@ -932,17 +938,12 @@ export const animeCommand: CommandDefinition = {
       const yukionime = await checkYukionime(searchQuery);
 
       if (yukionime.match && yukionime.complete) {
-        // === DATA LENGKAP → LANGSUNG PAKAI ===
-        console.log(
-          '[Anime] yukionime complete — skip AniList'
-        );
+        console.log('[Anime] yukionime complete — skip AniList');
 
-        // Hapus loading
         await ctx.api
           .deleteMessage(ctx.chat!.id, loading.message_id)
           .catch(() => {});
 
-        // Kirim warning + info
         await ctx.reply(
           buildYukionimeWarning(
             yukionime.match,
@@ -955,13 +956,11 @@ export const animeCommand: CommandDefinition = {
           }
         );
 
-        // Convert yukionime → AniListMedia
         const media = yukionimeToAniListMedia({
           ...yukionime.match,
           synopsis: yukionime.synopsis,
         });
 
-        // Build result TANPA AI enrichment
         const result = buildQimochiHubResult(media, null);
         const slug = yukionime.match.id;
 
@@ -993,7 +992,6 @@ export const animeCommand: CommandDefinition = {
         return;
       }
 
-      // Yukionime ada tapi tidak lengkap → warning, lanjut AniList
       if (yukionime.match) {
         await ctx.reply(
           buildYukionimeWarning(
@@ -1064,7 +1062,7 @@ export const animeCommand: CommandDefinition = {
       );
 
       /* ========================================================
-         STEP 3: DETECT MISSING (+ skip synopsis kalau ada yukionime)
+         STEP 3: DETECT MISSING
          ======================================================== */
       let need = detectMissing(media);
 
@@ -1145,7 +1143,6 @@ export const animeCommand: CommandDefinition = {
       const { yaml, body, missing } = result;
       let aiUsed = result.aiUsed;
 
-      // Ganti label AI → "dari Yukionime" kalau pakai synopsis yukionime
       if (yukionime.synopsis) {
         aiUsed = aiUsed.map((f) =>
           f === 'synopsis' ? 'synopsis (dari Yukionime)' : f
@@ -1293,7 +1290,26 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
       await ctx.reply(session.source_label);
     }
 
-    await deleteSession(env.DB, sessionId);
+    // ✅ NEW: Tombol Publish ke Web
+    const targetPath = `src/content/anime/${slug}.md`;
+
+    const pubKb = new InlineKeyboard()
+      .text('📤 Publish ke Web', `pub:an:${sessionId}`)
+      .text('❌ Batal', `pub:skip:${sessionId}`);
+
+    await ctx.reply(
+      `✅ <b>Review selesai?</b>\n\n` +
+        `📁 Target:\n<code>${escapeHtml(targetPath)}</code>\n\n` +
+        `Kalau cocok, klik tombol Publish di bawah.`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: pubKb,
+      }
+    );
+
+    // ⚠️ Session TIDAK dihapus di sini — dibutuhkan oleh publish handler
+    // Session dihapus otomatis setelah push sukses atau user klik Batal
   });
 
   bot.callbackQuery(/^an:x:([a-f0-9]+)$/, async (ctx) => {
@@ -1321,7 +1337,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
   });
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/commands/clearcache.ts =====
@@ -1437,6 +1452,7 @@ import {
   getSession,
   getLatestSessionByUser,
   updateSessionMetadata,
+  updateSessionSummary,
   deleteSession,
   type SessionRow,
 } from '../lib/dba-session';
@@ -1456,6 +1472,7 @@ import {
   markPartSent,
   CHAR_PART_SIZE,
 } from '../lib/dba-characters';
+import { saveEpCache } from '../lib/dba-episodes';
 import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
@@ -1824,9 +1841,6 @@ async function handleMetadataMerge(
    ============================================================ */
 
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
-  /* ========================================================
-     PART HANDLER (per-part characters)
-     ======================================================== */
   bot.callbackQuery(
     /^qd:cp:(\d+):(q_[a-f0-9]+)$/,
     async (ctx) => {
@@ -1878,7 +1892,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       const numParts = countParts(cache.total);
 
-      // Kirim part
       await sendJsonSection(
         ctx,
         `Characters ${part.start}-${part.end} dari ${cache.total} — ${session.title} [${partIndex + 1}/${numParts}]`,
@@ -1886,14 +1899,10 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         tracker
       );
 
-      // Mark part as sent
       await markPartSent(env.DB, sessionId, partIndex);
     }
   );
 
-  /* ========================================================
-     MAIN ACTIONS
-     ======================================================== */
   bot.callbackQuery(
     /^qd:(ms|mk|mo|m|c|e|f|s|v|x):(q_[a-f0-9]+)$/,
     async (ctx) => {
@@ -1922,7 +1931,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === BATAL ===
       if (action === 'x') {
         await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
         const chatId = ctx.chat?.id;
@@ -1944,7 +1952,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === SELESAI (metadata) ===
       if (action === 'mo') {
         await ctx.answerCallbackQuery({ text: '✅ Selesai!' });
         await ctx
@@ -1953,7 +1960,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === METADATA → Shikimori ===
       if (action === 'ms') {
         await ctx.answerCallbackQuery({ text: '📡 Cari Shikimori...' });
         const tracker: Tracker = (msgId) =>
@@ -1962,7 +1968,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === METADATA → Kitsu ===
       if (action === 'mk') {
         await ctx.answerCallbackQuery({ text: '📡 Cari Kitsu...' });
         const tracker: Tracker = (msgId) =>
@@ -1971,7 +1976,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === VOICE ACTORS redirect ===
       if (action === 'v') {
         await ctx.answerCallbackQuery({ text: '🎤 Buka menu Voice Actors...' });
         await showVaMenu(ctx, env);
@@ -1986,15 +1990,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
       try {
         const chainCtx = buildChainContext(session);
 
-        /* ---------- METADATA ---------- */
         if (action === 'm') {
           await handleMetadataShow(ctx, env, session, tracker);
           return;
         }
 
-        /* ---------- CHARACTERS ---------- */
         if (action === 'c') {
-          // Cek cache dulu
           const cached = await getCharCache(env.DB, sessionId);
 
           if (cached) {
@@ -2019,7 +2020,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             return;
           }
 
-          // Belum ada cache → fetch dari chain
           const { data: result, error } = await safeFetch(
             () => chainCharacters(chainCtx),
             CHAR_FETCH_TIMEOUT_MS
@@ -2040,7 +2040,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           const vas = result.voiceActors;
           const source = result.source;
 
-          // Simpan VA
           let vaResult = { newCount: 0, skippedCount: 0 };
           if (vas.length > 0) {
             try {
@@ -2050,14 +2049,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             }
           }
 
-          // Simpan cache karakter
           try {
             await saveCharCache(env.DB, sessionId, chars, vas, source);
           } catch (err) {
             console.warn('[DBA] Gagal simpan cache chars:', err);
           }
 
-          // Tampilkan menu part
           const total = chars.length;
           const numParts = countParts(total);
           const kb = buildPartsKeyboard(sessionId, total);
@@ -2081,7 +2078,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        /* ---------- EPISODES ---------- */
         if (action === 'e') {
           const { data: result, error } = await safeFetch(
             () => chainEpisodes(chainCtx),
@@ -2100,6 +2096,24 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           }
 
           const eps = result.data;
+
+          try {
+            await saveEpCache(
+              env.DB,
+              sessionId,
+              eps.map((e) => ({
+                number: e.number,
+                title: e.title,
+                aired: e.aired,
+                duration: e.duration,
+              })),
+              result.source,
+              result.truncated ?? false
+            );
+          } catch (err) {
+            console.warn('[DBA] Gagal simpan ep cache:', err);
+          }
+
           const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
 
           await sendJsonSection(
@@ -2111,7 +2125,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        /* ---------- FRANCHISES ---------- */
         if (action === 'f') {
           const { data: result, error } = await safeFetch(
             () => chainRelations(chainCtx),
@@ -2138,7 +2151,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        /* ---------- SUMMARY ---------- */
         if (action === 's') {
           let result;
           try {
@@ -2159,6 +2171,13 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           );
 
           const body = ai ?? raw ?? 'Tulis sinopsis manual...';
+
+          try {
+            await updateSessionSummary(env.DB, sessionId, body);
+          } catch (err) {
+            console.warn('[DBA] Gagal simpan summary:', err);
+          }
+
           await sendTextSection(
             ctx,
             `Summary — ${session.title}`,
@@ -2189,15 +2208,16 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
     }
   );
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/commands/decode.ts =====
 // src/commands/decode.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
+import { InlineKeyboard } from 'grammy';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import { startOrAppendBatch } from './publish';
 
 const MAX_INPUT_LEN = 8000;
 const MAX_FILE_CHARS = 2 * 1024 * 1024;
@@ -2207,7 +2227,7 @@ const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
 const MSG_BUDGET = 3800;
 const JSON_INLINE_THRESHOLD = 3500;
-const BATCH_MAX = 30;
+const BATCH_MAX = 6;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -2691,8 +2711,8 @@ function extractNextJsEmbeds(html: string): RawEntry[] {
 
   for (const m of html.matchAll(RSC_EMBED_RE)) {
     const quality = m[1] ?? '';
-    const mirror  = m[2] ?? '';
-    let link      = m[3] ?? '';
+    const mirror = m[2] ?? '';
+    let link = m[3] ?? '';
 
     if (!link) continue;
 
@@ -3333,10 +3353,14 @@ async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void>
 // BATCH
 // =================================================================
 
+function extractSlugHint(url: string): string | null {
+  const m = url.match(/\/tonton\/([^/]+)/i);
+  return m?.[1] ?? null;
+}
+
 function buildBatchUrls(input: string, start: number, end: number): string[] {
   const urls: string[] = [];
 
-  // 1. Template dengan {n}
   if (input.includes('{n}')) {
     for (let n = start; n <= end; n++) {
       urls.push(input.replace(/\{n\}/g, String(n)));
@@ -3344,7 +3368,6 @@ function buildBatchUrls(input: string, start: number, end: number): string[] {
     return urls;
   }
 
-  // 2. URL yang sudah ada "episode-N" → ganti dengan pattern baru
   const epMatch = input.match(/(episode|eps?|e)[-_]?0*\d+/i);
   if (epMatch && epMatch.index !== undefined) {
     const prefix = input.slice(0, epMatch.index);
@@ -3355,7 +3378,6 @@ function buildBatchUrls(input: string, start: number, end: number): string[] {
     return urls;
   }
 
-  // 3. Base URL → append episode-{n}-sub-indo
   const base = input.replace(/\/+$/, '');
   for (let n = start; n <= end; n++) {
     urls.push(`${base}/episode-${n}-sub-indo`);
@@ -3372,12 +3394,12 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
         '<b>Usage:</b>\n' +
         '<code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n\n' +
         '<b>Contoh 1 (base URL):</b>\n' +
-        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>\n\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 1-6</code>\n\n' +
         '<b>Contoh 2 (pakai placeholder):</b>\n' +
-        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-{n}-sub-indo 7-12</code>\n\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-{n}-sub-indo 1-6</code>\n\n' +
         '<b>Contoh 3 (URL episode existing):</b>\n' +
         '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-6-sub-indo 7-12</code>\n\n' +
-        `<i>Max ${BATCH_MAX} episode per batch.</i>`,
+        `<i>Max ${BATCH_MAX} episode per batch. Bisa ditambah pakai ➕ Tambah Batch.</i>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
     return;
@@ -3388,7 +3410,7 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
     await ctx.reply(
       '❌ Format salah.\n\n' +
         'Usage: <code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n' +
-        'Contoh: <code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>',
+        'Contoh: <code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 1-6</code>',
       { parse_mode: 'HTML' }
     );
     return;
@@ -3399,7 +3421,7 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
   const end = parseInt(m[3] ?? '0', 10);
 
   if (start < 1 || end < start) {
-    await ctx.reply('❌ Range tidak valid. Contoh: <code>7-12</code>', {
+    await ctx.reply('❌ Range tidak valid. Contoh: <code>1-6</code>', {
       parse_mode: 'HTML',
     });
     return;
@@ -3407,7 +3429,13 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
 
   const total = end - start + 1;
   if (total > BATCH_MAX) {
-    await ctx.reply(`❌ Max ${BATCH_MAX} episode per batch (kamu minta ${total}).`);
+    await ctx.reply(
+      `❌ Max ${BATCH_MAX} episode per batch (kamu minta ${total}).\n\n` +
+        `<i>Kirim 2x, contoh:</i>\n` +
+        `<code>/batch ${input} ${start}-${start + BATCH_MAX - 1}</code>\n` +
+        `<code>/batch ${input} ${start + BATCH_MAX}-${end}</code>`,
+      { parse_mode: 'HTML' }
+    );
     return;
   }
 
@@ -3425,7 +3453,6 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
     const n = start + i;
     const url = urls[i]!;
 
-    // Update progress
     try {
       await ctx.api.editMessageText(
         ctx.chat!.id,
@@ -3457,53 +3484,88 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
 
   results.sort((a, b) => a.number - b.number);
 
-  const combinedJson = JSON.stringify(results, null, 2) + '\n';
+  await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
 
-  const totalUrls = results.reduce(
-    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
-    0
-  );
-
-  const filename = `batch-${start}-${end}.json`;
-
-  const captionLines = [
-    `✅ <b>Batch selesai!</b>`,
-    `📊 Berhasil: <b>${results.length}/${total}</b> episode`,
-    `🎬 Total URL: <b>${totalUrls}</b>`,
-  ];
-  if (errors.length > 0) {
-    captionLines.push('');
-    captionLines.push(`⚠️ <b>Gagal (${errors.length}):</b>`);
-    for (const e of errors.slice(0, 10)) {
-      captionLines.push(`• Ep ${e.number}: <code>${escapeHtml(e.error)}</code>`);
-    }
-    if (errors.length > 10) {
-      captionLines.push(`<i>...dan ${errors.length - 10} lainnya</i>`);
-    }
+  if (results.length === 0) {
+    await ctx.reply(
+      `❌ Tidak ada episode yang berhasil di-fetch.\n\n` +
+        (errors.length > 0
+          ? `<b>Error:</b>\n` +
+            errors
+              .slice(0, 5)
+              .map((e) => `• Ep ${e.number}: <code>${escapeHtml(e.error)}</code>`)
+              .join('\n')
+          : ''),
+      { parse_mode: 'HTML' }
+    );
+    return;
   }
 
-  const caption = captionLines.join('\n');
+  if (!ctx.from?.id) return;
+
+  const slugHint = extractSlugHint(input);
 
   try {
-    await sendDocumentViaApi(
-      env.TELEGRAM_BOT_TOKEN,
-      ctx.chat!.id,
-      filename,
-      combinedJson,
-      caption
+    const result = await startOrAppendBatch(env.DB, ctx.from.id, {
+      slugHint,
+      newEpisodes: results,
+      errors: errors.map((e) => `Ep ${e.number}: ${e.error}`),
+    });
+
+    const kb = new InlineKeyboard()
+      .text('➕ Tambah Batch', `pub:baadd:${result.sessionId}`)
+      .text('📤 Publish', `pub:ba:${result.sessionId}`)
+      .row()
+      .text('❌ Batal', `pub:bax:${result.sessionId}`);
+
+    const lines: string[] = [];
+    lines.push(`✅ <b>Batch ${start}-${end} selesai</b>`);
+    lines.push('');
+
+    if (slugHint) lines.push(`🎬 <code>${escapeHtml(slugHint)}</code>`);
+
+    if (result.mode === 'reset_and_created') {
+      lines.push(`⚠️ <i>Session lama di-reset (slug berbeda).</i>`);
+    }
+
+    lines.push(
+      `📦 Episode terkumpul: <b>${result.totalEpisodes}</b> (Ep ${result.minEp}-${result.maxEp})`
     );
-    await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+    lines.push(`🎬 Total URL: <b>${result.totalUrls}</b>`);
+
+    if (result.skipped.length > 0) {
+      lines.push('');
+      lines.push(`⏭️ Skip (sudah ada): Ep ${result.skipped.join(', ')}`);
+      if (result.added.length > 0) {
+        lines.push(`➕ Baru: Ep ${result.added.join(', ')}`);
+      }
+    }
+
+    if (errors.length > 0) {
+      lines.push('');
+      lines.push(`⚠️ Gagal: ${errors.length} episode`);
+      for (const e of errors.slice(0, 3)) {
+        lines.push(`   • Ep ${e.number}: ${escapeHtml(e.error.slice(0, 40))}`);
+      }
+      if (errors.length > 3) {
+        lines.push(`   <i>...dan ${errors.length - 3} lainnya</i>`);
+      }
+    }
+
+    lines.push('');
+    lines.push(`🆔 <code>${result.sessionId}</code>`);
+
+    await ctx.reply(lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    });
   } catch (err: any) {
-    console.error('[Batch] sendDocument failed:', err);
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        `❌ Gagal kirim file: <code>${escapeHtml(err?.message ?? 'unknown')}</code>\n\n` +
-          caption,
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      )
-      .catch(() => {});
+    console.error('[Batch] save session error:', err);
+    await ctx.reply(
+      `❌ Gagal simpan session: <code>${escapeHtml(err?.message ?? 'unknown')}</code>`,
+      { parse_mode: 'HTML' }
+    );
   }
 }
 
@@ -3693,6 +3755,407 @@ export const deleteCommand: CommandDefinition = {
 };
 ===== END FILE =====
 
+===== FILE: ./src/commands/franchises.ts =====
+// src/commands/franchises.ts
+import type { CommandDefinition } from './registry';
+import type { Context } from 'grammy';
+import { InlineKeyboard, type Bot } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+import { githubCommitFile, githubGetFile } from '../lib/github';
+import { chainRelations } from '../services/qimochi-chain-extras';
+
+const TTL_MS = 30 * 60 * 1000;
+
+const HIDDEN_RELATIONS = new Set([
+  'character',
+  'adaptation',
+  'contains',
+  'other',
+]);
+
+const RELATION_LABEL: Record<string, string> = {
+  sequel: 'Sekuel',
+  prequel: 'Prekuel',
+  side_story: 'Cerita Sampingan',
+  parent_story: 'Cerita Induk',
+  alternative: 'Versi Alternatif',
+  spin_off: 'Spin-off',
+  summary: 'Ringkasan',
+  full_story: 'Cerita Lengkap',
+  compilation: 'Kompilasi',
+};
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS pending_franchises (
+            session_id     TEXT PRIMARY KEY,
+            user_id        INTEGER NOT NULL,
+            slug           TEXT NOT NULL,
+            json_data      TEXT NOT NULL,
+            relation_count INTEGER NOT NULL,
+            created_at     INTEGER NOT NULL,
+            expires_at     INTEGER NOT NULL
+          )`
+        )
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[Franchises] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+interface PendingRow {
+  session_id: string;
+  user_id: number;
+  slug: string;
+  json_data: string;
+  relation_count: number;
+  created_at: number;
+  expires_at: number;
+}
+
+async function savePending(
+  db: D1Database,
+  userId: number,
+  slug: string,
+  jsonData: string,
+  relationCount: number
+): Promise<string> {
+  await ensureDb(db);
+  const sessionId = 'f_' + crypto.randomUUID().replace(/-/g, '').slice(0, 14);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO pending_franchises
+        (session_id, user_id, slug, json_data, relation_count, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(sessionId, userId, slug, jsonData, relationCount, now, now + TTL_MS)
+    .run();
+
+  return sessionId;
+}
+
+async function getPending(
+  db: D1Database,
+  sessionId: string
+): Promise<PendingRow | null> {
+  await ensureDb(db);
+
+  const row = await db
+    .prepare('SELECT * FROM pending_franchises WHERE session_id = ?')
+    .bind(sessionId)
+    .first<PendingRow>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM pending_franchises WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return row;
+}
+
+async function deletePending(db: D1Database, sessionId: string): Promise<void> {
+  try {
+    await ensureDb(db);
+    await db
+      .prepare('DELETE FROM pending_franchises WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[Franchises] deletePending error:', err);
+  }
+}
+
+function extractFrontmatterField(
+  content: string,
+  field: string
+): string | null {
+  const re = new RegExp(`^${field}:\\s*(.+)$`, 'm');
+  const m = content.match(re);
+  if (!m || !m[1]) return null;
+  return m[1].trim().replace(/^["']|["']$/g, '');
+}
+
+async function doPublishFranchises(
+  ctx: Context,
+  env: Env,
+  slug: string
+): Promise<void> {
+  const loading = await ctx.reply(
+    `🔍 Fetch data anime <code>${escapeHtml(slug)}</code>...`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+  );
+
+  const mdPath = `src/content/anime/${slug}.md`;
+  let mdFile: Awaited<ReturnType<typeof githubGetFile>> = null;
+
+  try {
+    mdFile = await githubGetFile(env, mdPath);
+  } catch (err) {
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      `❌ Gagal fetch <code>${escapeHtml(mdPath)}</code>: <code>${escapeHtml((err as Error).message.slice(0, 200))}</code>`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  if (!mdFile) {
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      `❌ File tidak ditemukan: <code>${escapeHtml(mdPath)}</code>\n\n` +
+        `Pastikan anime sudah ada di qimochi.`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const malIdStr = extractFrontmatterField(mdFile.content, 'malId');
+  const titleStr =
+    extractFrontmatterField(mdFile.content, 'title') ?? slug;
+
+  const malId = malIdStr ? parseInt(malIdStr, 10) : NaN;
+
+  if (!malIdStr || isNaN(malId)) {
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      `❌ Field <code>malId</code> kosong di <code>${escapeHtml(mdPath)}</code>.\n\n` +
+        `Tambahkan dulu di frontmatter, contoh:\n<code>malId: 40748</code>`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  await ctx.api.editMessageText(
+    ctx.chat!.id,
+    loading.message_id,
+    `🔍 Fetch relations dari Shikimori (MAL ID: <code>${malId}</code>)...`,
+    { parse_mode: 'HTML' }
+  );
+
+  let relations: { relation: string; slug: string; title: string }[] = [];
+
+  try {
+    const result = await chainRelations({
+      malId,
+      kitsuId: null,
+      title: titleStr,
+    });
+
+    if (!result.data || result.data.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `⚠️ Tidak ada relations dari Shikimori.\n\n` +
+          `Error: <code>${escapeHtml(result.errors.join('; ').slice(0, 300))}</code>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    relations = result.data;
+  } catch (err) {
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      `❌ Gagal fetch relations: <code>${escapeHtml((err as Error).message.slice(0, 200))}</code>`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const filtered = relations.filter((r) => !HIDDEN_RELATIONS.has(r.relation));
+  const hidden = relations.filter((r) => HIDDEN_RELATIONS.has(r.relation));
+
+  if (filtered.length === 0) {
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      `⚠️ Semua relation (${relations.length}) tidak relevan setelah filter.\n\n` +
+        `<b>Difilter:</b>\n` +
+        hidden
+          .slice(0, 10)
+          .map((r) => `• <code>${escapeHtml(r.relation)}</code> → ${escapeHtml(r.slug)}`)
+          .join('\n'),
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const jsonData = JSON.stringify(filtered, null, 2) + '\n';
+
+  if (!ctx.from?.id) return;
+
+  const sessionId = await savePending(
+    env.DB,
+    ctx.from.id,
+    slug,
+    jsonData,
+    filtered.length
+  );
+
+  const targetPath = `src/data/anime/${slug}/franchises.json`;
+
+  const previewLines = filtered.map((r, i) => {
+    const label = RELATION_LABEL[r.relation] ?? r.relation;
+    return `${i + 1}. <b>${escapeHtml(label)}</b> → <code>${escapeHtml(r.slug)}</code>`;
+  });
+
+  const text =
+    `📋 <b>Franchise: ${escapeHtml(titleStr)}</b>\n\n` +
+    `🎬 <b>${filtered.length} relation</b> siap di-publish:\n` +
+    previewLines.join('\n') +
+    (hidden.length > 0
+      ? `\n\n⏭️ <i>Difilter (${hidden.length}): ${hidden.map((r) => r.relation).join(', ')}</i>`
+      : '') +
+    `\n\n📁 Target:\n<code>${escapeHtml(targetPath)}</code>\n` +
+    `📏 Size: ${Math.round(jsonData.length / 1024)} KB`;
+
+  const kb = new InlineKeyboard()
+    .text('📤 Push ke GitHub', `pf:push:${sessionId}`)
+    .text('❌ Batal', `pf:cancel:${sessionId}`);
+
+  await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, text, {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  });
+}
+
+export function setupFranchisesCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(/^pf:push:(f_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+
+    const pending = await getPending(env.DB, sessionId);
+
+    if (!pending) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Kadaluarsa. Ulangi /publish_franchises.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    if (ctx.from?.id !== pending.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+    const targetPath = `src/data/anime/${pending.slug}/franchises.json`;
+
+    const result = await githubCommitFile(
+      env,
+      targetPath,
+      pending.json_data,
+      `feat(franchises): add for ${pending.slug}`
+    );
+
+    if (!result.ok) {
+      await ctx
+        .reply(
+          `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    await deletePending(env.DB, sessionId);
+
+    const commitShort = result.sha?.slice(0, 7) ?? '?';
+
+    await ctx
+      .editMessageText(
+        `✅ <b>Published!</b>\n\n` +
+          `📁 <code>${escapeHtml(targetPath)}</code>\n` +
+          `📊 ${pending.relation_count} relation\n` +
+          `🔗 Commit: <code>${commitShort}</code>\n` +
+          `⏳ Deploy ~2 menit`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: undefined,
+        }
+      )
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^pf:cancel:(f_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (sessionId) await deletePending(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+    await ctx
+      .editMessageText('❌ <b>Dibatalkan.</b>', {
+        parse_mode: 'HTML',
+        reply_markup: undefined,
+      })
+      .catch(() => {});
+  });
+}
+
+export const publishFranchisesCommand: CommandDefinition = {
+  name: 'publish_franchises',
+  description: 'Push franchises dari Shikimori ke qimochi',
+  usage: '/publish_franchises <slug>',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const slug = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+
+    if (!slug) {
+      await ctx.reply(
+        '<b>📋 Publish Franchises</b>\n\n' +
+          '<b>Usage:</b>\n' +
+          '<code>/publish_franchises &lt;slug&gt;</code>\n\n' +
+          '<b>Contoh:</b>\n' +
+          '<code>/publish_franchises yozakura-san-chi-no-daisakusen-2nd-season</code>\n\n' +
+          '<i>Bot fetch relations dari Shikimori → push ke src/data/anime/{slug}/franchises.json</i>',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return;
+    }
+
+    await doPublishFranchises(ctx, env, slug);
+  },
+};
+===== END FILE =====
+
 ===== FILE: ./src/commands/help.ts =====
 import type { CommandDefinition } from './registry';
 import { COMMANDS } from './list';
@@ -3757,6 +4220,15 @@ import {
   endCommand,
 } from './database-anime';
 import { vaCommand } from './va';
+import {
+  publishAnimeCommand,
+  publishBatchCommand,
+  batchResetCommand,
+  publishCommand,
+} from './publish';
+import { publishFranchisesCommand } from './franchises';
+import { publishDbaCommand } from './publish-dba';
+import { publishDataCommand } from './publish-data';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -3773,6 +4245,13 @@ export const COMMANDS: CommandDefinition[] = [
   batchCommand,
   listCommand,
   deleteCommand,
+  publishAnimeCommand,
+  publishBatchCommand,
+  batchResetCommand,
+  publishFranchisesCommand,
+  publishDbaCommand,
+  publishDataCommand,
+  publishCommand,
 ];
 ===== END FILE =====
 
@@ -3803,6 +4282,2565 @@ export const pingCommand: CommandDefinition = {
     );
   },
 };
+===== END FILE =====
+
+===== FILE: ./src/commands/publish-data.ts =====
+// src/commands/publish-data.ts
+import type { CommandDefinition } from './registry';
+import type { Bot } from 'grammy';
+import { InlineKeyboard } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+import {
+  githubCommitFile,
+  githubCommitMultipleFiles,
+  githubGetFile,
+  type FileToCommit,
+} from '../lib/github';
+
+const TTL_MS = 30 * 60 * 1000;
+const CHAR_PART_SIZE = 50;
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+interface SessionRow {
+  session_id: string;
+  user_id: number;
+  mal_id: number | null;
+  kitsu_id: string | null;
+  title: string;
+  expires_at: number;
+}
+
+interface PendingRow {
+  session_id: string;
+  user_id: number;
+  slug: string;
+  section: string;
+  files_json: string;
+  total_items: number;
+  file_count: number;
+  total_size: number;
+  created_at: number;
+  expires_at: number;
+}
+
+interface PendingFile {
+  path: string;
+  content: string;
+  items: number;
+}
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensurePendingDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS pending_data_v2 (
+            session_id  TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            slug        TEXT NOT NULL,
+            section     TEXT NOT NULL,
+            files_json  TEXT NOT NULL,
+            total_items INTEGER NOT NULL,
+            file_count  INTEGER NOT NULL,
+            total_size  INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL
+          )`
+        )
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[PublishData] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+async function savePending(
+  db: D1Database,
+  data: {
+    user_id: number;
+    slug: string;
+    section: string;
+    files: PendingFile[];
+    total_items: number;
+    total_size: number;
+  }
+): Promise<string> {
+  await ensurePendingDb(db);
+  const sessionId = 'pd_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO pending_data_v2
+        (session_id, user_id, slug, section, files_json, total_items, file_count, total_size, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      data.user_id,
+      data.slug,
+      data.section,
+      JSON.stringify(data.files),
+      data.total_items,
+      data.files.length,
+      data.total_size,
+      now,
+      now + TTL_MS
+    )
+    .run();
+
+  return sessionId;
+}
+
+async function getPending(
+  db: D1Database,
+  sessionId: string
+): Promise<PendingRow | null> {
+  await ensurePendingDb(db);
+
+  const row = await db
+    .prepare('SELECT * FROM pending_data_v2 WHERE session_id = ?')
+    .bind(sessionId)
+    .first<PendingRow>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM pending_data_v2 WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return row;
+}
+
+async function deletePending(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await ensurePendingDb(db);
+    await db
+      .prepare('DELETE FROM pending_data_v2 WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[PublishData] deletePending error:', err);
+  }
+}
+
+async function getSession(
+  env: Env,
+  userId: number
+): Promise<SessionRow | null> {
+  return env.DB
+    .prepare(
+      `SELECT * FROM qimochi_sessions
+       WHERE user_id = ? AND expires_at > ?
+       ORDER BY created_at DESC LIMIT 1`
+    )
+    .bind(userId, Date.now())
+    .first<SessionRow>();
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function buildPendingFiles(
+  items: unknown[],
+  basePath: string,
+  chunkSize: number
+): PendingFile[] {
+  const chunks = chunkArray(items, chunkSize);
+  const files: PendingFile[] = [];
+
+  let cursor = 1;
+  for (const chunk of chunks) {
+    const start = cursor;
+    const end = cursor + chunk.length - 1;
+    files.push({
+      path: `${basePath}/${start}-${end}.json`,
+      content: JSON.stringify(chunk, null, 2) + '\n',
+      items: chunk.length,
+    });
+    cursor = end + 1;
+  }
+
+  return files;
+}
+
+async function countExistingFiles(
+  env: Env,
+  files: PendingFile[],
+  target: 'yukio-data' | 'qimochi' | 'yukionime'
+): Promise<number> {
+  const results = await Promise.allSettled(
+    files.map((f) =>
+      Promise.race([
+        githubGetFile(env, f.path, target),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+      ])
+    )
+  );
+
+  let count = 0;
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value) count++;
+  }
+  return count;
+}
+
+async function previewAndSave(
+  ctx: any,
+  env: Env,
+  session: SessionRow,
+  slug: string,
+  section: string,
+  items: unknown[],
+  basePath: string,
+  chunkSize: number,
+  loadingMessageId: number,
+  extraInfo?: string
+): Promise<void> {
+  const files = buildPendingFiles(items, basePath, chunkSize);
+  const totalSize = files.reduce((sum, f) => sum + f.content.length, 0);
+
+  const pendingId = await savePending(env.DB, {
+    user_id: session.user_id,
+    slug,
+    section,
+    files,
+    total_items: items.length,
+    total_size: totalSize,
+  });
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat.id,
+      loadingMessageId,
+      '🔍 Cek file existing...',
+      { parse_mode: 'HTML' }
+    )
+    .catch(() => {});
+
+  let existingCount = 0;
+  try {
+    existingCount = await countExistingFiles(env, files, 'yukio-data');
+  } catch (err) {
+    console.warn('[PublishData] countExistingFiles error:', err);
+  }
+
+  const sizeKB = Math.max(1, Math.round(totalSize / 1024));
+
+  const lines: string[] = [];
+  lines.push(`📋 <b>Preview: ${escapeHtml(section)}</b>`);
+  lines.push('');
+  lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
+  lines.push(`📁 <code>${escapeHtml(basePath)}/</code>`);
+  lines.push(`📏 ${sizeKB} KB total`);
+  lines.push(`📊 ${items.length} item → ${files.length} file`);
+  if (extraInfo) lines.push(extraInfo);
+  lines.push('');
+
+  if (files.length <= 5) {
+    lines.push('<b>File:</b>');
+    for (const f of files) {
+      const name = f.path.slice(f.path.lastIndexOf('/') + 1);
+      lines.push(`• <code>${escapeHtml(name)}</code> (${f.items} item)`);
+    }
+    lines.push('');
+  }
+
+  if (existingCount === files.length && files.length > 0) {
+    lines.push('⚠️ <b>Semua file sudah ada.</b> Akan di-overwrite.');
+  } else if (existingCount > 0) {
+    lines.push(`⚠️ <b>${existingCount}/${files.length} file sudah ada.</b>`);
+  } else {
+    lines.push('✅ Semua file baru.');
+  }
+
+  const kb = new InlineKeyboard()
+    .text('📤 Push ke yukio-data', `pd:push:${pendingId}`)
+    .text('❌ Batal', `pd:cancel:${pendingId}`);
+
+  await ctx.api.editMessageText(
+    ctx.chat.id,
+    loadingMessageId,
+    lines.join('\n'),
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    }
+  );
+}
+
+async function doPublishCharacters(
+  ctx: any,
+  env: Env,
+  session: SessionRow,
+  slug: string
+): Promise<void> {
+  const loading = await ctx.reply('🔍 Cek characters dari session...');
+
+  try {
+    let cacheRow: { data: string; total: number; source: string } | null = null;
+
+    try {
+      cacheRow = await env.DB
+        .prepare(
+          `SELECT data, total, source FROM qimochi_char_cache
+           WHERE session_id = ?`
+        )
+        .bind(session.session_id)
+        .first<{ data: string; total: number; source: string }>();
+    } catch (err) {
+      console.warn('[PublishData] char cache query error:', err);
+    }
+
+    if (!cacheRow) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        `❌ <b>Characters belum ada di cache.</b>\n\n` +
+          `Buka <code>/dba</code> → klik <b>👥 Characters</b> dulu,\n` +
+          `lalu jalankan <code>/publish_data</code> lagi.\n\n` +
+          `<i>Cache expired setelah 30 menit.</i>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    let characters: unknown[] = [];
+
+    try {
+      const parsed = JSON.parse(cacheRow.data);
+      if (Array.isArray(parsed)) characters = parsed;
+    } catch {
+      characters = [];
+    }
+
+    if (characters.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        '❌ Characters kosong di cache.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await previewAndSave(
+      ctx,
+      env,
+      session,
+      slug,
+      'characters',
+      characters,
+      `data/anime/${slug}/characters`,
+      CHAR_PART_SIZE,
+      loading.message_id,
+      `📡 Sumber: ${escapeHtml(cacheRow.source ?? 'unknown')}`
+    );
+  } catch (err: any) {
+    console.error('[PublishData] doPublishCharacters error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat.id,
+        loading.message_id,
+        `❌ <b>Gagal prepare characters</b>\n\n` +
+          `<code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  }
+}
+
+export function setupPublishDataCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(/^pd:(chars|eps|fr|va):([a-z0-9-]+)$/, async (ctx) => {
+    try {
+      const section = ctx.match[1] ?? '';
+      const slug = ctx.match[2] ?? '';
+
+      const userId = ctx.from?.id;
+      if (!userId) return;
+
+      const session = await getSession(env, userId);
+
+      if (!session) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Session kadaluarsa. Ulangi /dba.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: `⏳ ${section}...` });
+
+      if (section === 'chars') {
+        await doPublishCharacters(ctx, env, session, slug);
+        return;
+      }
+
+      await ctx.reply(
+        `🚧 <b>Section ${escapeHtml(section)}</b> belum diimplementasi.\n\n` +
+          `Slug: <code>${escapeHtml(slug)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err: any) {
+      console.error('[PublishData] callback error:', err);
+      await ctx
+        .reply(
+          `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    }
+  });
+
+  bot.callbackQuery(/^pd:push:(pd_[a-z0-9]+)$/, async (ctx) => {
+    try {
+      const pendingId = ctx.match[1] ?? '';
+      if (!pendingId) {
+        await ctx.answerCallbackQuery({ text: '❌' });
+        return;
+      }
+
+      const pending = await getPending(env.DB, pendingId);
+      if (!pending) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Kadaluarsa. Ulangi /publish_data.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      if (ctx.from?.id !== pending.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+      let files: PendingFile[] = [];
+      try {
+        files = JSON.parse(pending.files_json) as PendingFile[];
+      } catch {
+        files = [];
+      }
+
+      if (files.length === 0) {
+        await ctx.reply('❌ Tidak ada file untuk di-push.').catch(() => {});
+        return;
+      }
+
+      const message = `feat(${pending.section}): add for ${pending.slug}`;
+
+      let result: {
+        ok: boolean;
+        sha?: string;
+        commitUrl?: string;
+        error?: string;
+      };
+
+      if (files.length === 1) {
+        const f = files[0]!;
+        result = await githubCommitFile(
+          env,
+          f.path,
+          f.content,
+          message,
+          'yukio-data'
+        );
+      } else {
+        const payload: FileToCommit[] = files.map((f) => ({
+          path: f.path,
+          content: f.content,
+        }));
+        result = await githubCommitMultipleFiles(
+          env,
+          payload,
+          message,
+          'yukio-data'
+        );
+      }
+
+      if (!result.ok) {
+        await ctx
+          .reply(
+            `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+            { parse_mode: 'HTML' }
+          )
+          .catch(() => {});
+        return;
+      }
+
+      await deletePending(env.DB, pendingId);
+
+      const commitShort = result.sha?.slice(0, 7) ?? '?';
+
+      await ctx
+        .editMessageText(
+          `✅ <b>Published!</b>\n\n` +
+            `📁 <code>data/anime/${escapeHtml(pending.slug)}/${escapeHtml(pending.section)}/</code>\n` +
+            `📦 ${pending.file_count} file · ${pending.total_items} item\n` +
+            `🔗 Commit: <code>${commitShort}</code>\n` +
+            `⏳ Deploy ~2 menit`,
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: undefined,
+          }
+        )
+        .catch(() => {});
+    } catch (err: any) {
+      console.error('[PublishData] push error:', err);
+      await ctx
+        .reply(
+          `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    }
+  });
+
+  bot.callbackQuery(/^pd:cancel:(pd_[a-z0-9]+)$/, async (ctx) => {
+    try {
+      const pendingId = ctx.match[1] ?? '';
+      if (pendingId) await deletePending(env.DB, pendingId);
+      await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+      await ctx
+        .editMessageText('❌ <b>Dibatalkan.</b>', {
+          parse_mode: 'HTML',
+          reply_markup: undefined,
+        })
+        .catch(() => {});
+    } catch (err) {
+      console.error('[PublishData] cancel error:', err);
+    }
+  });
+}
+
+export const publishDataCommand: CommandDefinition = {
+  name: 'publish_data',
+  description: 'Push JSON data ke yukio-data',
+  usage: '/publish_data',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const session = await getSession(env, userId);
+
+    if (!session) {
+      await ctx.reply(
+        '📭 Tidak ada session /dba aktif.\n\n' +
+          'Kirim <code>/dba &lt;judul&gt;</code> dulu.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const slug = slugify(session.title);
+    const kb = new InlineKeyboard()
+      .text('👥 Characters', `pd:chars:${slug}`)
+      .text('🎬 Episodes', `pd:eps:${slug}`)
+      .row()
+      .text('🔗 Franchises', `pd:fr:${slug}`)
+      .text('🎤 Voice Actors', `pd:va:${slug}`)
+      .row()
+      .text('❌ Batal', `pd:batal:${slug}`);
+
+    await ctx.reply(
+      `📤 <b>Publish Data</b>\n\n` +
+        `🎬 <code>${escapeHtml(session.title)}</code>\n` +
+        `📁 Target: <code>yukio-data</code>\n\n` +
+        `Pilih section yang mau di-push:`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    );
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/publish-dba.ts =====
+// src/commands/publish-dba.ts
+import type { CommandDefinition } from './registry';
+import type { Context } from 'grammy';
+import { InlineKeyboard, type Bot } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+import type { AniListMedia } from '../types/anime';
+import { githubCommitFile, githubGetFile } from '../lib/github';
+import { buildMetadataYaml } from '../services/qimochi-yaml';
+import { askAI } from '../services/ai';
+
+const TTL_MS = 30 * 60 * 1000;
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+interface SessionRow {
+  session_id: string;
+  user_id: number;
+  mal_id: number | null;
+  kitsu_id: string | null;
+  title: string;
+  metadata: string | null;
+  summary: string | null;
+  expires_at: number;
+}
+
+interface PendingRow {
+  session_id: string;
+  user_id: number;
+  slug: string;
+  markdown: string;
+  created_at: number;
+  expires_at: number;
+}
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensurePendingDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS pending_dba_metadata (
+            session_id  TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            slug        TEXT NOT NULL,
+            markdown    TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL
+          )`
+        )
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[PublishDBA] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+async function savePending(
+  db: D1Database,
+  userId: number,
+  slug: string,
+  markdown: string
+): Promise<string> {
+  await ensurePendingDb(db);
+  const sessionId = 'pdm_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO pending_dba_metadata
+        (session_id, user_id, slug, markdown, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(sessionId, userId, slug, markdown, now, now + TTL_MS)
+    .run();
+
+  return sessionId;
+}
+
+async function getPending(
+  db: D1Database,
+  sessionId: string
+): Promise<PendingRow | null> {
+  await ensurePendingDb(db);
+
+  const row = await db
+    .prepare('SELECT * FROM pending_dba_metadata WHERE session_id = ?')
+    .bind(sessionId)
+    .first<PendingRow>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM pending_dba_metadata WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return row;
+}
+
+async function deletePending(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await ensurePendingDb(db);
+    await db
+      .prepare('DELETE FROM pending_dba_metadata WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[PublishDBA] deletePending error:', err);
+  }
+}
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function stripHtml(s: string): string {
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function looksIndonesian(s: string): boolean {
+  const lower = s.toLowerCase();
+  const words = [
+    ' yang ', ' dengan ', ' untuk ', ' adalah ', ' dan ',
+    ' di ', ' ke ', ' dari ', ' ini ', ' itu ', ' tidak ',
+  ];
+  let count = 0;
+  for (const w of words) if (lower.includes(w)) count++;
+  return count >= 3;
+}
+
+async function buildSynopsis(
+  env: Env,
+  title: string,
+  rawDesc: string
+): Promise<string> {
+  if (!rawDesc || rawDesc.length < 30) {
+    return '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.';
+  }
+
+  const clean = stripHtml(rawDesc);
+
+  if (looksIndonesian(clean)) {
+    return clean;
+  }
+
+  const prompt =
+    `Tulis ulang sinopsis anime berikut menjadi bahasa Indonesia yang natural.\n\n` +
+    `Judul: ${title}\n\n` +
+    `Sinopsis referensi:\n${clean.slice(0, 2000)}\n\n` +
+    `ATURAN:\n` +
+    `- Tulis sebagai sinopsis baru, BUKAN terjemahan literal\n` +
+    `- Bahasa Indonesia natural dan mengalir\n` +
+    `- 2-3 paragraf pendek\n` +
+    `- Jangan spoiler\n` +
+    `- Jangan tambahkan info yang tidak ada di referensi\n` +
+    `- Langsung mulai dari tokoh utama atau setting\n\n` +
+    `Output hanya sinopsis, tanpa penjelasan tambahan.`;
+
+  try {
+    const result = await askAI(env, prompt, {
+      maxTokens: 700,
+      temperature: 0.6,
+      smart: true,
+    });
+
+    if (result && result.length > 50) {
+      return result.trim();
+    }
+  } catch (err) {
+    console.warn('[PublishDBA] AI rewrite failed:', err);
+  }
+
+  return clean;
+}
+
+async function buildMarkdown(
+  env: Env,
+  session: SessionRow,
+  media: AniListMedia
+): Promise<string> {
+  const yaml = buildMetadataYaml({
+    media,
+    malId: session.mal_id ?? null,
+    kitsuId: session.kitsu_id ?? null,
+  });
+
+  let body: string;
+
+  if (session.summary && session.summary.trim().length > 50) {
+    body = session.summary.trim();
+  } else {
+    const rawSynopsis = media.description ?? '';
+    body = await buildSynopsis(env, session.title, rawSynopsis);
+  }
+
+  return `${yaml}\n\n${body}\n`;
+}
+
+async function doPublishDba(
+  ctx: Context,
+  env: Env,
+  session: SessionRow
+): Promise<void> {
+  if (!session.metadata) {
+    await ctx.reply(
+      '❌ Session tidak punya metadata. Ulangi <code>/dba &lt;judul&gt;</code> dulu.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  let media: AniListMedia;
+  try {
+    media = JSON.parse(session.metadata) as AniListMedia;
+  } catch {
+    await ctx.reply('❌ Gagal parse metadata dari session.');
+    return;
+  }
+
+  if (!ctx.from?.id) return;
+
+  const slug = slugify(session.title);
+  const hasSummary = !!session.summary && session.summary.trim().length > 50;
+
+  let loadingMsg: { message_id: number } | null = null;
+
+  if (!hasSummary) {
+    loadingMsg = await ctx.reply('🤖 Generate sinopsis Indonesia...');
+  }
+
+  let markdown: string;
+  try {
+    markdown = await buildMarkdown(env, session, media);
+  } catch (err) {
+    if (loadingMsg) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loadingMsg.message_id,
+          `❌ Gagal generate sinopsis: <code>${escapeHtml((err as Error).message ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    }
+    return;
+  }
+
+  if (loadingMsg) {
+    await ctx.api
+      .deleteMessage(ctx.chat!.id, loadingMsg.message_id)
+      .catch(() => {});
+  }
+
+  const targetPath = `src/content/anime/${slug}.md`;
+  const pendingId = await savePending(env.DB, ctx.from.id, slug, markdown);
+
+  let existing: Awaited<ReturnType<typeof githubGetFile>> = null;
+  try {
+    existing = await githubGetFile(env, targetPath, 'yukionime');
+  } catch {}
+
+  const sizeKB = Math.max(1, Math.round(markdown.length / 1024));
+  const lines: string[] = [];
+
+  lines.push(`📋 <b>Preview Publish DBA</b>`);
+  lines.push('');
+  lines.push(`📁 <code>${escapeHtml(targetPath)}</code>`);
+  lines.push(`📏 ${sizeKB} KB`);
+  lines.push(`🎬 ${escapeHtml(session.title)}`);
+  if (hasSummary) lines.push(`📝 Sinopsis: dari /dba summary`);
+  lines.push('');
+
+  if (existing) {
+    lines.push(
+      `⚠️ <b>File sudah ada!</b> (${Math.max(1, Math.round(existing.content.length / 1024))} KB)`
+    );
+    lines.push('Akan di-overwrite.');
+  } else {
+    lines.push('✅ File baru.');
+  }
+
+  const kb = new InlineKeyboard()
+    .text('📤 Push ke yukionime', `pdm:push:${pendingId}`)
+    .text('❌ Batal', `pdm:cancel:${pendingId}`);
+
+  await ctx.reply(lines.join('\n'), {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  });
+}
+
+export function setupPublishDbaCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(/^pdm:push:(pdm_[a-z0-9]+)$/, async (ctx) => {
+    const pendingId = ctx.match[1] ?? '';
+    if (!pendingId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+
+    const pending = await getPending(env.DB, pendingId);
+    if (!pending) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Kadaluarsa. Ulangi /publish_dba.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    if (ctx.from?.id !== pending.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+    const targetPath = `src/content/anime/${pending.slug}.md`;
+    const result = await githubCommitFile(
+      env,
+      targetPath,
+      pending.markdown,
+      `feat(anime): add ${pending.slug}`,
+      'yukionime'
+    );
+
+    if (!result.ok) {
+      await ctx
+        .reply(
+          `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    await deletePending(env.DB, pendingId);
+
+    const commitShort = result.sha?.slice(0, 7) ?? '?';
+
+    await ctx
+      .editMessageText(
+        `✅ <b>Published!</b>\n\n` +
+          `📁 <code>${escapeHtml(targetPath)}</code>\n` +
+          `🔗 Commit: <code>${commitShort}</code>\n` +
+          `⏳ Deploy ~2 menit`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: undefined,
+        }
+      )
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^pdm:cancel:(pdm_[a-z0-9]+)$/, async (ctx) => {
+    const pendingId = ctx.match[1] ?? '';
+    if (pendingId) await deletePending(env.DB, pendingId);
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+    await ctx
+      .editMessageText('❌ <b>Dibatalkan.</b>', {
+        parse_mode: 'HTML',
+        reply_markup: undefined,
+      })
+      .catch(() => {});
+  });
+}
+
+export const publishDbaCommand: CommandDefinition = {
+  name: 'publish_dba',
+  description: 'Push metadata anime ke yukionime',
+  usage: '/publish_dba',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const session = await env.DB
+      .prepare(
+        `SELECT * FROM qimochi_sessions
+         WHERE user_id = ? AND expires_at > ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .bind(userId, Date.now())
+      .first<SessionRow>();
+
+    if (!session) {
+      await ctx.reply(
+        '📭 Tidak ada session /dba aktif.\n\n' +
+          'Kirim <code>/dba &lt;judul&gt;</code> dulu, lalu jalankan command ini.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await doPublishDba(ctx, env, session);
+  },
+};
+===== END FILE =====
+
+===== FILE: ./src/commands/publish.ts =====
+// src/commands/publish.ts
+import type { CommandDefinition } from './registry';
+import type { Context } from 'grammy';
+import { InlineKeyboard, type Bot } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+import type { AniListMedia } from '../types/anime';
+import {
+  githubCommitFile,
+  githubGetFile,
+  githubListDir,
+  type FileToCommit,
+} from '../lib/github';
+import { buildMetadataYaml } from '../services/qimochi-yaml';
+
+const BATCH_TTL_MS = 24 * 60 * 60 * 1000;
+const PUBLISH_TTL_MS = 30 * 60 * 1000;
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export interface EpisodeObject {
+  number: number;
+  streams: { quality: string; servers: { name: string; url: string }[] }[];
+}
+
+interface SessionRow {
+  session_id: string;
+  user_id: number;
+  yaml: string;
+  body: string;
+  missing: string;
+  ai_used: string;
+  cover: string | null;
+  source_label: string | null;
+  slug: string | null;
+  created_at: number;
+  expires_at: number;
+}
+
+interface BatchSessionRow {
+  session_id: string;
+  user_id: number;
+  slug_hint: string | null;
+  chosen_slug: string | null;
+  suggestions: string | null;
+  combined_json: string;
+  min_ep: number;
+  max_ep: number;
+  total_urls: number | null;
+  errors: string | null;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
+}
+
+export interface StartOrAppendResult {
+  sessionId: string;
+  mode: 'created' | 'appended' | 'reset_and_created';
+  slugHint: string | null;
+  totalEpisodes: number;
+  minEp: number;
+  maxEp: number;
+  totalUrls: number;
+  added: number[];
+  skipped: number[];
+}
+
+interface DbaSessionRow {
+  session_id: string;
+  user_id: number;
+  mal_id: number | null;
+  kitsu_id: string | null;
+  title: string;
+  metadata: string | null;
+  summary: string | null;
+  expires_at: number;
+}
+
+interface PendingPublishRow {
+  session_id: string;
+  user_id: number;
+  files_json: string;
+  summary_json: string;
+  created_at: number;
+  expires_at: number;
+}
+
+interface PublishSummary {
+  yukionime: { metadata: boolean; files: number };
+  yukioData: { characters: number; episodes: number; franchises: number; actors: number; files: number };
+  qimochi: { franchises: number; files: number };
+}
+
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function stripHtml(s: string): string {
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+async function ensureDb(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS temp_anime (
+            session_id   TEXT PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            yaml         TEXT NOT NULL,
+            body         TEXT NOT NULL,
+            missing      TEXT NOT NULL,
+            ai_used      TEXT NOT NULL,
+            cover        TEXT,
+            source_label TEXT,
+            slug         TEXT,
+            created_at   INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL
+          )`
+        )
+        .run();
+      try {
+        await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
+      } catch {}
+      dbReady = true;
+    } catch (err) {
+      console.error('[Publish] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+async function getSession(
+  db: D1Database,
+  sessionId: string
+): Promise<SessionRow | null> {
+  await ensureDb(db);
+  const row = await db
+    .prepare('SELECT * FROM temp_anime WHERE session_id = ?')
+    .bind(sessionId)
+    .first<SessionRow>();
+  if (!row) return null;
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM temp_anime WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+  return row;
+}
+
+async function deleteSession(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await db
+      .prepare('DELETE FROM temp_anime WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[Publish] deleteSession error:', err);
+  }
+}
+
+function buildMarkdown(session: SessionRow): string {
+  const body = session.body.trim();
+  return `${session.yaml}\n\n${body}\n`;
+}
+
+let batchDbReady = false;
+let batchDbInitPromise: Promise<void> | null = null;
+
+async function ensureBatchDb(db: D1Database): Promise<void> {
+  if (batchDbReady) return;
+  if (batchDbInitPromise) return batchDbInitPromise;
+
+  batchDbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS batch_sessions (
+            session_id     TEXT PRIMARY KEY,
+            user_id        INTEGER NOT NULL,
+            slug_hint      TEXT,
+            chosen_slug    TEXT,
+            suggestions    TEXT,
+            combined_json  TEXT NOT NULL,
+            min_ep         INTEGER NOT NULL,
+            max_ep         INTEGER NOT NULL,
+            total_urls     INTEGER,
+            errors         TEXT,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL,
+            expires_at     INTEGER NOT NULL
+          )`
+        )
+        .run();
+      await db
+        .prepare(
+          'CREATE INDEX IF NOT EXISTS idx_batch_sessions_user ON batch_sessions(user_id, updated_at DESC)'
+        )
+        .run();
+      batchDbReady = true;
+    } catch (err) {
+      console.error('[Publish] batch DB init error:', err);
+      batchDbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return batchDbInitPromise;
+}
+
+async function getActiveSession(
+  db: D1Database,
+  userId: number
+): Promise<BatchSessionRow | null> {
+  await ensureBatchDb(db);
+  try {
+    const row = await db
+      .prepare(
+        `SELECT * FROM batch_sessions
+         WHERE user_id = ? AND expires_at > ?
+         ORDER BY updated_at DESC LIMIT 1`
+      )
+      .bind(userId, Date.now())
+      .first<BatchSessionRow>();
+    return row ?? null;
+  } catch (err) {
+    console.error('[Publish] getActiveSession error:', err);
+    return null;
+  }
+}
+
+async function getBatchSession(
+  db: D1Database,
+  sessionId: string
+): Promise<BatchSessionRow | null> {
+  await ensureBatchDb(db);
+  try {
+    const row = await db
+      .prepare('SELECT * FROM batch_sessions WHERE session_id = ?')
+      .bind(sessionId)
+      .first<BatchSessionRow>();
+
+    if (!row) return null;
+    if (row.expires_at < Date.now()) {
+      await db
+        .prepare('DELETE FROM batch_sessions WHERE session_id = ?')
+        .bind(sessionId)
+        .run()
+        .catch(() => {});
+      return null;
+    }
+    return row;
+  } catch (err) {
+    console.error('[Publish] getBatchSession error:', err);
+    return null;
+  }
+}
+
+async function updateBatchChosenSlug(
+  db: D1Database,
+  sessionId: string,
+  slug: string
+): Promise<void> {
+  await ensureBatchDb(db);
+  await db
+    .prepare('UPDATE batch_sessions SET chosen_slug = ? WHERE session_id = ?')
+    .bind(slug, sessionId)
+    .run();
+}
+
+async function updateBatchSuggestions(
+  db: D1Database,
+  sessionId: string,
+  suggestions: string[]
+): Promise<void> {
+  await ensureBatchDb(db);
+  await db
+    .prepare('UPDATE batch_sessions SET suggestions = ? WHERE session_id = ?')
+    .bind(JSON.stringify(suggestions), sessionId)
+    .run();
+}
+
+async function deleteBatchSession(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await ensureBatchDb(db);
+    await db
+      .prepare('DELETE FROM batch_sessions WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[Publish] deleteBatchSession error:', err);
+  }
+}
+
+export async function resetBatchSessions(
+  db: D1Database,
+  userId: number
+): Promise<number> {
+  await ensureBatchDb(db);
+  try {
+    const res = await db
+      .prepare('DELETE FROM batch_sessions WHERE user_id = ?')
+      .bind(userId)
+      .run();
+    return res.meta?.changes ?? 0;
+  } catch (err) {
+    console.error('[Publish] resetBatchSessions error:', err);
+    return 0;
+  }
+}
+
+export async function startOrAppendBatch(
+  db: D1Database,
+  userId: number,
+  data: {
+    slugHint: string | null;
+    newEpisodes: EpisodeObject[];
+    errors: string[];
+  }
+): Promise<StartOrAppendResult> {
+  await ensureBatchDb(db);
+
+  if (data.newEpisodes.length === 0) {
+    throw new Error('Tidak ada episode baru untuk disimpan');
+  }
+
+  const existing = await getActiveSession(db, userId);
+  const now = Date.now();
+
+  let mode: StartOrAppendResult['mode'];
+  let existingEpisodes: EpisodeObject[] = [];
+  let sessionId: string;
+  let isSameSeries = false;
+
+  if (!existing) {
+    mode = 'created';
+    sessionId = 'b_' + crypto.randomUUID().replace(/-/g, '').slice(0, 14);
+  } else if (
+    !data.slugHint ||
+    !existing.slug_hint ||
+    existing.slug_hint === data.slugHint
+  ) {
+    mode = 'appended';
+    sessionId = existing.session_id;
+    isSameSeries = true;
+    try {
+      existingEpisodes = JSON.parse(existing.combined_json) as EpisodeObject[];
+    } catch {
+      existingEpisodes = [];
+    }
+  } else {
+    mode = 'reset_and_created';
+    await deleteBatchSession(db, existing.session_id);
+    sessionId = 'b_' + crypto.randomUUID().replace(/-/g, '').slice(0, 14);
+  }
+
+  const existingNumbers = new Set(existingEpisodes.map((e) => e.number));
+  const added: number[] = [];
+  const skipped: number[] = [];
+  const merged: EpisodeObject[] = [...existingEpisodes];
+
+  for (const ep of data.newEpisodes) {
+    if (existingNumbers.has(ep.number)) {
+      skipped.push(ep.number);
+    } else {
+      added.push(ep.number);
+      merged.push(ep);
+    }
+  }
+
+  merged.sort((a, b) => a.number - b.number);
+
+  if (merged.length === 0) {
+    throw new Error('Tidak ada episode yang bisa disimpan');
+  }
+
+  const first = merged[0];
+  const last = merged[merged.length - 1];
+  if (!first || !last) {
+    throw new Error('Gagal menghitung range episode');
+  }
+
+  const minEp = first.number;
+  const maxEp = last.number;
+  const totalUrls = merged.reduce(
+    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
+    0
+  );
+  const combinedJson = JSON.stringify(merged, null, 2) + '\n';
+
+  let existingErrors: string[] = [];
+  if (existing && isSameSeries && existing.errors) {
+    try {
+      existingErrors = JSON.parse(existing.errors) as string[];
+    } catch {
+      existingErrors = [];
+    }
+  }
+  const mergedErrors = [...existingErrors, ...data.errors].slice(-20);
+
+  if (mode === 'created' || mode === 'reset_and_created') {
+    await db
+      .prepare(
+        `INSERT INTO batch_sessions
+          (session_id, user_id, slug_hint, chosen_slug, suggestions, combined_json, min_ep, max_ep, total_urls, errors, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        sessionId,
+        userId,
+        data.slugHint,
+        null,
+        null,
+        combinedJson,
+        minEp,
+        maxEp,
+        totalUrls,
+        JSON.stringify(mergedErrors),
+        now,
+        now,
+        now + BATCH_TTL_MS
+      )
+      .run();
+  } else {
+    await db
+      .prepare(
+        `UPDATE batch_sessions
+         SET combined_json = ?, min_ep = ?, max_ep = ?, total_urls = ?, errors = ?, updated_at = ?, expires_at = ?
+         WHERE session_id = ?`
+      )
+      .bind(
+        combinedJson,
+        minEp,
+        maxEp,
+        totalUrls,
+        JSON.stringify(mergedErrors),
+        now,
+        now + BATCH_TTL_MS,
+        sessionId
+      )
+      .run();
+  }
+
+  return {
+    sessionId,
+    mode,
+    slugHint: data.slugHint,
+    totalEpisodes: merged.length,
+    minEp,
+    maxEp,
+    totalUrls,
+    added,
+    skipped,
+  };
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const m: number[][] = [];
+  for (let i = 0; i <= b.length; i++) m[i] = [i];
+  for (let j = 0; j <= a.length; j++) {
+    const row = m[0];
+    if (row) row[j] = j;
+  }
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      const rowPrev = m[i - 1];
+      const rowCurr = m[i];
+      if (!rowPrev || !rowCurr) continue;
+
+      const cost = a[j - 1] === b[i - 1] ? 0 : 1;
+      const del = (rowPrev[j] ?? 0) + 1;
+      const ins = (rowCurr[j - 1] ?? 0) + 1;
+      const sub = (rowPrev[j - 1] ?? 0) + cost;
+      rowCurr[j] = Math.min(del, ins, sub);
+    }
+  }
+
+  const lastRow = m[b.length];
+  return lastRow ? (lastRow[a.length] ?? 0) : 0;
+}
+
+function similarity(a: string, b: string): number {
+  const max = Math.max(a.length, b.length);
+  if (max === 0) return 1;
+  return 1 - levenshtein(a, b) / max;
+}
+
+async function findSimilarSlugs(
+  env: Env,
+  hint: string
+): Promise<{ slug: string; score: number }[]> {
+  if (!hint) return [];
+  try {
+    const dirs = await githubListDir(env, 'src/data/anime');
+    const candidates = dirs
+      .filter((d) => d.type === 'dir')
+      .map((d) => d.name);
+
+    return candidates
+      .map((slug) => ({
+        slug,
+        score: similarity(hint.toLowerCase(), slug.toLowerCase()),
+      }))
+      .filter((x) => x.score >= 0.5)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+  } catch (err) {
+    console.warn('[Publish] findSimilarSlugs error:', err);
+    return [];
+  }
+}
+
+async function doPublishAnime(
+  ctx: Context,
+  env: Env,
+  sessionId: string,
+  force: boolean
+): Promise<void> {
+  const session = await getSession(env.DB, sessionId);
+  if (!session) {
+    await ctx.answerCallbackQuery({
+      text: '⏱️ Session kadaluarsa. Ulangi /anime.',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const slug = session.slug?.trim();
+  if (!slug) {
+    await ctx.answerCallbackQuery({
+      text: '❌ Slug kosong. Ulangi /anime.',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const path = `src/content/anime/${slug}.md`;
+  const content = buildMarkdown(session);
+
+  if (!force) {
+    let existing: Awaited<ReturnType<typeof githubGetFile>> = null;
+    try {
+      existing = await githubGetFile(env, path);
+    } catch (err) {
+      console.warn('[Publish] getFile failed:', err);
+    }
+
+    if (existing) {
+      const previewOld = existing.content.slice(0, 300);
+      await ctx.answerCallbackQuery({ text: '⚠️ File sudah ada' });
+
+      const kb = new InlineKeyboard()
+        .text('✅ Overwrite', `pub:anforce:${sessionId}`)
+        .text('❌ Batal', `pub:skip:${sessionId}`);
+
+      await ctx.reply(
+        `⚠️ <b>File sudah ada di repo!</b>\n\n` +
+          `📁 <code>${escapeHtml(path)}</code>\n` +
+          `📏 Lama: <b>${existing.content.length}</b> char\n` +
+          `📏 Baru: <b>${content.length}</b> char\n\n` +
+          `<b>Preview lama:</b>\n` +
+          `<pre>${escapeHtml(previewOld)}</pre>\n\n` +
+          `Overwrite?`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: kb,
+        }
+      );
+      return;
+    }
+  }
+
+  await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+  const loadingMsg = await ctx.reply(
+    `📤 <b>Push ke GitHub...</b>\n\n📁 <code>${escapeHtml(path)}</code>`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+  );
+
+  const result = await githubCommitFile(
+    env,
+    path,
+    content,
+    `feat: add anime ${slug}`
+  );
+
+  if (!result.ok) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loadingMsg.message_id,
+        `❌ <b>Gagal push</b>\n\n<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+    return;
+  }
+
+  await deleteSession(env.DB, sessionId);
+
+  const commitShort = result.sha?.slice(0, 7) ?? '?';
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      loadingMsg.message_id,
+      `✅ <b>Published!</b>\n\n` +
+        `📁 <code>${escapeHtml(path)}</code>\n` +
+        `🔗 Commit: <code>${commitShort}</code>\n` +
+        `⏳ Deploy: ~2 menit`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    )
+    .catch(() => {});
+}
+
+async function doPublishBatchInitial(
+  ctx: Context,
+  env: Env,
+  sessionId: string
+): Promise<void> {
+  const session = await getBatchSession(env.DB, sessionId);
+  if (!session) {
+    await ctx.answerCallbackQuery({
+      text: '⏱️ Batch kadaluarsa. Ulangi /batch.',
+      show_alert: true,
+    });
+    return;
+  }
+
+  if (ctx.from?.id !== session.user_id) {
+    await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+    return;
+  }
+
+  await ctx.answerCallbackQuery({ text: '🔍 Cari slug...' });
+
+  const slugHint = session.slug_hint ?? '';
+  const suggestions = slugHint ? await findSimilarSlugs(env, slugHint) : [];
+
+  await updateBatchSuggestions(
+    env.DB,
+    sessionId,
+    suggestions.map((s) => s.slug)
+  );
+
+  const lines: string[] = [];
+  lines.push(`📦 <b>Publish Batch</b>`);
+  lines.push('');
+  lines.push(`🎬 <code>${escapeHtml(slugHint || '(slug hint kosong)')}</code>`);
+  lines.push(`📊 <b>${session.min_ep}-${session.max_ep}</b>`);
+  if (session.total_urls) lines.push(`🎬 URL: <b>${session.total_urls}</b>`);
+  lines.push('');
+
+  const kb = new InlineKeyboard();
+
+  if (suggestions.length > 0) {
+    lines.push('🔍 <b>Slug mirip di repo:</b>');
+    suggestions.forEach((s, i) => {
+      const pct = Math.round(s.score * 100);
+      lines.push(`${i + 1}. <code>${escapeHtml(s.slug)}</code> (${pct}%)`);
+      const label = s.slug.length > 26 ? s.slug.slice(0, 24) + '…' : s.slug;
+      kb.text(`📁 ${label} (${pct}%)`, `pub:bp:${sessionId}:${i}`).row();
+    });
+    lines.push('');
+  } else {
+    lines.push('⚠️ Tidak ada slug mirip di repo.');
+    lines.push('');
+  }
+
+  if (slugHint) {
+    kb.text('✨ Pakai slug dari URL', `pub:bp:${sessionId}:url`).row();
+  }
+  kb.text('✏️ Custom slug', `pub:bp:${sessionId}:custom`).row();
+  kb.text('❌ Batal', `pub:bax:${sessionId}`);
+
+  await ctx.reply(lines.join('\n'), {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  });
+}
+
+async function doPublishBatchPickSlug(
+  ctx: Context,
+  env: Env,
+  sessionId: string,
+  pick: string
+): Promise<void> {
+  const session = await getBatchSession(env.DB, sessionId);
+  if (!session) {
+    await ctx.answerCallbackQuery({ text: '⏱️ Batch kadaluarsa' });
+    return;
+  }
+
+  let slug: string | null = null;
+
+  if (pick === 'url') {
+    slug = session.slug_hint;
+  } else if (pick === 'custom') {
+    await ctx.answerCallbackQuery({ text: '✏️ Kirim slug manual' });
+    await ctx.reply(
+      `✏️ Kirim slug baru via command:\n\n` +
+        `<code>/publish_batch ${sessionId} slug-baru-kamu</code>`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  } else {
+    const idx = parseInt(pick, 10);
+    let arr: string[] = [];
+    try {
+      arr = session.suggestions
+        ? (JSON.parse(session.suggestions) as string[])
+        : [];
+    } catch {
+      arr = [];
+    }
+    slug = arr[idx] ?? null;
+  }
+
+  if (!slug) {
+    await ctx.answerCallbackQuery({ text: '❌ Slug tidak valid' });
+    return;
+  }
+
+  await updateBatchChosenSlug(env.DB, sessionId, slug);
+  await ctx.answerCallbackQuery({ text: `✅ ${slug.slice(0, 30)}` });
+
+  await doPublishBatchPreview(ctx, env, sessionId, slug);
+}
+
+async function doPublishBatchPreview(
+  ctx: Context,
+  env: Env,
+  sessionId: string,
+  slug: string
+): Promise<void> {
+  const session = await getBatchSession(env.DB, sessionId);
+  if (!session) {
+    await ctx.answerCallbackQuery({ text: '⏱️ Batch kadaluarsa' });
+    return;
+  }
+
+  const path = `src/data/anime/${slug}/episodes/${session.min_ep}-${session.max_ep}.json`;
+  const sizeKB = Math.round(session.combined_json.length / 1024);
+
+  let episodes: EpisodeObject[] = [];
+  try {
+    episodes = JSON.parse(session.combined_json) as EpisodeObject[];
+  } catch {
+    episodes = [];
+  }
+
+  const episodeCount = episodes.length;
+  const rangeExpected = session.max_ep - session.min_ep + 1;
+  const hasGap = episodeCount !== rangeExpected;
+
+  let existing: Awaited<ReturnType<typeof githubGetFile>> = null;
+  try {
+    existing = await githubGetFile(env, path);
+  } catch {}
+
+  const lines: string[] = [];
+  lines.push(`📋 <b>Preview Publish</b>`);
+  lines.push('');
+  lines.push(`📁 <code>${escapeHtml(path)}</code>`);
+  lines.push(`📏 ${sizeKB} KB`);
+  lines.push(`📊 ${episodeCount} episode (Ep ${session.min_ep}-${session.max_ep})`);
+  if (hasGap) {
+    lines.push(`⚠️ <i>Ada gap — hanya ${episodeCount} dari ${rangeExpected} episode.</i>`);
+  }
+  if (session.total_urls) lines.push(`🎬 URL: <b>${session.total_urls}</b>`);
+  lines.push('');
+
+  if (existing) {
+    lines.push(
+      `⚠️ <b>File sudah ada!</b> (${Math.round(existing.content.length / 1024)} KB)`
+    );
+    lines.push('Akan di-overwrite.');
+  } else {
+    lines.push('✅ File baru.');
+  }
+
+  const kb = new InlineKeyboard()
+    .text('📤 Push ke GitHub', `pub:bpush:${sessionId}`)
+    .text('❌ Batal', `pub:bax:${sessionId}`);
+
+  await ctx.reply(lines.join('\n'), {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  });
+}
+
+async function doPublishBatchPush(
+  ctx: Context,
+  env: Env,
+  sessionId: string
+): Promise<void> {
+  const session = await getBatchSession(env.DB, sessionId);
+  if (!session || !session.chosen_slug) {
+    await ctx.answerCallbackQuery({
+      text: '⏱️ Batch kadaluarsa atau slug belum dipilih',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const slug = session.chosen_slug;
+  const path = `src/data/anime/${slug}/episodes/${session.min_ep}-${session.max_ep}.json`;
+
+  await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+  const loading = await ctx.reply(
+    `📤 <b>Push ke GitHub...</b>\n\n📁 <code>${escapeHtml(path)}</code>`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+  );
+
+  const commitMsg = `feat: add episodes ${session.min_ep}-${session.max_ep} for ${slug}`;
+  const result = await githubCommitFile(env, path, session.combined_json, commitMsg);
+
+  if (!result.ok) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ <b>Gagal push</b>\n\n<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+    return;
+  }
+
+  await deleteBatchSession(env.DB, sessionId);
+
+  const commitShort = result.sha?.slice(0, 7) ?? '?';
+  const siteUrl = `https://qimochi.pages.dev/anime/${slug}/`;
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      `✅ <b>Published!</b>\n\n` +
+        `📁 <code>${escapeHtml(path)}</code>\n` +
+        `🔗 Commit: <code>${commitShort}</code>\n` +
+        `⏳ Deploy: ~2 menit\n\n` +
+        (result.commitUrl ? `<a href="${result.commitUrl}">Lihat commit</a>\n` : '') +
+        `🌐 <a href="${siteUrl}">${escapeHtml(siteUrl)}</a>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    )
+    .catch(() => {});
+}
+
+async function getDbaSession(
+  env: Env,
+  userId: number
+): Promise<DbaSessionRow | null> {
+  try {
+    const row = await env.DB
+      .prepare(
+        `SELECT * FROM qimochi_sessions
+         WHERE user_id = ? AND expires_at > ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .bind(userId, Date.now())
+      .first<DbaSessionRow>();
+    return row ?? null;
+  } catch {
+    return null;
+  }
+}
+
+let pendingPublishDbReady = false;
+let pendingPublishDbInitPromise: Promise<void> | null = null;
+
+async function ensurePendingPublishDb(db: D1Database): Promise<void> {
+  if (pendingPublishDbReady) return;
+  if (pendingPublishDbInitPromise) return pendingPublishDbInitPromise;
+
+  pendingPublishDbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS pending_publish (
+            session_id   TEXT PRIMARY KEY,
+            user_id      INTEGER NOT NULL,
+            files_json   TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL
+          )`
+        )
+        .run();
+      pendingPublishDbReady = true;
+    } catch (err) {
+      console.error('[Publish] pending DB init error:', err);
+      pendingPublishDbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return pendingPublishDbInitPromise;
+}
+
+async function savePendingPublish(
+  db: D1Database,
+  userId: number,
+  files: FileToCommit[],
+  summary: PublishSummary
+): Promise<string> {
+  await ensurePendingPublishDb(db);
+  const sessionId = 'pp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO pending_publish
+        (session_id, user_id, files_json, summary_json, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      userId,
+      JSON.stringify(files),
+      JSON.stringify(summary),
+      now,
+      now + PUBLISH_TTL_MS
+    )
+    .run();
+
+  return sessionId;
+}
+
+async function getPendingPublish(
+  db: D1Database,
+  sessionId: string
+): Promise<PendingPublishRow | null> {
+  await ensurePendingPublishDb(db);
+
+  const row = await db
+    .prepare('SELECT * FROM pending_publish WHERE session_id = ?')
+    .bind(sessionId)
+    .first<PendingPublishRow>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM pending_publish WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+
+  return row;
+}
+
+async function deletePendingPublish(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await ensurePendingPublishDb(db);
+    await db
+      .prepare('DELETE FROM pending_publish WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[Publish] deletePendingPublish error:', err);
+  }
+}
+
+async function buildMetadataFile(
+  session: DbaSessionRow,
+  slug: string
+): Promise<FileToCommit | null> {
+  if (!session.metadata) return null;
+
+  let media: AniListMedia;
+  try {
+    media = JSON.parse(session.metadata) as AniListMedia;
+  } catch {
+    return null;
+  }
+
+  const yaml = buildMetadataYaml({
+    media,
+    malId: session.mal_id ?? null,
+    kitsuId: session.kitsu_id ?? null,
+  });
+
+  let body: string;
+
+  if (session.summary && session.summary.trim().length > 50) {
+    body = session.summary.trim();
+  } else {
+    const raw = media.description ?? '';
+    if (raw.length < 30) {
+      body = '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.';
+    } else {
+      body = stripHtml(raw);
+    }
+  }
+
+  return {
+    path: `src/content/anime/${slug}.md`,
+    content: `${yaml}\n\n${body}\n`,
+  };
+}
+
+async function doPublishNew(ctx: Context, env: Env): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const loading = await ctx.reply('🔍 Scan session...');
+
+  try {
+    const session = await getDbaSession(env, userId);
+
+    if (!session) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        '📭 Tidak ada session /dba aktif.\n\n' +
+          'Kirim <code>/dba &lt;judul&gt;</code> dulu.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const slug = slugify(session.title);
+    const files: FileToCommit[] = [];
+    const summary: PublishSummary = {
+      yukionime: { metadata: false, files: 0 },
+      yukioData: { characters: 0, episodes: 0, franchises: 0, actors: 0, files: 0 },
+      qimochi: { franchises: 0, files: 0 },
+    };
+
+    const metaFile = await buildMetadataFile(session, slug);
+    if (metaFile) {
+      files.push(metaFile);
+      summary.yukionime.metadata = true;
+      summary.yukionime.files = 1;
+    }
+
+    if (files.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `⚠️ <b>Tidak ada data siap di-publish.</b>\n\n` +
+          `Buka <code>/dba</code> → klik <b>📋 Metadata</b> atau section lain dulu.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const pendingId = await savePendingPublish(env.DB, userId, files, summary);
+
+    const lines: string[] = [];
+    lines.push(`📋 <b>Preview Publish</b>`);
+    lines.push('');
+    lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
+    lines.push(`🆔 <code>${slug}</code>`);
+    lines.push('');
+
+    if (summary.yukionime.metadata) {
+      lines.push(`📄 <b>Metadata + Summary</b> → yukionime`);
+    }
+
+    lines.push('');
+    lines.push(`📦 Total: <b>${files.length}</b> file`);
+
+    const kb = new InlineKeyboard()
+      .text('📤 Push', `pp:push:${pendingId}`)
+      .text('❌ Batal', `pp:cancel:${pendingId}`);
+
+    await ctx.api.editMessageText(
+      ctx.chat!.id,
+      loading.message_id,
+      lines.join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    );
+  } catch (err: any) {
+    console.error('[Publish] scan error:', err);
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  }
+}
+
+export const publishAnimeCommand: CommandDefinition = {
+  name: 'publish_anime',
+  description: 'Push metadata anime ke qimochi',
+  usage: '/publish_anime [slug]',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const argSlug = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const row = await env.DB
+      .prepare(
+        `SELECT * FROM temp_anime
+         WHERE user_id = ? AND expires_at > ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .bind(userId, Date.now())
+      .first<SessionRow>();
+
+    if (!row) {
+      await ctx.reply(
+        '📭 Tidak ada session /anime yang aktif.\n\n' +
+          'Kirim <code>/anime &lt;judul&gt;</code> lalu klik 📋 Convert ke YAML dulu.',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const slug = argSlug || row.slug;
+    if (!slug) {
+      await ctx.reply(
+        '❌ Session tidak punya slug. Kirim slug manual:\n' +
+          '<code>/publish_anime my-slug-here</code>',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const path = `src/content/anime/${slug}.md`;
+    const content = buildMarkdown({ ...row, slug });
+
+    const loading = await ctx.reply(
+      `📤 <b>Push ke GitHub...</b>\n\n📁 <code>${escapeHtml(path)}</code>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+
+    const result = await githubCommitFile(
+      env,
+      path,
+      content,
+      `feat: add anime ${slug}`
+    );
+
+    if (!result.ok) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ <b>Gagal push</b>\n\n<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    await deleteSession(env.DB, row.session_id);
+
+    const commitShort = result.sha?.slice(0, 7) ?? '?';
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `✅ <b>Published!</b>\n\n` +
+          `📁 <code>${escapeHtml(path)}</code>\n` +
+          `🔗 Commit: <code>${commitShort}</code>\n` +
+          `⏳ Deploy ~2 menit`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      )
+      .catch(() => {});
+  },
+};
+
+export const publishBatchCommand: CommandDefinition = {
+  name: 'publish_batch',
+  description: 'Push batch episode ke repo web',
+  usage: '/publish_batch [session_id] [slug]',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const parts = arg.split(/\s+/).filter(Boolean);
+
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      const sessionId = parts[0];
+      const customSlug = parts[1];
+      const session = await getBatchSession(env.DB, sessionId);
+      if (!session) {
+        await ctx.reply('❌ Session batch tidak ditemukan / kadaluarsa.');
+        return;
+      }
+      if (session.user_id !== ctx.from?.id) {
+        await ctx.reply('⛔ Bukan sesi Anda.');
+        return;
+      }
+
+      await updateBatchChosenSlug(env.DB, sessionId, customSlug);
+      await doPublishBatchPreview(ctx, env, sessionId, customSlug);
+      return;
+    }
+
+    await ctx.reply(
+      '<b>📦 Publish Batch</b>\n\n' +
+        '<b>Auto:</b> dari tombol di akhir <code>/batch</code>\n\n' +
+        '<b>Manual:</b>\n' +
+        '<code>/publish_batch &lt;session_id&gt; &lt;slug&gt;</code>\n\n' +
+        '<i>Session ID ada di pesan batch selesai.</i>',
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+  },
+};
+
+export const batchResetCommand: CommandDefinition = {
+  name: 'batch_reset',
+  description: 'Hapus semua session batch aktif',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    if (!ctx.from?.id) return;
+    const count = await resetBatchSessions(env.DB, ctx.from.id);
+    if (count === 0) {
+      await ctx.reply('📭 Tidak ada session batch aktif.');
+      return;
+    }
+    await ctx.reply(`✅ <b>${count}</b> session batch dihapus.`, {
+      parse_mode: 'HTML',
+    });
+  },
+};
+
+export const publishCommand: CommandDefinition = {
+  name: 'publish',
+  description: 'Push semua data ke yukionime + yukio-data',
+  usage: '/publish',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    await doPublishNew(ctx, env);
+  },
+};
+
+/* ============================================================
+   CALLBACKS
+   ============================================================ */
+
+export function setupPublishCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(/^pub:an:([a-f0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await doPublishAnime(ctx, env, sessionId, false);
+  });
+
+  bot.callbackQuery(/^pub:anforce:([a-f0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await doPublishAnime(ctx, env, sessionId, true);
+  });
+
+  bot.callbackQuery(/^pub:skip:([a-f0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (sessionId) await deleteSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: undefined })
+      .catch(() => {});
+    await ctx
+      .reply('❌ <b>Dibatalkan.</b>', { parse_mode: 'HTML' })
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^pub:ba:(b_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await doPublishBatchInitial(ctx, env, sessionId);
+  });
+
+  bot.callbackQuery(/^pub:bp:(b_[a-z0-9]+):(.+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const pick = ctx.match[2] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await doPublishBatchPickSlug(ctx, env, sessionId, pick);
+  });
+
+  bot.callbackQuery(/^pub:bpush:(b_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await doPublishBatchPush(ctx, env, sessionId);
+  });
+
+  bot.callbackQuery(/^pub:bax:(b_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (sessionId) await deleteBatchSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: undefined })
+      .catch(() => {});
+    await ctx
+      .reply('❌ <b>Batch dibatalkan.</b>', { parse_mode: 'HTML' })
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^pub:baadd:(b_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+
+    const session = await getBatchSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({ text: '⏱️ Batch kadaluarsa' });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '➕ Kirim /batch lagi' });
+
+    await ctx.reply(
+      `➕ <b>Tambah Batch</b>\n\n` +
+        `Session aktif:\n` +
+        `<code>${sessionId}</code>\n\n` +
+        `📊 Sekarang: <b>${session.min_ep}-${session.max_ep}</b>\n` +
+        (session.slug_hint
+          ? `🎬 <code>${escapeHtml(session.slug_hint)}</code>\n`
+          : '') +
+        `\nKirim <code>/batch &lt;url&gt; &lt;range&gt;</code> lagi.\n` +
+        `Episode yang sudah ada akan otomatis di-skip.`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+  });
+
+  bot.callbackQuery(/^pp:push:(pp_[a-z0-9]+)$/, async (ctx) => {
+    try {
+      const pendingId = ctx.match[1] ?? '';
+      if (!pendingId) {
+        await ctx.answerCallbackQuery({ text: '❌' });
+        return;
+      }
+
+      const pending = await getPendingPublish(env.DB, pendingId);
+      if (!pending) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Kadaluarsa. Ulangi /publish.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      if (ctx.from?.id !== pending.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+      let files: FileToCommit[] = [];
+      try {
+        files = JSON.parse(pending.files_json) as FileToCommit[];
+      } catch {
+        files = [];
+      }
+
+      if (files.length === 0) {
+        await ctx.reply('❌ Tidak ada file.').catch(() => {});
+        return;
+      }
+
+      const metaFile = files.find((f) => f.path.startsWith('src/content/anime/'));
+
+      if (!metaFile) {
+        await ctx.reply('❌ Metadata tidak ada di pending.').catch(() => {});
+        return;
+      }
+
+      const slug = metaFile.path.split('/').pop()?.replace(/\.md$/, '') ?? '';
+
+      const result = await githubCommitFile(
+        env,
+        metaFile.path,
+        metaFile.content,
+        `feat(anime): add ${slug}`,
+        'yukionime'
+      );
+
+      if (!result.ok) {
+        await ctx
+          .reply(
+            `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+            { parse_mode: 'HTML' }
+          )
+          .catch(() => {});
+        return;
+      }
+
+      await deletePendingPublish(env.DB, pendingId);
+
+      const commitShort = result.sha?.slice(0, 7) ?? '?';
+
+      await ctx
+        .editMessageText(
+          `✅ <b>Published!</b>\n\n` +
+            `📄 <code>${escapeHtml(metaFile.path)}</code>\n` +
+            `🔗 Commit: <code>${commitShort}</code>\n` +
+            `⏳ Deploy ~2 menit`,
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: undefined,
+          }
+        )
+        .catch(() => {});
+    } catch (err: any) {
+      console.error('[Publish] push error:', err);
+      await ctx
+        .reply(
+          `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    }
+  });
+
+  bot.callbackQuery(/^pp:cancel:(pp_[a-z0-9]+)$/, async (ctx) => {
+    const pendingId = ctx.match[1] ?? '';
+    if (pendingId) await deletePendingPublish(env.DB, pendingId);
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+    await ctx
+      .editMessageText('❌ <b>Dibatalkan.</b>', {
+        parse_mode: 'HTML',
+        reply_markup: undefined,
+      })
+      .catch(() => {});
+  });
+}
+
 ===== END FILE =====
 
 ===== FILE: ./src/commands/registry.ts =====
@@ -5541,9 +8579,15 @@ import { setupVaCallbacks } from './commands/va';
 import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
 import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
+import { setupPublishCallbacks } from './commands/publish';
+import { setupFranchisesCallbacks } from './commands/franchises';
+import { setupPublishDbaCallbacks } from './commands/publish-dba';
+import { setupPublishDataCallbacks } from './commands/publish-data';
+import { COMMANDS } from './commands/list';
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
+let menuSetForToken: string | null = null;
 
 function createBot(env: Env): Bot {
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
@@ -5562,6 +8606,10 @@ function createBot(env: Env): Bot {
   setupAnimeCallbacks(bot, env);
   setupDatabaseAnimeCallbacks(bot, env);
   setupVaCallbacks(bot, env);
+  setupPublishCallbacks(bot, env);
+  setupFranchisesCallbacks(bot, env);
+  setupPublishDbaCallbacks(bot, env);
+  setupPublishDataCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
@@ -5587,6 +8635,37 @@ function createBot(env: Env): Bot {
   return bot;
 }
 
+async function setupBotMenu(bot: Bot, token: string): Promise<void> {
+  if (menuSetForToken === token) return;
+
+  try {
+    const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+
+    const commands = COMMANDS
+      .filter((c) => COMMAND_NAME_RE.test(c.name))
+      .map((c) => ({
+        command: c.name,
+        description: (c.description || c.name).slice(0, 256),
+      }));
+
+    const skipped = COMMANDS
+      .filter((c) => !COMMAND_NAME_RE.test(c.name))
+      .map((c) => c.name);
+
+    if (skipped.length > 0) {
+      console.warn(
+        `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
+      );
+    }
+
+    await bot.api.setMyCommands(commands);
+    menuSetForToken = token;
+    console.log(`[Bot] setMyCommands: ${commands.length} commands registered`);
+  } catch (err) {
+    console.error('[Bot] setMyCommands failed:', err);
+  }
+}
+
 async function getBot(env: Env): Promise<Bot> {
   if (!cachedBot) {
     console.log('[Bot] creating new instance');
@@ -5597,8 +8676,9 @@ async function getBot(env: Env): Promise<Bot> {
     const t0 = Date.now();
     initPromise = cachedBot
       .init()
-      .then(() => {
+      .then(async () => {
         console.log(`[Bot] init OK in ${Date.now() - t0}ms`);
+        await setupBotMenu(cachedBot!, env.TELEGRAM_BOT_TOKEN);
       })
       .catch((err) => {
         console.error(`[Bot] init FAILED in ${Date.now() - t0}ms:`, err);
@@ -5627,6 +8707,52 @@ export default {
       );
     }
 
+    if (url.pathname === '/setup-commands') {
+      try {
+        const bot = await getBot(env);
+        const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+
+const commands = COMMANDS
+  .filter((c) => COMMAND_NAME_RE.test(c.name))
+  .map((c) => ({
+    command: c.name,
+    description: (c.description || c.name).slice(0, 256),
+  }));
+
+const skipped = COMMANDS
+  .filter((c) => !COMMAND_NAME_RE.test(c.name))
+  .map((c) => c.name);
+
+await bot.api.setMyCommands(commands);
+menuSetForToken = env.TELEGRAM_BOT_TOKEN;
+
+return new Response(
+  JSON.stringify({
+    ok: true,
+    count: commands.length,
+    commands: commands.map((c) => `/${c.command}`),
+    skipped,
+  }, null, 2),
+  { headers: { 'Content-Type': 'application/json' } }
+);
+        menuSetForToken = env.TELEGRAM_BOT_TOKEN;
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            count: commands.length,
+            commands: commands.map((c) => `/${c.command}`),
+          }, null, 2),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({ ok: false, error: err?.message ?? String(err) }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
@@ -5653,53 +8779,84 @@ export default {
         );
       }
     }
-    
-    if (url.pathname === '/debug/anilist') {
-  const t0 = Date.now();
-  const proxyUrl = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
 
-  const query = `
-    query ($idMal: Int) {
-      Media(idMal: $idMal, type: ANIME) {
-        id
-        title { romaji }
-        characters(page: 1, perPage: 3) {
-          edges {
-            role
-            node { name { full } }
-            voiceActors(language: JAPANESE) {
-              id
-              name { full }
-              languageV2
+    if (url.pathname === '/debug/anilist') {
+      const t0 = Date.now();
+      const proxyUrl = 'https://bimaakbar--062eb542c0de11f1b2c41607ee4eb77e.web.val.run';
+
+      const query = `
+        query ($idMal: Int) {
+          Media(idMal: $idMal, type: ANIME) {
+            id
+            title { romaji }
+            characters(page: 1, perPage: 3) {
+              edges {
+                role
+                node { name { full } }
+                voiceActors(language: JAPANESE) {
+                  id
+                  name { full }
+                  languageV2
+                }
+              }
             }
           }
         }
+      `;
+
+      try {
+        const res = await fetch(proxyUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            query,
+            variables: { idMal: 40748 },
+          }),
+        });
+
+        const text = await res.text();
+
+        return new Response(
+          JSON.stringify(
+            {
+              ok: res.ok,
+              status: res.status,
+              elapsed: Date.now() - t0,
+              bodyPreview: text.slice(0, 2000),
+            },
+            null,
+            2
+          ),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            elapsed: Date.now() - t0,
+            error: err?.message ?? String(err),
+          }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
       }
     }
-  `;
 
+if (url.pathname === '/debug/gh-app') {
   try {
-    const res = await fetch(proxyUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        query,
-        variables: { idMal: 40748 },
-      }),
-    });
-
-    const text = await res.text();
+    const { getInstallationToken } = await import('./lib/github-app');
+    const token = await getInstallationToken(env);
 
     return new Response(
       JSON.stringify(
         {
-          ok: res.ok,
-          status: res.status,
-          elapsed: Date.now() - t0,
-          bodyPreview: text.slice(0, 2000),
+          ok: true,
+          tokenPreview: token.slice(0, 20) + '...',
+          tokenLength: token.length,
+          appId: env.GH_APP_ID,
+          installationId: env.GH_APP_INSTALLATION_ID,
         },
         null,
         2
@@ -5710,7 +8867,6 @@ export default {
     return new Response(
       JSON.stringify({
         ok: false,
-        elapsed: Date.now() - t0,
         error: err?.message ?? String(err),
       }),
       { status: 500, headers: { 'Content-Type': 'application/json' } }
@@ -5722,12 +8878,10 @@ export default {
       return registerDiscordCommands(env);
     }
 
-    // Discord — interaction endpoint
     if (url.pathname === '/discord') {
       return handleDiscordRequest(request, env, ctx);
     }
 
-    // Telegram — webhook
     if (url.pathname === '/webhook') {
       const t0 = Date.now();
       try {
@@ -5764,7 +8918,6 @@ export default {
     }
   },
 };
-
 ===== END FILE =====
 
 ===== FILE: ./src/lib/cache.ts =====
@@ -5874,10 +9027,6 @@ import { InlineKeyboard } from 'grammy';
 export const CHAR_PART_SIZE = 50;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
-/* ============================================================
-   TABLE
-   ============================================================ */
-
 let cacheDbReady = false;
 let cacheDbInitPromise: Promise<void> | null = null;
 
@@ -5901,8 +9050,6 @@ export async function ensureCharCacheTable(db: D1Database): Promise<void> {
           )`
         )
         .run();
-
-      // Migration: tambah kolom sent_parts kalau belum ada
       try {
         await db
           .prepare(
@@ -5923,10 +9070,6 @@ export async function ensureCharCacheTable(db: D1Database): Promise<void> {
 
   return cacheDbInitPromise;
 }
-
-/* ============================================================
-   SAVE
-   ============================================================ */
 
 export async function saveCharCache(
   db: D1Database,
@@ -5966,10 +9109,6 @@ export async function saveCharCache(
 
   console.log(`[CharCache] saved ${chars.length} chars for ${sessionId}`);
 }
-
-/* ============================================================
-   READ
-   ============================================================ */
 
 export interface CharCacheData {
   chars: UnifiedCharacter[];
@@ -6029,10 +9168,6 @@ export async function getCharCache(
   }
 }
 
-/* ============================================================
-   MARK SENT
-   ============================================================ */
-
 export async function markPartSent(
   db: D1Database,
   sessionId: string,
@@ -6072,10 +9207,6 @@ export async function markPartSent(
   }
 }
 
-/* ============================================================
-   DELETE
-   ============================================================ */
-
 export async function deleteCharCache(
   db: D1Database,
   sessionId: string
@@ -6090,10 +9221,6 @@ export async function deleteCharCache(
     console.warn('[CharCache] delete error:', err);
   }
 }
-
-/* ============================================================
-   PARTS
-   ============================================================ */
 
 export function getCharacterPart(
   chars: UnifiedCharacter[],
@@ -6116,10 +9243,6 @@ export function getCharacterPart(
 export function countParts(total: number, partSize = CHAR_PART_SIZE): number {
   return Math.ceil(total / partSize);
 }
-
-/* ============================================================
-   MENU KEYBOARD
-   ============================================================ */
 
 const PARTS_PER_ROW = 5;
 
@@ -6153,7 +9276,6 @@ export function buildPartsKeyboard(
 
   return kb;
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/lib/dba-common.ts =====
@@ -6236,6 +9358,151 @@ export function parseJsonMedia(raw: string | null): AniListMedia | null {
   }
 }
 
+===== END FILE =====
+
+===== FILE: ./src/lib/dba-episodes.ts =====
+// src/lib/dba-episodes.ts
+import type { D1Database } from '@cloudflare/workers-types';
+
+export interface CachedEpisode {
+  number: number;
+  title: string;
+  aired?: string;
+  duration?: number;
+}
+
+export interface EpCacheData {
+  episodes: CachedEpisode[];
+  source: string;
+  total: number;
+}
+
+const CACHE_TTL_MS = 30 * 60 * 1000;
+
+let dbReady = false;
+let dbInitPromise: Promise<void> | null = null;
+
+export async function ensureEpCacheTable(db: D1Database): Promise<void> {
+  if (dbReady) return;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    try {
+      await db
+        .prepare(
+          `CREATE TABLE IF NOT EXISTS qimochi_ep_cache (
+            session_id  TEXT PRIMARY KEY,
+            source      TEXT NOT NULL,
+            total       INTEGER NOT NULL,
+            data        TEXT NOT NULL,
+            truncated   INTEGER DEFAULT 0,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL
+          )`
+        )
+        .run();
+      dbReady = true;
+    } catch (err) {
+      console.error('[EpCache] DB init error:', err);
+      dbInitPromise = null;
+      throw err;
+    }
+  })();
+
+  return dbInitPromise;
+}
+
+export async function saveEpCache(
+  db: D1Database,
+  sessionId: string,
+  episodes: CachedEpisode[],
+  source: string,
+  truncated = false
+): Promise<void> {
+  await ensureEpCacheTable(db);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO qimochi_ep_cache
+        (session_id, source, total, data, truncated, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         source = excluded.source,
+         total = excluded.total,
+         data = excluded.data,
+         truncated = excluded.truncated,
+         created_at = excluded.created_at,
+         expires_at = excluded.expires_at`
+    )
+    .bind(
+      sessionId,
+      source,
+      episodes.length,
+      JSON.stringify(episodes),
+      truncated ? 1 : 0,
+      now,
+      now + CACHE_TTL_MS
+    )
+    .run();
+
+  console.log(`[EpCache] saved ${episodes.length} episodes for ${sessionId}`);
+}
+
+export async function getEpCache(
+  db: D1Database,
+  sessionId: string
+): Promise<EpCacheData | null> {
+  await ensureEpCacheTable(db);
+
+  const row = await db
+    .prepare(
+      `SELECT source, total, data, truncated, expires_at
+       FROM qimochi_ep_cache
+       WHERE session_id = ?`
+    )
+    .bind(sessionId)
+    .first<{
+      source: string;
+      total: number;
+      data: string;
+      truncated: number;
+      expires_at: number;
+    }>();
+
+  if (!row) return null;
+
+  if (row.expires_at < Date.now()) {
+    await deleteEpCache(db, sessionId);
+    return null;
+  }
+
+  try {
+    const episodes = JSON.parse(row.data) as CachedEpisode[];
+    return {
+      episodes,
+      source: row.source,
+      total: row.total,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteEpCache(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await ensureEpCacheTable(db);
+    await db
+      .prepare('DELETE FROM qimochi_ep_cache WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch (err) {
+    console.warn('[EpCache] delete error:', err);
+  }
+}
 ===== END FILE =====
 
 ===== FILE: ./src/lib/dba-metadata.ts =====
@@ -6463,10 +9730,6 @@ import { ensureTrackDb } from './telegram-utils';
 
 export const SESSION_TTL_MS = 30 * 60 * 1000;
 
-/* ============================================================
-   DB INIT
-   ============================================================ */
-
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
 
@@ -6497,15 +9760,14 @@ export async function ensureDb(db: D1Database): Promise<void> {
         )
         .run();
 
-      // Migration: tambah kolom baru kalau belum ada
       for (const col of ['metadata', 'fetched_sources']) {
-        try {
-          await db
-            .prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
-            .run();
-        } catch {
-          // ignore
-        }
+  		try {
+    		await db
+      		.prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
+      		.run();
+  		} catch {
+    		// ignore
+  		}
       }
 
       await db
@@ -6534,10 +9796,6 @@ export async function ensureDb(db: D1Database): Promise<void> {
   return dbInitPromise;
 }
 
-/* ============================================================
-   TYPES
-   ============================================================ */
-
 export interface SessionRow {
   session_id: string;
   user_id: number;
@@ -6551,6 +9809,7 @@ export interface SessionRow {
   source: string | null;
   metadata: string | null;
   fetched_sources: string | null;
+  summary: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -6567,10 +9826,6 @@ export interface SaveSessionInput {
   metadata?: AniListMedia | null;
   fetchedSources?: string[];
 }
-
-/* ============================================================
-   SAVE
-   ============================================================ */
 
 export async function saveSession(
   db: D1Database,
@@ -6609,10 +9864,6 @@ export async function saveSession(
   return sessionId;
 }
 
-/* ============================================================
-   UPDATE METADATA
-   ============================================================ */
-
 export async function updateSessionMetadata(
   db: D1Database,
   sessionId: string,
@@ -6635,10 +9886,6 @@ export async function updateSessionMetadata(
     )
     .run();
 }
-
-/* ============================================================
-   GET
-   ============================================================ */
 
 export async function getSession(
   db: D1Database,
@@ -6681,9 +9928,19 @@ export async function getLatestSessionByUser(
     .first<SessionRow>();
 }
 
-/* ============================================================
-   DELETE
-   ============================================================ */
+export async function updateSessionSummary(
+  db: D1Database,
+  sessionId: string,
+  summary: string
+): Promise<void> {
+  await ensureDb(db);
+  await db
+    .prepare(
+      `UPDATE qimochi_sessions SET summary = ? WHERE session_id = ?`
+    )
+    .bind(summary, sessionId)
+    .run();
+}
 
 export async function deleteSession(
   db: D1Database,
@@ -6813,6 +10070,452 @@ export async function getAllVoiceActors(
   return res.results ?? [];
 }
 
+===== END FILE =====
+
+===== FILE: ./src/lib/github-app.ts =====
+// src/lib/github-app.ts
+import type { Env } from '../types/env';
+
+interface CachedToken {
+  token: string;
+  expiresAt: number;
+}
+
+interface InstallationTokenResponse {
+  token: string;
+  expires_at: string;
+}
+
+let cachedToken: CachedToken | null = null;
+
+function base64url(input: string | Uint8Array): string {
+  let b64: string;
+
+  if (typeof input === 'string') {
+    const bytes = new TextEncoder().encode(input);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) {
+      bin += String.fromCharCode(bytes[i]!);
+    }
+    b64 = btoa(bin);
+  } else {
+    let bin = '';
+    for (let i = 0; i < input.length; i++) {
+      bin += String.fromCharCode(input[i]!);
+    }
+    b64 = btoa(bin);
+  }
+
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function pemToArrayBuffer(pem: string): ArrayBuffer {
+  const b64 = pem
+    .replace(/-----BEGIN [^-]+-----/g, '')
+    .replace(/-----END [^-]+-----/g, '')
+    .replace(/\s+/g, '');
+
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function importPrivateKey(pem: string): Promise<CryptoKey> {
+  const pkcs8 = pemToArrayBuffer(pem);
+  return crypto.subtle.importKey(
+    'pkcs8',
+    pkcs8,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+}
+
+async function createJWT(env: Env): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = {
+    iat: now - 60,
+    exp: now + 600,
+    iss: env.GH_APP_ID,
+  };
+
+  const headerB64 = base64url(JSON.stringify(header));
+  const payloadB64 = base64url(JSON.stringify(payload));
+  const signingInput = `${headerB64}.${payloadB64}`;
+
+  const key = await importPrivateKey(env.GH_APP_PRIVATE_KEY);
+
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signingInput)
+  );
+
+  const signatureB64 = base64url(new Uint8Array(signature));
+
+  return `${signingInput}.${signatureB64}`;
+}
+
+export async function getInstallationToken(env: Env): Promise<string> {
+  if (cachedToken && cachedToken.expiresAt > Date.now() + 60_000) {
+    return cachedToken.token;
+  }
+
+  const jwt = await createJWT(env);
+
+  const url = `https://api.github.com/app/installations/${env.GH_APP_INSTALLATION_ID}/access_tokens`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'yukio-bot/1.0',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    throw new Error(
+      `Installation token failed: HTTP ${res.status} ${err.slice(0, 200)}`
+    );
+  }
+
+  const data = (await res.json()) as InstallationTokenResponse;
+
+  cachedToken = {
+    token: data.token,
+    expiresAt: new Date(data.expires_at).getTime(),
+  };
+
+  return data.token;
+}
+
+export function clearInstallationTokenCache(): void {
+  cachedToken = null;
+}
+===== END FILE =====
+
+===== FILE: ./src/lib/github.ts =====
+// src/lib/github.ts
+import type { Env } from '../types/env';
+import { getInstallationToken } from './github-app';
+
+const API_BASE = 'https://api.github.com';
+
+export type RepoTarget = 'qimochi' | 'yukionime' | 'yukio-data';
+
+export interface RepoConfig {
+  repo: string;
+  branch: string;
+}
+
+export function resolveRepo(
+  env: Env,
+  target: RepoTarget = 'qimochi'
+): RepoConfig {
+  switch (target) {
+    case 'yukionime':
+      return { repo: env.YUKIONIME_REPO, branch: env.YUKIONIME_BRANCH };
+    case 'yukio-data':
+      return { repo: env.YUKIO_DATA_REPO, branch: env.YUKIO_DATA_BRANCH };
+    case 'qimochi':
+    default:
+      return { repo: env.GITHUB_REPO, branch: env.GITHUB_BRANCH };
+  }
+}
+
+interface GithubFileResponse {
+  sha: string;
+  content: string;
+  encoding: string;
+  path: string;
+}
+
+interface GithubListItem {
+  name: string;
+  path: string;
+  sha: string;
+  type: 'file' | 'dir';
+}
+
+interface GitRefResponse {
+  object: { sha: string; type: string; url: string };
+  ref: string;
+  url: string;
+}
+
+interface GitCommitResponse {
+  sha: string;
+  tree: { sha: string; url: string };
+  message: string;
+  parents: { sha: string; url: string }[];
+  url: string;
+}
+
+interface GitBlobResponse {
+  sha: string;
+  url: string;
+}
+
+interface GitTreeResponse {
+  sha: string;
+  url: string;
+  truncated: boolean;
+}
+
+export interface FileToCommit {
+  path: string;
+  content: string;
+}
+
+export interface CommitResult {
+  ok: boolean;
+  sha?: string;
+  commitUrl?: string;
+  error?: string;
+}
+
+export interface MultiCommitResult extends CommitResult {
+  filesCount?: number;
+}
+
+export interface GithubFile {
+  path: string;
+  sha: string;
+  content: string;
+}
+
+async function buildHeaders(env: Env): Promise<Record<string, string>> {
+  const token = await getInstallationToken(env);
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'yukio-bot/1.0',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+function b64Encode(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) {
+    bin += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(bin);
+}
+
+function b64Decode(b64: string): string {
+  const bin = atob(b64.replace(/\s+/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+export async function githubGetFile(
+  env: Env,
+  path: string,
+  target: RepoTarget = 'qimochi'
+): Promise<GithubFile | null> {
+  const { repo, branch } = resolveRepo(env, target);
+  const headers = await buildHeaders(env);
+
+  const url = `${API_BASE}/repos/${repo}/contents/${path}?ref=${branch}`;
+  const res = await fetch(url, { headers });
+
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    throw new Error(
+      `GitHub GET ${repo}/${path} → HTTP ${res.status}: ${err.slice(0, 200)}`
+    );
+  }
+
+  const data = (await res.json()) as GithubFileResponse;
+  return {
+    path: data.path,
+    sha: data.sha,
+    content: b64Decode(data.content),
+  };
+}
+
+export async function githubCommitFile(
+  env: Env,
+  path: string,
+  content: string,
+  message: string,
+  target: RepoTarget = 'qimochi'
+): Promise<CommitResult> {
+  const { repo, branch } = resolveRepo(env, target);
+  const headers = await buildHeaders(env);
+
+  let sha: string | undefined;
+  try {
+    const existing = await githubGetFile(env, path, target);
+    if (existing) sha = existing.sha;
+  } catch {}
+
+  const body: Record<string, unknown> = {
+    message,
+    content: b64Encode(content),
+    branch,
+  };
+  if (sha) body.sha = sha;
+
+  const url = `${API_BASE}/repos/${repo}/contents/${path}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    return { ok: false, error: `HTTP ${res.status}: ${err.slice(0, 300)}` };
+  }
+
+  const data = (await res.json()) as {
+    content?: { sha: string };
+    commit?: { sha: string; html_url: string };
+  };
+
+  return {
+    ok: true,
+    sha: data.commit?.sha,
+    commitUrl: data.commit?.html_url,
+  };
+}
+
+export async function githubCommitMultipleFiles(
+  env: Env,
+  files: FileToCommit[],
+  message: string,
+  target: RepoTarget = 'qimochi'
+): Promise<MultiCommitResult> {
+  if (files.length === 0) {
+    return { ok: false, error: 'No files to commit' };
+  }
+
+  const { repo, branch } = resolveRepo(env, target);
+  const headers = await buildHeaders(env);
+  const base = `${API_BASE}/repos/${repo}`;
+
+  try {
+    const refRes = await fetch(`${base}/git/ref/heads/${branch}`, { headers });
+    if (!refRes.ok) {
+      return { ok: false, error: `Get ref failed: HTTP ${refRes.status}` };
+    }
+    const refData = (await refRes.json()) as GitRefResponse;
+    const parentCommitSha = refData.object.sha;
+
+    const commitRes = await fetch(`${base}/git/commits/${parentCommitSha}`, {
+      headers,
+    });
+    if (!commitRes.ok) {
+      return { ok: false, error: `Get commit failed: HTTP ${commitRes.status}` };
+    }
+    const commitData = (await commitRes.json()) as GitCommitResponse;
+    const baseTreeSha = commitData.tree.sha;
+
+    const blobResults = await Promise.all(
+      files.map(async (f) => {
+        const res = await fetch(`${base}/git/blobs`, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: b64Encode(f.content),
+            encoding: 'base64',
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(`Blob ${f.path} failed: HTTP ${res.status}`);
+        }
+        const data = (await res.json()) as GitBlobResponse;
+        return { path: f.path, sha: data.sha };
+      })
+    );
+
+    const treeRes = await fetch(`${base}/git/trees`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_tree: baseTreeSha,
+        tree: blobResults.map((b) => ({
+          path: b.path,
+          mode: '100644',
+          type: 'blob',
+          sha: b.sha,
+        })),
+      }),
+    });
+    if (!treeRes.ok) {
+      return { ok: false, error: `Create tree failed: HTTP ${treeRes.status}` };
+    }
+    const treeData = (await treeRes.json()) as GitTreeResponse;
+
+    const newCommitRes = await fetch(`${base}/git/commits`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message,
+        tree: treeData.sha,
+        parents: [parentCommitSha],
+      }),
+    });
+    if (!newCommitRes.ok) {
+      return {
+        ok: false,
+        error: `Create commit failed: HTTP ${newCommitRes.status}`,
+      };
+    }
+    const newCommitData = (await newCommitRes.json()) as GitCommitResponse;
+
+    const updateRes = await fetch(`${base}/git/refs/heads/${branch}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha: newCommitData.sha, force: false }),
+    });
+    if (!updateRes.ok) {
+      return { ok: false, error: `Update ref failed: HTTP ${updateRes.status}` };
+    }
+
+    return {
+      ok: true,
+      sha: newCommitData.sha,
+      commitUrl: `https://github.com/${repo}/commit/${newCommitData.sha}`,
+      filesCount: files.length,
+    };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message ?? 'unknown' };
+  }
+}
+
+export async function githubListDir(
+  env: Env,
+  path: string,
+  target: RepoTarget = 'qimochi'
+): Promise<GithubListItem[]> {
+  const { repo, branch } = resolveRepo(env, target);
+  const headers = await buildHeaders(env);
+
+  const url = `${API_BASE}/repos/${repo}/contents/${path}?ref=${branch}`;
+  const res = await fetch(url, { headers });
+
+  if (res.status === 404) return [];
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    throw new Error(
+      `GitHub LIST ${repo}/${path} → HTTP ${res.status}: ${err.slice(0, 200)}`
+    );
+  }
+
+  const data = (await res.json()) as GithubListItem[];
+  return Array.isArray(data) ? data : [];
+}
 ===== END FILE =====
 
 ===== FILE: ./src/lib/http.ts =====
@@ -10219,10 +13922,24 @@ export interface Env {
 
   VAL_TOWN_FETCH_URL: string;
 
+  YUKIO_TOKEN: string;
+
+  GITHUB_REPO: string;
+  GITHUB_BRANCH: string;
+
+  YUKIONIME_REPO: string;
+  YUKIONIME_BRANCH: string;
+
+  YUKIO_DATA_REPO: string;
+  YUKIO_DATA_BRANCH: string;
+
+  GH_APP_ID: string;
+  GH_APP_INSTALLATION_ID: string;
+  GH_APP_PRIVATE_KEY: string;
+
   DB: D1Database;
   AI: Ai;
 }
-
 ===== END FILE =====
 
 ===== FILE: ./tsconfig.json =====
@@ -10281,4 +13998,15 @@ BUSINESS_OWNER_ID = "1605070949"
 DISCORD_PUBLIC_KEY = "27f6ff67480b1af5ab5d8cd34139ca28834a2b70c85ce09170f146e803822f21"
 VAL_TOWN_FETCH_URL = "https://yukio-anime.val.run/"
 
+GITHUB_REPO = "bimaakbar-dev/qimochi"
+GITHUB_BRANCH = "main"
+
+YUKIONIME_REPO = "bimaakbar-dev/yukionime"
+YUKIONIME_BRANCH = "main"
+
+YUKIO_DATA_REPO = "bimaakbar-dev/yukio-data"
+YUKIO_DATA_BRANCH = "main"
+
+GH_APP_ID = "5219871"
+GH_APP_INSTALLATION_ID = "168750287"
 ===== END FILE =====
