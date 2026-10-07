@@ -68,6 +68,8 @@ interface GitTreeResponse {
 export interface FileToCommit {
   path: string;
   content: string;
+  target?: RepoTarget;
+  itemCount?: number;
 }
 
 export interface CommitResult {
