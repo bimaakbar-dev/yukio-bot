@@ -1,5 +1,6 @@
 // src/lib/github.ts
 import type { Env } from '../types/env';
+import { getInstallationToken } from './github-app';
 
 const API_BASE = 'https://api.github.com';
 
@@ -86,9 +87,10 @@ export interface GithubFile {
   content: string;
 }
 
-function buildHeaders(env: Env): Record<string, string> {
+async function buildHeaders(env: Env): Promise<Record<string, string>> {
+  const token = await getInstallationToken(env);
   return {
-    Authorization: `Bearer ${env.YUKIO_TOKEN}`,
+    Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
     'User-Agent': 'yukio-bot/1.0',
     'X-GitHub-Api-Version': '2022-11-28',
@@ -117,8 +119,10 @@ export async function githubGetFile(
   target: RepoTarget = 'qimochi'
 ): Promise<GithubFile | null> {
   const { repo, branch } = resolveRepo(env, target);
+  const headers = await buildHeaders(env);
+
   const url = `${API_BASE}/repos/${repo}/contents/${path}?ref=${branch}`;
-  const res = await fetch(url, { headers: buildHeaders(env) });
+  const res = await fetch(url, { headers });
 
   if (res.status === 404) return null;
   if (!res.ok) {
@@ -144,7 +148,7 @@ export async function githubCommitFile(
   target: RepoTarget = 'qimochi'
 ): Promise<CommitResult> {
   const { repo, branch } = resolveRepo(env, target);
-  const url = `${API_BASE}/repos/${repo}/contents/${path}`;
+  const headers = await buildHeaders(env);
 
   let sha: string | undefined;
   try {
@@ -159,9 +163,10 @@ export async function githubCommitFile(
   };
   if (sha) body.sha = sha;
 
+  const url = `${API_BASE}/repos/${repo}/contents/${path}`;
   const res = await fetch(url, {
     method: 'PUT',
-    headers: { ...buildHeaders(env), 'Content-Type': 'application/json' },
+    headers: { ...headers, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
@@ -193,7 +198,7 @@ export async function githubCommitMultipleFiles(
   }
 
   const { repo, branch } = resolveRepo(env, target);
-  const headers = buildHeaders(env);
+  const headers = await buildHeaders(env);
   const base = `${API_BASE}/repos/${repo}`;
 
   try {
@@ -292,8 +297,10 @@ export async function githubListDir(
   target: RepoTarget = 'qimochi'
 ): Promise<GithubListItem[]> {
   const { repo, branch } = resolveRepo(env, target);
+  const headers = await buildHeaders(env);
+
   const url = `${API_BASE}/repos/${repo}/contents/${path}?ref=${branch}`;
-  const res = await fetch(url, { headers: buildHeaders(env) });
+  const res = await fetch(url, { headers });
 
   if (res.status === 404) return [];
   if (!res.ok) {
