@@ -13,6 +13,7 @@ import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
 import { setupPublishCallbacks } from './commands/publish';
 import { setupFranchisesCallbacks } from './commands/franchises';
 import { setupPublishDbaCallbacks } from './commands/publish-dba';
+import { setupPublishDataCallbacks } from './commands/publish-data';
 import { COMMANDS } from './commands/list';
 
 let cachedBot: Bot | null = null;
@@ -39,6 +40,7 @@ function createBot(env: Env): Bot {
   setupPublishCallbacks(bot, env);
   setupFranchisesCallbacks(bot, env);
   setupPublishDbaCallbacks(bot, env);
+  setupPublishDataCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
