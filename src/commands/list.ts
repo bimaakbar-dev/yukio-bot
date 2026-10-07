@@ -18,6 +18,7 @@ import {
   publishBatchCommand,
   batchResetCommand,
 } from './publish';
+import { publishFranchisesCommand } from './franchises';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -37,4 +38,5 @@ export const COMMANDS: CommandDefinition[] = [
   publishAnimeCommand,
   publishBatchCommand,
   batchResetCommand,
+  publishFranchisesCommand,
 ];
