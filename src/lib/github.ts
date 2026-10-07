@@ -222,6 +222,10 @@ export async function githubCommitMultipleFiles(
 
     const blobResults = await Promise.all(
       files.map(async (f) => {
+        if (f.content === null) {
+          return { path: f.path, sha: null as string | null };
+        }
+
         const res = await fetch(`${base}/git/blobs`, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
@@ -234,7 +238,7 @@ export async function githubCommitMultipleFiles(
           throw new Error(`Blob ${f.path} failed: HTTP ${res.status}`);
         }
         const data = (await res.json()) as GitBlobResponse;
-        return { path: f.path, sha: data.sha };
+        return { path: f.path, sha: data.sha as string | null };
       })
     );
 
@@ -243,12 +247,11 @@ export async function githubCommitMultipleFiles(
       headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         base_tree: baseTreeSha,
-        tree: blobResults.map((b) => ({
-          path: b.path,
-          mode: '100644',
-          type: 'blob',
-          sha: b.sha,
-        })),
+        tree: blobResults.map((b) =>
+          b.sha === null
+            ? { path: b.path, mode: '100644', type: 'blob', sha: null }
+            : { path: b.path, mode: '100644', type: 'blob', sha: b.sha }
+        ),
       }),
     });
     if (!treeRes.ok) {
