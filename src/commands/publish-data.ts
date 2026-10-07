@@ -68,7 +68,7 @@ async function ensurePendingDb(db: D1Database): Promise<void> {
     try {
       await db
         .prepare(
-          `CREATE TABLE IF NOT EXISTS pending_data_sections (
+          `CREATE TABLE IF NOT EXISTS pending_data_v2 (
             session_id  TEXT PRIMARY KEY,
             user_id     INTEGER NOT NULL,
             slug        TEXT NOT NULL,
@@ -110,7 +110,7 @@ async function savePending(
 
   await db
     .prepare(
-      `INSERT INTO pending_data_sections
+      `INSERT INTO pending_data_v2
         (session_id, user_id, slug, section, files_json, total_items, file_count, total_size, created_at, expires_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
@@ -138,7 +138,7 @@ async function getPending(
   await ensurePendingDb(db);
 
   const row = await db
-    .prepare('SELECT * FROM pending_data_sections WHERE session_id = ?')
+    .prepare('SELECT * FROM pending_data_v2 WHERE session_id = ?')
     .bind(sessionId)
     .first<PendingRow>();
 
@@ -146,7 +146,7 @@ async function getPending(
 
   if (row.expires_at < Date.now()) {
     await db
-      .prepare('DELETE FROM pending_data_sections WHERE session_id = ?')
+      .prepare('DELETE FROM pending_data_v2 WHERE session_id = ?')
       .bind(sessionId)
       .run()
       .catch(() => {});
@@ -163,7 +163,7 @@ async function deletePending(
   try {
     await ensurePendingDb(db);
     await db
-      .prepare('DELETE FROM pending_data_sections WHERE session_id = ?')
+      .prepare('DELETE FROM pending_data_v2 WHERE session_id = ?')
       .bind(sessionId)
       .run();
   } catch (err) {
