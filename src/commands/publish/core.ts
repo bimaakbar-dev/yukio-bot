@@ -7,6 +7,7 @@ import { escapeHtml, slugify } from '../../lib/utils';
 import { getLatestSessionByUser } from '../../lib/dba-session';
 import {
   buildMetadataFile,
+  buildQimochiMarkdownFromDba,
   buildCharacterFiles,
   buildEpisodeFiles,
   buildFranchiseFiles,
@@ -14,7 +15,12 @@ import {
 } from './builders';
 import { buildPreviewLines, buildPreviewKeyboard } from './preview';
 import { savePendingPublish } from './state';
-import { ALL_SECTIONS, emptySummary, sectionFromPath, type SectionKey } from './types';
+import {
+  ALL_SECTIONS,
+  emptySummary,
+  sectionFromPath,
+  type SectionKey,
+} from './types';
 
 export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
   const userId = ctx.from?.id;
@@ -40,12 +46,20 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
     const files: FileToCommit[] = [];
     const summary = emptySummary();
 
+    /* ── Metadata → yukionime + qimochi ──────── */
     const metaFile = await buildMetadataFile(env, session, slug);
     if (metaFile) {
       files.push(metaFile);
       summary.yukionime.metadata = true;
     }
 
+    // Auto-mirror markdown tipis ke qimochi
+    const qimochiMd = buildQimochiMarkdownFromDba(session, slug);
+    if (qimochiMd) {
+      files.push(qimochiMd);
+    }
+
+    /* ── Characters ──────────────────────────── */
     try {
       const charFiles = await buildCharacterFiles(env, session.session_id, slug);
       if (charFiles.length > 0) {
@@ -58,6 +72,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       console.warn('[Publish] buildCharacterFiles error:', err);
     }
 
+    /* ── Episodes ────────────────────────────── */
     try {
       const epFiles = await buildEpisodeFiles(env, session.session_id, slug);
       if (epFiles.length > 0) {
@@ -70,6 +85,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       console.warn('[Publish] buildEpisodeFiles error:', err);
     }
 
+    /* ── Franchises ──────────────────────────── */
     try {
       const frFiles = await buildFranchiseFiles(session, slug);
       if (frFiles.length > 0) {
@@ -94,6 +110,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       console.warn('[Publish] buildFranchiseFiles error:', err);
     }
 
+    /* ── Actors ──────────────────────────────── */
     try {
       const vaFiles = await buildActorFiles(env);
       if (vaFiles.length > 0) {
@@ -106,6 +123,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       console.warn('[Publish] buildActorFiles error:', err);
     }
 
+    /* ── Empty check ─────────────────────────── */
     if (files.length === 0) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
@@ -117,6 +135,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       return;
     }
 
+    /* ── Preview ─────────────────────────────── */
     const availableSections = new Set<SectionKey>();
     for (const f of files) {
       availableSections.add(sectionFromPath(f.path));
