@@ -635,34 +635,34 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        if (action === 'e') {
-          const { data: result, error } = await safeFetch(
-            () => chainEpisodes(chainCtx),
-            30000
-          );
+		if (action === 'e') {
+  		const { data: result, error } = await safeFetch(
+    		() => chainEpisodes(chainCtx),
+    		30000
+  		);
 
-          if (!result || !result.data || result.data.length === 0) {
-            const errs = result?.errors ?? [error ?? 'unknown'];
-            await sendTextSection(
-              ctx,
-              `Episodes — ${session.title} [FAILED]`,
-              fallbackJson(errs),
-              tracker
-            );
-            return;
-          }
+  		if (!result || !result.data || result.data.length === 0) {
+    		const errs = result?.errors ?? [error ?? 'unknown'];
+    		await sendTextSection(
+      		ctx,
+      		`Episodes — ${session.title} [FAILED]`,
+      		fallbackJson(errs),
+      		tracker
+    		);
+    		return;
+  		}
 
-          const eps = result.data;
-          const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
+  		const eps = result.data;
+  		const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
 
-          await sendJsonSection(
-            ctx,
-            `Episodes — ${session.title} [${result.source}]${truncNote}`,
-            eps,
-            tracker
-          );
-          return;
-        }
+  		await sendJsonSection(
+    		ctx,
+    		`Episodes — ${session.title} [${result.source}]${truncNote}`,
+    		eps,
+    		tracker
+  		);
+  		return;
+		}
 
         if (action === 'f') {
           const { data: result, error } = await safeFetch(
