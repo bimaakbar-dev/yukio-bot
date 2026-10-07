@@ -58,6 +58,7 @@ import {
   markPartSent,
   CHAR_PART_SIZE,
 } from '../lib/dba-characters';
+import { saveEpCache } from '../lib/dba-episodes';
 import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
