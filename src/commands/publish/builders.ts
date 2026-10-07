@@ -5,7 +5,11 @@ import type { FileToCommit } from '../../lib/github';
 import { stripHtml, chunkArray, looksIndonesian } from '../../lib/utils';
 import { getCharCache, CHAR_PART_SIZE } from '../../lib/dba-characters';
 import { getEpCache } from '../../lib/dba-episodes';
-import { getAllVoiceActors } from '../../lib/dba-voice-actors';
+import {
+  getAllVoiceActors,
+  type VoiceActorRow,
+} from '../../lib/dba-voice-actors';
+import type { UnifiedCharacter } from '../../services/qimochi-chain-extras';
 import { buildMetadataYaml } from '../../services/qimochi-yaml';
 import { chainRelations } from '../../services/qimochi-chain-extras';
 import { askAI } from '../../services/ai';
@@ -17,6 +21,69 @@ import {
   EP_PART_SIZE,
   RELATION_FETCH_TIMEOUT_MS,
 } from './types';
+
+function hasText(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function isHttpUrl(v: unknown): v is string {
+  if (!hasText(v)) return false;
+  try {
+    const u = new URL(v);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+interface CleanCharacter {
+  name: string;
+  role: 'main' | 'supporting' | 'background';
+  voiceActors: string[];
+  nameNative?: string;
+  image?: string;
+}
+
+function sanitizeCharacter(c: UnifiedCharacter): CleanCharacter {
+  const out: CleanCharacter = {
+    name: hasText(c.name) ? c.name.trim() : 'Unknown',
+    role:
+      c.role === 'main' || c.role === 'supporting' || c.role === 'background'
+        ? c.role
+        : 'background',
+    voiceActors: Array.isArray(c.voiceActors)
+      ? c.voiceActors.filter(hasText)
+      : [],
+  };
+
+  if (hasText(c.nameNative)) out.nameNative = c.nameNative.trim();
+  if (isHttpUrl(c.image)) out.image = c.image.trim();
+
+  return out;
+}
+
+interface CleanActor {
+  id: string;
+  name: string;
+  nameNative?: string;
+  image?: string;
+  defaultLanguage?: string;
+}
+
+function sanitizeActor(va: VoiceActorRow): CleanActor {
+  const out: CleanActor = {
+    id: hasText(va.id) ? va.id.trim().toLowerCase() : 'unknown',
+    name: hasText(va.name) ? va.name.trim() : 'Unknown',
+  };
+
+  if (hasText(va.nameNative)) out.nameNative = va.nameNative.trim();
+  if (isHttpUrl(va.image)) out.image = va.image.trim();
+  if (hasText(va.defaultLanguage)) {
+    out.defaultLanguage = va.defaultLanguage.trim();
+  }
+
+  return out;
+}
 
 async function rewriteSynopsisToId(
   env: Env,
@@ -106,7 +173,8 @@ export async function buildCharacterFiles(
   const cache = await getCharCache(env.DB, sessionId);
   if (!cache || cache.chars.length === 0) return [];
 
-  const chunks = chunkArray(cache.chars, CHAR_PART_SIZE);
+  const sanitized = cache.chars.map(sanitizeCharacter);
+  const chunks = chunkArray(sanitized, CHAR_PART_SIZE);
   const files: FileToCommit[] = [];
 
   let cursor = 1;
@@ -197,8 +265,10 @@ export async function buildActorFiles(env: Env): Promise<FileToCommit[]> {
   const vas = await getAllVoiceActors(env.DB);
   if (vas.length === 0) return [];
 
-  const groups = new Map<string, typeof vas>();
-  for (const va of vas) {
+  const sanitized: CleanActor[] = vas.map(sanitizeActor);
+
+  const groups = new Map<string, CleanActor[]>();
+  for (const va of sanitized) {
     const first = (va.id.charAt(0) || '').toLowerCase();
     const letter = /^[a-z]$/.test(first) ? first : '_';
     if (!groups.has(letter)) groups.set(letter, []);
