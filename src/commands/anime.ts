@@ -27,8 +27,13 @@ import {
   getTempAnime,
   deleteTempAnime,
 } from '../lib/temp-anime';
+import { githubCommitFile } from '../lib/github';
+import { chainRelations } from '../services/qimochi-chain-extras';
+import { filterFranchises, RELATION_LABEL } from '../lib/franchises';
+import { safeFetch } from '../lib/dba-common';
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const RELATION_FETCH_TIMEOUT_MS = 8000;
 
 function buildInfoMessage(media: AniListMedia): string {
   const title = pickTitle(media);
@@ -224,6 +229,7 @@ export const animeCommand: CommandDefinition = {
           cover: yukionime.match.image ?? null,
           sourceLabel: '📚 Dari Yukionime (database)',
           slug,
+          metadataJson: JSON.stringify(media),
         });
 
         const keyboard = new InlineKeyboard()
@@ -368,10 +374,16 @@ export const animeCommand: CommandDefinition = {
         console.log('[Anime] no AI needed — skipping');
       }
 
+      /* ========================================================
+         STEP 5: INJECT SYNOPSIS YUKIONIME
+         ======================================================== */
       if (yukionime.synopsis) {
         enriched = { ...(enriched ?? {}), synopsis: yukionime.synopsis };
       }
 
+      /* ========================================================
+         STEP 6: BUILD RESULT
+         ======================================================== */
       const result = buildQimochiHubResult(media, enriched);
       const { yaml, body, missing } = result;
       let aiUsed = result.aiUsed;
@@ -392,6 +404,7 @@ export const animeCommand: CommandDefinition = {
         cover: media.coverImage.extraLarge || media.coverImage.large || null,
         sourceLabel: sourceLabel || null,
         slug,
+        metadataJson: JSON.stringify(media),
       });
 
       const keyboard = new InlineKeyboard()
@@ -521,20 +534,190 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
 
     const targetPath = `src/content/anime/${slug}.md`;
 
-    const pubKb = new InlineKeyboard()
-      .text('📤 Publish ke Web', `pub:an:${sessionId}`)
-      .text('❌ Batal', `pub:skip:${sessionId}`);
+    const kb = new InlineKeyboard()
+      .text('🔗 Ambil Franchises', `an:fr:${sessionId}`)
+      .row()
+      .text('📤 Post ke qimochi', `pub:an:${sessionId}`)
+      .text('❌ Batal', `an:x:${sessionId}`);
 
     await ctx.reply(
       `✅ <b>Review selesai?</b>\n\n` +
-        `📁 Target:\n<code>${escapeHtml(targetPath)}</code>\n\n` +
-        `Kalau cocok, klik tombol Publish di bawah.`,
+        `📁 Target markdown:\n<code>${escapeHtml(targetPath)}</code>\n\n` +
+        `<b>Action berikutnya:</b>\n` +
+        `• <b>🔗 Ambil Franchises</b> — fetch relations & push ke qimochi\n` +
+        `• <b>📤 Post ke qimochi</b> — push markdown .md`,
       {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
-        reply_markup: pubKb,
+        reply_markup: kb,
       }
     );
+  });
+
+  /* ────────────────────────────────────────────────────────
+     an:fr — Fetch franchises & push ke qimochi
+     ──────────────────────────────────────────────────────── */
+  bot.callbackQuery(/^an:fr:([a-f0-9]+)$/, async (ctx) => {
+    const [, sessionId] = ctx.match as RegExpMatchArray;
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌ Session tidak valid' });
+      return;
+    }
+
+    const session = await getTempAnime(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Session kadaluarsa. Ulangi /anime.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    if (ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+      return;
+    }
+
+    if (!session.metadata_json) {
+      await ctx.answerCallbackQuery({
+        text: '❌ Metadata kosong, tidak bisa fetch franchises.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    let media: AniListMedia;
+    try {
+      media = JSON.parse(session.metadata_json) as AniListMedia;
+    } catch {
+      await ctx.answerCallbackQuery({
+        text: '❌ Metadata corrupt.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const malId = media.myanimelistId ?? null;
+    const slug = session.slug;
+
+    if (!malId) {
+      await ctx.answerCallbackQuery({
+        text: '❌ MAL ID tidak ada. Tidak bisa fetch franchises.',
+        show_alert: true,
+      });
+      return;
+    }
+    if (!slug) {
+      await ctx.answerCallbackQuery({
+        text: '❌ Slug kosong.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '🔗 Fetch franchises...' });
+
+    const loading = await ctx.reply(
+      `🔗 Fetch relations dari Shikimori (MAL ID: <code>${malId}</code>)...`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+
+    const { data: result } = await safeFetch(
+      () =>
+        chainRelations({
+          malId,
+          kitsuId: null,
+          title: pickTitle(media),
+        }),
+      RELATION_FETCH_TIMEOUT_MS
+    );
+
+    if (!result || !result.data || result.data.length === 0) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `⚠️ <b>Tidak ada relations.</b>\n\n` +
+            `<i>Error: ${escapeHtml((result?.errors ?? ['timeout']).join('; ').slice(0, 300))}</i>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    const filtered = filterFranchises(result.data);
+    if (filtered.length === 0) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `⚠️ Semua relation (${result.data.length}) difilter habis.`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    const json = JSON.stringify(filtered, null, 2) + '\n';
+    const targetPath = `src/data/anime/${slug}/franchises.json`;
+
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `📤 Push <code>${escapeHtml(targetPath)}</code> ke qimochi...`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+
+    const commit = await githubCommitFile(
+      env,
+      targetPath,
+      json,
+      `feat(franchises): add for ${slug}`,
+      'qimochi'
+    );
+
+    if (!commit.ok) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `❌ <b>Gagal push franchises</b>\n\n<code>${escapeHtml(commit.error ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    const commitShort = commit.sha?.slice(0, 7) ?? '?';
+    const previewLines = filtered
+      .slice(0, 8)
+      .map((r, i) => {
+        const label = RELATION_LABEL[r.relation] ?? r.relation;
+        return `${i + 1}. <b>${escapeHtml(label)}</b> → <code>${escapeHtml(r.slug)}</code>`;
+      });
+    const more =
+      filtered.length > 8
+        ? `\n<i>…dan ${filtered.length - 8} lainnya</i>`
+        : '';
+
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `✅ <b>Franchises posted!</b>\n\n` +
+          `📁 <code>${escapeHtml(targetPath)}</code>\n` +
+          `📊 ${filtered.length} relation\n` +
+          `🔗 Commit: <code>${commitShort}</code>\n\n` +
+          previewLines.join('\n') +
+          more,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        }
+      )
+      .catch(() => {});
   });
 
   bot.callbackQuery(/^an:x:([a-f0-9]+)$/, async (ctx) => {

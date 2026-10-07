@@ -20,6 +20,7 @@ import {
 } from '../lib/utils';
 import { getCharCache, CHAR_PART_SIZE } from '../lib/dba-characters';
 import { getEpCache } from '../lib/dba-episodes';
+import { getAllVoiceActors } from '../lib/dba-voice-actors';
 import {
   getLatestSessionByUser,
   type SessionRow as DbaSessionRow,
@@ -409,6 +410,31 @@ async function buildFranchiseFiles(
       itemCount,
     },
   ];
+}
+
+async function buildActorFiles(env: Env): Promise<FileToCommit[]> {
+  const vas = await getAllVoiceActors(env.DB);
+  if (vas.length === 0) return [];
+
+  const groups = new Map<string, typeof vas>();
+  for (const va of vas) {
+    const first = (va.id.charAt(0) || '').toLowerCase();
+    const letter = /^[a-z]$/.test(first) ? first : '_';
+    if (!groups.has(letter)) groups.set(letter, []);
+    groups.get(letter)!.push(va);
+  }
+
+  const files: FileToCommit[] = [];
+  for (const [letter, items] of groups) {
+    items.sort((a, b) => a.id.localeCompare(b.id));
+    files.push({
+      path: `data/actors/${letter}.json`,
+      content: JSON.stringify(items, null, 2) + '\n',
+      target: 'yukio-data',
+      itemCount: items.length,
+    });
+  }
+  return files;
 }
 
 function buildPreviewLines(
@@ -946,6 +972,19 @@ async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       }
     } catch (err) {
       console.warn('[Publish] buildFranchiseFiles error:', err);
+    }
+
+    // Actors (Step 6) — group semua VA global by huruf pertama id
+    try {
+      const vaFiles = await buildActorFiles(env);
+      if (vaFiles.length > 0) {
+        files.push(...vaFiles);
+        let total = 0;
+        for (const vf of vaFiles) total += vf.itemCount ?? 0;
+        summary.yukioData.actors = { count: total, files: vaFiles.length };
+      }
+    } catch (err) {
+      console.warn('[Publish] buildActorFiles error:', err);
     }
 
     if (files.length === 0) {

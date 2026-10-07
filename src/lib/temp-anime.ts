@@ -13,6 +13,7 @@ export interface TempAnimeRow {
   cover: string | null;
   source_label: string | null;
   slug: string | null;
+  metadata_json: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -29,22 +30,28 @@ export async function ensureDb(db: D1Database): Promise<void> {
       await db
         .prepare(
           `CREATE TABLE IF NOT EXISTS temp_anime (
-            session_id   TEXT PRIMARY KEY,
-            user_id      INTEGER NOT NULL,
-            yaml         TEXT NOT NULL,
-            body         TEXT NOT NULL,
-            missing      TEXT NOT NULL,
-            ai_used      TEXT NOT NULL,
-            cover        TEXT,
-            source_label TEXT,
-            slug         TEXT,
-            created_at   INTEGER NOT NULL,
-            expires_at   INTEGER NOT NULL
+            session_id    TEXT PRIMARY KEY,
+            user_id       INTEGER NOT NULL,
+            yaml          TEXT NOT NULL,
+            body          TEXT NOT NULL,
+            missing       TEXT NOT NULL,
+            ai_used       TEXT NOT NULL,
+            cover         TEXT,
+            source_label  TEXT,
+            slug          TEXT,
+            metadata_json TEXT,
+            created_at    INTEGER NOT NULL,
+            expires_at    INTEGER NOT NULL
           )`
         )
         .run();
       try {
         await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
+      } catch {}
+      try {
+        await db
+          .prepare('ALTER TABLE temp_anime ADD COLUMN metadata_json TEXT')
+          .run();
       } catch {}
       dbReady = true;
     } catch (err) {
@@ -65,6 +72,7 @@ export interface SaveTempAnimeInput {
   cover: string | null;
   sourceLabel: string | null;
   slug: string;
+  metadataJson?: string | null;
 }
 
 export async function saveTempAnime(
@@ -80,8 +88,8 @@ export async function saveTempAnime(
   await db
     .prepare(
       `INSERT INTO temp_anime
-         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, slug, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (session_id, user_id, yaml, body, missing, ai_used, cover, source_label, slug, metadata_json, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
@@ -93,6 +101,7 @@ export async function saveTempAnime(
       data.cover,
       data.sourceLabel,
       data.slug,
+      data.metadataJson ?? null,
       now,
       now + ANIME_SESSION_TTL_MS
     )

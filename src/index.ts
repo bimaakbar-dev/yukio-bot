@@ -11,6 +11,8 @@ import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
 import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
 import { setupPublishCallbacks } from './commands/publish';
+import { setupPostCallbacks } from './commands/post';
+import { setupKillCallbacks } from './commands/kill';
 import { COMMANDS } from './commands/list';
 
 const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
@@ -37,6 +39,8 @@ function createBot(env: Env): Bot {
   setupDatabaseAnimeCallbacks(bot, env);
   setupVaCallbacks(bot, env);
   setupPublishCallbacks(bot, env);
+  setupPostCallbacks(bot, env);
+  setupKillCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
