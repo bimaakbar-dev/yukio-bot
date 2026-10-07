@@ -15,11 +15,7 @@ database_id = "8b0b931d-b4f7-41c0-885b-6e90c11c8bb7"
 enabled = true
 
 [triggers]
-crons = [
-  "0 3 * * *",
-  "0 23 * * *",
-  "0 11 * * *",
-]
+crons = ["0 3 * * *", "0 22 * * *", "0 6 * * *", "0 14 * * *", "0 17 * * *"]
 
 [vars]
 ADMIN_USER_ID = "1605070949"
