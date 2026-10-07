@@ -7,6 +7,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { AniListMedia } from '../types/anime';
 import { githubCommitFile, githubGetFile } from '../lib/github';
 import { buildMetadataYaml } from '../services/qimochi-yaml';
+import { askAI } from '../services/ai';
 
 const TTL_MS = 30 * 60 * 1000;
 
@@ -152,10 +153,67 @@ function stripHtml(s: string): string {
     .trim();
 }
 
-function buildMarkdown(
+function looksIndonesian(s: string): boolean {
+  const lower = s.toLowerCase();
+  const words = [
+    ' yang ', ' dengan ', ' untuk ', ' adalah ', ' dan ',
+    ' di ', ' ke ', ' dari ', ' ini ', ' itu ', ' tidak ',
+  ];
+  let count = 0;
+  for (const w of words) if (lower.includes(w)) count++;
+  return count >= 3;
+}
+
+async function buildSynopsis(
+  env: Env,
+  title: string,
+  rawDesc: string
+): Promise<string> {
+  if (!rawDesc || rawDesc.length < 30) {
+    return '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.';
+  }
+
+  const clean = stripHtml(rawDesc);
+
+  if (looksIndonesian(clean)) {
+    return clean;
+  }
+
+  const prompt =
+    `Tulis ulang sinopsis anime berikut menjadi bahasa Indonesia yang natural.\n\n` +
+    `Judul: ${title}\n\n` +
+    `Sinopsis referensi:\n${clean.slice(0, 2000)}\n\n` +
+    `ATURAN:\n` +
+    `- Tulis sebagai sinopsis baru, BUKAN terjemahan literal\n` +
+    `- Bahasa Indonesia natural dan mengalir\n` +
+    `- 2-3 paragraf pendek\n` +
+    `- Jangan spoiler\n` +
+    `- Jangan tambahkan info yang tidak ada di referensi\n` +
+    `- Langsung mulai dari tokoh utama atau setting\n\n` +
+    `Output hanya sinopsis, tanpa penjelasan tambahan.`;
+
+  try {
+    const result = await askAI(env, prompt, {
+      maxTokens: 700,
+      temperature: 0.6,
+      smart: true,
+    });
+
+    if (result && result.length > 50) {
+      return result.trim();
+    }
+  } catch (err) {
+    console.warn('[PublishDBA] AI rewrite failed:', err);
+  }
+
+  return clean;
+}
+
+async function buildMarkdown(
+  env: Env,
   session: SessionRow,
   media: AniListMedia
-): string {
+): Promise<string> {
   const yaml = buildMetadataYaml({
     media,
     malId: session.mal_id ?? null,
@@ -163,9 +221,7 @@ function buildMarkdown(
   });
 
   const rawSynopsis = media.description ?? '';
-  const body = rawSynopsis
-    ? stripHtml(rawSynopsis)
-    : '> ⚠️ Sinopsis belum tersedia. Silakan isi manual.';
+  const body = await buildSynopsis(env, session.title, rawSynopsis);
 
   return `${yaml}\n\n${body}\n`;
 }
@@ -191,12 +247,32 @@ async function doPublishDba(
     return;
   }
 
-  const slug = slugify(session.title);
-  const markdown = buildMarkdown(session, media);
-  const targetPath = `src/content/anime/${slug}.md`;
-
   if (!ctx.from?.id) return;
 
+  const slug = slugify(session.title);
+
+  const loadingMsg = await ctx.reply('🤖 Generate sinopsis Indonesia...');
+
+  let markdown: string;
+  try {
+    markdown = await buildMarkdown(env, session, media);
+  } catch (err) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loadingMsg.message_id,
+        `❌ Gagal generate sinopsis: <code>${escapeHtml((err as Error).message ?? 'unknown')}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+    return;
+  }
+
+  await ctx.api
+    .deleteMessage(ctx.chat!.id, loadingMsg.message_id)
+    .catch(() => {});
+
+  const targetPath = `src/content/anime/${slug}.md`;
   const pendingId = await savePending(env.DB, ctx.from.id, slug, markdown);
 
   let existing: Awaited<ReturnType<typeof githubGetFile>> = null;
