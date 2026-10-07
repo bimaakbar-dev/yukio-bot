@@ -22,6 +22,10 @@ import {
   RELATION_FETCH_TIMEOUT_MS,
 } from './types';
 
+/* ============================================================
+   SANITIZERS
+   ============================================================ */
+
 function hasText(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0;
 }
@@ -85,6 +89,10 @@ function sanitizeActor(va: VoiceActorRow): CleanActor {
   return out;
 }
 
+/* ============================================================
+   AI REWRITE SYNOPSIS
+   ============================================================ */
+
 async function rewriteSynopsisToId(
   env: Env,
   title: string,
@@ -119,6 +127,10 @@ async function rewriteSynopsisToId(
   return null;
 }
 
+/* ============================================================
+   QIMOCHI YAML HELPERS
+   ============================================================ */
+
 function escapeQimochiYaml(s: string): string {
   const cleaned = s.replace(/\n/g, ' ').trim();
   const needsQuote =
@@ -128,6 +140,10 @@ function escapeQimochiYaml(s: string): string {
   if (!needsQuote) return cleaned;
   return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
+
+/* ============================================================
+   RESOLVE BODY (dipakai bareng yukionime + qimochi)
+   ============================================================ */
 
 export async function resolveSessionBody(
   env: Env,
@@ -152,6 +168,10 @@ export async function resolveSessionBody(
   return aiBody ?? clean;
 }
 
+/* ============================================================
+   BUILDERS — yukionime
+   ============================================================ */
+
 export function buildMetadataFile(
   session: DbaSessionRow,
   slug: string,
@@ -170,6 +190,10 @@ export function buildMetadataFile(
     target: 'yukionime',
   };
 }
+
+/* ============================================================
+   BUILDERS — qimochi (mirror tipis dari DBA)
+   ============================================================ */
 
 export function buildQimochiMarkdownFromDba(
   slug: string,
@@ -228,6 +252,7 @@ export function buildQimochiMarkdownFromDba(
     `studio: ${escapeQimochiYaml(studio)}`,
     `releaseDate: ${releaseDate}`,
     `addedAt: ${addedAt}`,
+    `updatedAt: ${addedAt}`,
     `rating: ${rating}`,
     '---',
   ];
@@ -239,6 +264,10 @@ export function buildQimochiMarkdownFromDba(
     itemCount: 1,
   };
 }
+
+/* ============================================================
+   BUILDERS — yukio-data
+   ============================================================ */
 
 export async function buildCharacterFiles(
   env: Env,
