@@ -19,6 +19,7 @@ import {
   batchResetCommand,
 } from './publish';
 import { publishFranchisesCommand } from './franchises';
+import { publishDbaCommand } from './publish-dba';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -39,4 +40,5 @@ export const COMMANDS: CommandDefinition[] = [
   publishBatchCommand,
   batchResetCommand,
   publishFranchisesCommand,
+  publishDbaCommand,
 ];
