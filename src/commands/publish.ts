@@ -16,18 +16,10 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/* ============================================================
-   TYPES
-   ============================================================ */
-
 export interface EpisodeObject {
   number: number;
   streams: { quality: string; servers: { name: string; url: string }[] }[];
 }
-
-/* ============================================================
-   ANIME SESSION (temp_anime)
-   ============================================================ */
 
 interface SessionRow {
   session_id: string;
@@ -77,10 +69,6 @@ function buildMarkdown(session: SessionRow): string {
   const body = session.body.trim();
   return `${session.yaml}\n\n${body}\n`;
 }
-
-/* ============================================================
-   BATCH SESSION (batch_sessions)
-   ============================================================ */
 
 let batchDbReady = false;
 let batchDbInitPromise: Promise<void> | null = null;
@@ -248,10 +236,6 @@ export async function resetBatchSessions(
   }
 }
 
-/* ============================================================
-   START OR APPEND BATCH
-   ============================================================ */
-
 export interface StartOrAppendResult {
   sessionId: string;
   mode: 'created' | 'appended' | 'reset_and_created';
@@ -282,7 +266,6 @@ export async function startOrAppendBatch(
   const existing = await getActiveSession(db, userId);
   const now = Date.now();
 
-  // Determine mode
   let mode: StartOrAppendResult['mode'];
   let existingEpisodes: EpisodeObject[] = [];
   let sessionId: string;
@@ -296,7 +279,6 @@ export async function startOrAppendBatch(
     !existing.slug_hint ||
     existing.slug_hint === data.slugHint
   ) {
-    // Same series atau salah satu null → append
     mode = 'appended';
     sessionId = existing.session_id;
     isSameSeries = true;
@@ -306,13 +288,11 @@ export async function startOrAppendBatch(
       existingEpisodes = [];
     }
   } else {
-    // Different series → reset & create new
     mode = 'reset_and_created';
     await deleteBatchSession(db, existing.session_id);
     sessionId = 'b_' + crypto.randomUUID().replace(/-/g, '').slice(0, 14);
   }
 
-  // Dedup by number
   const existingNumbers = new Set(existingEpisodes.map((e) => e.number));
   const added: number[] = [];
   const skipped: number[] = [];
@@ -342,7 +322,6 @@ export async function startOrAppendBatch(
   );
   const combinedJson = JSON.stringify(merged, null, 2) + '\n';
 
-  // Merge errors (keep last 20)
   let existingErrors: string[] = [];
   if (existing && isSameSeries && existing.errors) {
     try {
@@ -415,10 +394,6 @@ export async function startOrAppendBatch(
   };
 }
 
-/* ============================================================
-   LEVENSHTEIN
-   ============================================================ */
-
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
@@ -469,10 +444,6 @@ async function findSimilarSlugs(
     return [];
   }
 }
-
-/* ============================================================
-   ANIME — PUSH
-   ============================================================ */
 
 async function doPublishAnime(
   ctx: Context,
@@ -581,10 +552,6 @@ async function doPublishAnime(
     .catch(() => {});
 }
 
-/* ============================================================
-   BATCH — FLOW
-   ============================================================ */
-
 async function doPublishBatchInitial(
   ctx: Context,
   env: Env,
@@ -615,7 +582,6 @@ async function doPublishBatchInitial(
     suggestions.map((s) => s.slug)
   );
 
-  const episodeCount = session.max_ep - session.min_ep + 1;
   const lines: string[] = [];
   lines.push(`📦 <b>Publish Batch</b>`);
   lines.push('');
@@ -713,7 +679,6 @@ async function doPublishBatchPreview(
     return;
   }
 
-  // File naming: min-max
   const path = `src/data/anime/${slug}/episodes/${session.min_ep}-${session.max_ep}.json`;
   const sizeKB = Math.round(session.combined_json.length / 1024);
 
@@ -835,12 +800,7 @@ async function doPublishBatchPush(
     .catch(() => {});
 }
 
-/* ============================================================
-   CALLBACKS
-   ============================================================ */
-
 export function setupPublishCallbacks(bot: Bot, env: Env): void {
-  // === Anime ===
   bot.callbackQuery(/^pub:an:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
@@ -861,7 +821,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     await ctx.reply('❌ <b>Dibatalkan.</b>', { parse_mode: 'HTML' }).catch(() => {});
   });
 
-  // === Batch ===
   bot.callbackQuery(/^pub:ba:(b_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
@@ -889,7 +848,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     await ctx.reply('❌ <b>Batch dibatalkan.</b>', { parse_mode: 'HTML' }).catch(() => {});
   });
 
-  // ➕ Tambah Batch — info cara nambah
   bot.callbackQuery(/^pub:baadd:(b_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
@@ -916,10 +874,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     );
   });
 }
-
-/* ============================================================
-   COMMAND: /publish_anime
-   ============================================================ */
 
 export const publishAnimeCommand: CommandDefinition = {
   name: 'publish_anime',
@@ -1004,10 +958,6 @@ export const publishAnimeCommand: CommandDefinition = {
   },
 };
 
-/* ============================================================
-   COMMAND: /publish_batch
-   ============================================================ */
-
 export const publishBatchCommand: CommandDefinition = {
   name: 'publish_batch',
   description: 'Push batch episode ke repo web',
@@ -1046,10 +996,6 @@ export const publishBatchCommand: CommandDefinition = {
     );
   },
 };
-
-/* ============================================================
-   COMMAND: /batch_reset
-   ============================================================ */
 
 export const batchResetCommand: CommandDefinition = {
   name: 'batch_reset',
