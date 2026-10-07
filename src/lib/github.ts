@@ -3,6 +3,28 @@ import type { Env } from '../types/env';
 
 const API_BASE = 'https://api.github.com';
 
+export type RepoTarget = 'qimochi' | 'yukionime' | 'yukio-data';
+
+export interface RepoConfig {
+  repo: string;
+  branch: string;
+}
+
+export function resolveRepo(
+  env: Env,
+  target: RepoTarget = 'qimochi'
+): RepoConfig {
+  switch (target) {
+    case 'yukionime':
+      return { repo: env.YUKIONIME_REPO, branch: env.YUKIONIME_BRANCH };
+    case 'yukio-data':
+      return { repo: env.YUKIO_DATA_REPO, branch: env.YUKIO_DATA_BRANCH };
+    case 'qimochi':
+    default:
+      return { repo: env.GITHUB_REPO, branch: env.GITHUB_BRANCH };
+  }
+}
+
 interface GithubFileResponse {
   sha: string;
   content: string;
@@ -58,6 +80,12 @@ export interface MultiCommitResult extends CommitResult {
   filesCount?: number;
 }
 
+export interface GithubFile {
+  path: string;
+  sha: string;
+  content: string;
+}
+
 function buildHeaders(env: Env): Record<string, string> {
   return {
     Authorization: `Bearer ${env.YUKIO_TOKEN}`,
@@ -83,24 +111,20 @@ function b64Decode(b64: string): string {
   return new TextDecoder('utf-8').decode(bytes);
 }
 
-export interface GithubFile {
-  path: string;
-  sha: string;
-  content: string;
-}
-
 export async function githubGetFile(
   env: Env,
-  path: string
+  path: string,
+  target: RepoTarget = 'qimochi'
 ): Promise<GithubFile | null> {
-  const url = `${API_BASE}/repos/${env.GITHUB_REPO}/contents/${path}?ref=${env.GITHUB_BRANCH}`;
+  const { repo, branch } = resolveRepo(env, target);
+  const url = `${API_BASE}/repos/${repo}/contents/${path}?ref=${branch}`;
   const res = await fetch(url, { headers: buildHeaders(env) });
 
   if (res.status === 404) return null;
   if (!res.ok) {
     const err = await res.text().catch(() => '');
     throw new Error(
-      `GitHub GET ${path} → HTTP ${res.status}: ${err.slice(0, 200)}`
+      `GitHub GET ${repo}/${path} → HTTP ${res.status}: ${err.slice(0, 200)}`
     );
   }
 
@@ -116,20 +140,22 @@ export async function githubCommitFile(
   env: Env,
   path: string,
   content: string,
-  message: string
+  message: string,
+  target: RepoTarget = 'qimochi'
 ): Promise<CommitResult> {
-  const url = `${API_BASE}/repos/${env.GITHUB_REPO}/contents/${path}`;
+  const { repo, branch } = resolveRepo(env, target);
+  const url = `${API_BASE}/repos/${repo}/contents/${path}`;
 
   let sha: string | undefined;
   try {
-    const existing = await githubGetFile(env, path);
+    const existing = await githubGetFile(env, path, target);
     if (existing) sha = existing.sha;
   } catch {}
 
   const body: Record<string, unknown> = {
     message,
     content: b64Encode(content),
-    branch: env.GITHUB_BRANCH,
+    branch,
   };
   if (sha) body.sha = sha;
 
@@ -159,15 +185,16 @@ export async function githubCommitFile(
 export async function githubCommitMultipleFiles(
   env: Env,
   files: FileToCommit[],
-  message: string
+  message: string,
+  target: RepoTarget = 'qimochi'
 ): Promise<MultiCommitResult> {
   if (files.length === 0) {
     return { ok: false, error: 'No files to commit' };
   }
 
+  const { repo, branch } = resolveRepo(env, target);
   const headers = buildHeaders(env);
-  const base = `${API_BASE}/repos/${env.GITHUB_REPO}`;
-  const branch = env.GITHUB_BRANCH;
+  const base = `${API_BASE}/repos/${repo}`;
 
   try {
     const refRes = await fetch(`${base}/git/ref/heads/${branch}`, { headers });
@@ -251,7 +278,7 @@ export async function githubCommitMultipleFiles(
     return {
       ok: true,
       sha: newCommitData.sha,
-      commitUrl: `https://github.com/${env.GITHUB_REPO}/commit/${newCommitData.sha}`,
+      commitUrl: `https://github.com/${repo}/commit/${newCommitData.sha}`,
       filesCount: files.length,
     };
   } catch (err) {
@@ -261,16 +288,18 @@ export async function githubCommitMultipleFiles(
 
 export async function githubListDir(
   env: Env,
-  path: string
+  path: string,
+  target: RepoTarget = 'qimochi'
 ): Promise<GithubListItem[]> {
-  const url = `${API_BASE}/repos/${env.GITHUB_REPO}/contents/${path}?ref=${env.GITHUB_BRANCH}`;
+  const { repo, branch } = resolveRepo(env, target);
+  const url = `${API_BASE}/repos/${repo}/contents/${path}?ref=${branch}`;
   const res = await fetch(url, { headers: buildHeaders(env) });
 
   if (res.status === 404) return [];
   if (!res.ok) {
     const err = await res.text().catch(() => '');
     throw new Error(
-      `GitHub LIST ${path} → HTTP ${res.status}: ${err.slice(0, 200)}`
+      `GitHub LIST ${repo}/${path} → HTTP ${res.status}: ${err.slice(0, 200)}`
     );
   }
 
