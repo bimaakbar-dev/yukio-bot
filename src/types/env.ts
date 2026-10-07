@@ -11,8 +11,15 @@ export interface Env {
   VAL_TOWN_FETCH_URL: string;
 
   YUKIO_TOKEN: string;
+
   GITHUB_REPO: string;
   GITHUB_BRANCH: string;
+
+  YUKIONIME_REPO: string;
+  YUKIONIME_BRANCH: string;
+
+  YUKIO_DATA_REPO: string;
+  YUKIO_DATA_BRANCH: string;
 
   DB: D1Database;
   AI: Ai;
