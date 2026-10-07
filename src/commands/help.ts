@@ -1,10 +1,7 @@
 import type { CommandDefinition } from './registry';
 import { COMMANDS } from './list';
 import { isAdmin } from '../lib/permissions';
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+import { escapeHtml } from '../lib/utils';
 
 export const helpCommand: CommandDefinition = {
   name: 'help',
@@ -32,7 +29,6 @@ export const helpCommand: CommandDefinition = {
       msg += '<i>Beberapa command memerlukan akses admin.</i>';
     }
 
-    // Telegram limit 4096 char
     if (msg.length > 4000) {
       msg = msg.slice(0, 3950) + '\n\n<i>… [truncated]</i>';
     }

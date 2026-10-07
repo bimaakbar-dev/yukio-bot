@@ -2,7 +2,6 @@
 import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
-import type { D1Database } from '@cloudflare/workers-types';
 import type { CommandDefinition } from './registry';
 import {
   trackMessage,
@@ -13,35 +12,7 @@ import {
   ensureTrackDb,
   type Tracker,
 } from '../lib/telegram-utils';
-
-/* ============================================================
-   VA DATA
-   ============================================================ */
-
-interface VoiceActorRow {
-  id: string;
-  name: string;
-  nameNative: string | null;
-  image: string | null;
-  defaultLanguage: string | null;
-}
-
-async function getAllVoiceActors(
-  db: D1Database
-): Promise<VoiceActorRow[]> {
-  const res = await db
-    .prepare(
-      `SELECT id, name, nameNative, image, defaultLanguage
-       FROM voice_actors
-       ORDER BY id ASC`
-    )
-    .all<VoiceActorRow>();
-  return res.results ?? [];
-}
-
-/* ============================================================
-   SHOW MENU (dipakai /va dan redirect dari /dba)
-   ============================================================ */
+import { getAllVoiceActors } from '../lib/dba-voice-actors';
 
 export async function showVaMenu(
   ctx: Context,
@@ -51,10 +22,8 @@ export async function showVaMenu(
 
   const vas = await getAllVoiceActors(env.DB);
   const total = vas.length;
-
   const sessionId = `va_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 
-  // Track pesan user
   if (ctx.message?.message_id) {
     await trackMessage(env.DB, sessionId, ctx.message.message_id);
   }
@@ -79,10 +48,6 @@ export async function showVaMenu(
   await trackMessage(env.DB, sessionId, msg.message_id);
 }
 
-/* ============================================================
-   COMMAND /va
-   ============================================================ */
-
 export const vaCommand: CommandDefinition = {
   name: 'va',
   description: 'Lihat & kelola voice actors',
@@ -92,10 +57,6 @@ export const vaCommand: CommandDefinition = {
     await showVaMenu(ctx, env);
   },
 };
-
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
 
 export function setupVaCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^va:([pfx]):(va_[a-f0-9]+)$/, async (ctx) => {
@@ -110,8 +71,6 @@ export function setupVaCallbacks(bot: Bot, env: Env): void {
 
     const chatId = ctx.chat?.id;
     if (!chatId) return;
-
-    // === BATAL ===
     if (action === 'x') {
       await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
       const deleted = await clearTrackedSession(
@@ -142,7 +101,6 @@ export function setupVaCallbacks(bot: Bot, env: Env): void {
     const tracker: Tracker = (msgId) =>
       trackMessage(env.DB, sessionId, msgId);
 
-    // Hapus keyboard dari menu
     await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
 
     if (action === 'p') {
@@ -177,7 +135,7 @@ export function setupVaCallbacks(bot: Bot, env: Env): void {
         await sendJsonSection(
           ctx,
           `Voice Actors (${vas.length})`,
-          json ? vas : vas,
+          vas,
           tracker
         );
       }

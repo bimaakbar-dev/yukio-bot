@@ -25,10 +25,9 @@ import {
   type Tracker,
 } from '../lib/telegram-utils';
 
-/* ---------- DBA modules ---------- */
+import { escapeHtml, withTimeout } from '../lib/utils';
+
 import {
-  escapeHtml,
-  fetchWithTimeout,
   safeFetch,
   fallbackJson,
   parseJsonArray,
@@ -64,17 +63,9 @@ import { saveEpCache } from '../lib/dba-episodes';
 import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
-/* ============================================================
-   CONSTANTS
-   ============================================================ */
-
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
 const CHAR_FETCH_TIMEOUT_MS = 25000;
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
 
 function buildChainContext(session: SessionRow): ChainContext {
   return {
@@ -111,10 +102,6 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
-/* ============================================================
-   AI SYNOPSIS
-   ============================================================ */
-
 async function rewriteSynopsis(
   env: Env,
   title: string,
@@ -147,10 +134,6 @@ async function rewriteSynopsis(
     return null;
   }
 }
-
-/* ============================================================
-   COMMAND: /dba
-   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -259,10 +242,6 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
-/* ============================================================
-   COMMAND: /end
-   ============================================================ */
-
 export const endCommand: CommandDefinition = {
   name: 'end',
   description: 'Hapus semua pesan session /dba aktif',
@@ -306,10 +285,6 @@ export const endCommand: CommandDefinition = {
   },
 };
 
-/* ============================================================
-   METADATA HANDLERS
-   ============================================================ */
-
 async function handleMetadataShow(
   ctx: Context,
   env: Env,
@@ -319,7 +294,7 @@ async function handleMetadataShow(
   let media = parseJsonMedia(session.metadata);
 
   if (!media) {
-    const fetched = await fetchWithTimeout(
+    const fetched = await withTimeout(
       () => getMetadataFromAniList(session.title),
       SOURCE_TIMEOUT_MS
     );
@@ -376,13 +351,13 @@ async function handleMetadataMerge(
   let incoming: AniListMedia | null = null;
 
   if (sourceName === 'shikimori') {
-    const shiki = await fetchWithTimeout(
+    const shiki = await withTimeout(
       () => searchShikimori(session.title),
       SOURCE_TIMEOUT_MS
     );
     if (shiki) incoming = shikimoriToAniList(shiki);
   } else if (sourceName === 'kitsu') {
-    const kitsu = await fetchWithTimeout(
+    const kitsu = await withTimeout(
       () => searchKitsu(session.title),
       SOURCE_TIMEOUT_MS
     );
@@ -423,10 +398,6 @@ async function handleMetadataMerge(
   });
   await tracker(msg.message_id);
 }
-
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
 
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(

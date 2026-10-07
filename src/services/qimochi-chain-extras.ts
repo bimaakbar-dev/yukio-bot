@@ -1,6 +1,7 @@
 // src/services/qimochi-chain-extras.ts
 import { fetchWithRetry } from '../lib/http';
 import { getCharactersFromAniList } from './anilist';
+import { withTimeout, slugify } from '../lib/utils';
 
 export interface UnifiedVoiceActor {
   id: string;
@@ -54,31 +55,6 @@ const KITSU_PAGE_LIMIT = 20;
 const PARALLEL_BATCH = 5;
 const EPISODES_TIME_BUDGET_MS = 20000;
 const MAX_RELATIONS = 30;
-
-async function withTimeout<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<T | null> {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
-}
-
-function slugify(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
 
 interface KitsuIncluded {
   id: string;
@@ -314,18 +290,16 @@ async function getKitsuEpisodes(
       attr.canonicalTitle ??
       `Episode ${number}`;
     const aired = attr.airdate ? attr.airdate.split('T')[0] : undefined;
-	const duration =
-  	attr.length && attr.length > 0
-    	? attr.length
-    	: undefined;
+    const duration =
+      attr.length && attr.length > 0 ? attr.length : undefined;
 
-	out.push({
-  	number,
-  	title,
-  	...(aired ? { aired } : {}),
-  	...(duration ? { duration } : {}),
-	});
-	if (out.length >= MAX_EPISODES) break;
+    out.push({
+      number,
+      title,
+      ...(aired ? { aired } : {}),
+      ...(duration ? { duration } : {}),
+    });
+    if (out.length >= MAX_EPISODES) break;
   }
 
   out.sort((a, b) => a.number - b.number);

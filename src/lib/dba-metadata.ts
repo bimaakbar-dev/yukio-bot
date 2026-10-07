@@ -2,12 +2,8 @@
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../types/anime';
 import { buildMetadataYaml } from '../services/qimochi-yaml';
-import { escapeHtml } from './dba-common';
+import { escapeHtml } from './utils';
 import type { SessionRow } from './dba-session';
-
-/* ============================================================
-   DETECT MISSING
-   ============================================================ */
 
 export interface MissingInfo {
   fields: string[];
@@ -55,10 +51,6 @@ export function detectMissing(
 
   return { fields, canShikimori, canKitsu };
 }
-
-/* ============================================================
-   MERGE
-   ============================================================ */
 
 export interface MergeResult {
   merged: AniListMedia;
@@ -148,10 +140,6 @@ export function mergeMetadata(
 
   return { merged, filled };
 }
-
-/* ============================================================
-   KEYBOARD + VIEW
-   ============================================================ */
 
 export function buildMetadataKeyboard(
   sessionId: string,

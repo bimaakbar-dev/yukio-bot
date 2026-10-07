@@ -1,21 +1,11 @@
 // src/lib/telegram-utils.ts
 import type { Context, Api } from 'grammy';
 import type { D1Database } from '@cloudflare/workers-types';
+import { escapeHtml } from './utils';
 
 export const MSG_LIMIT = 3500;
 export const BATCH_OVERHEAD = 300;
 export const AUTO_DELETE_DELAY_MS = 3000;
-
-/* ============================================================
-   HTML / SPLIT
-   ============================================================ */
-
-export function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 
 export function splitText(text: string, max: number): string[] {
   if (text.length <= max) return [text];
@@ -52,10 +42,6 @@ export function splitText(text: string, max: number): string[] {
   if (current) parts.push(current);
   return parts;
 }
-
-/* ============================================================
-   MESSAGE TRACKING (D1)
-   ============================================================ */
 
 let trackDbReady = false;
 let trackDbInitPromise: Promise<void> | null = null;
@@ -162,10 +148,6 @@ export async function clearTrackedSession(
   return deleted;
 }
 
-/* ============================================================
-   SEND — text section
-   ============================================================ */
-
 export async function sendTextSection(
   ctx: Context,
   label: string,
@@ -193,10 +175,6 @@ export async function sendTextSection(
     }
   }
 }
-
-/* ============================================================
-   SEND — JSON section (split per item)
-   ============================================================ */
 
 export async function sendJsonSection<T>(
   ctx: Context,
@@ -248,10 +226,6 @@ export async function sendJsonSection<T>(
   }
 }
 
-/* ============================================================
-   SEND — auto-delete
-   ============================================================ */
-
 export async function sendAutoDelete(
   ctx: Context,
   text: string,
@@ -272,10 +246,6 @@ export async function sendAutoDelete(
     console.warn('[Send] autoDelete failed:', err);
   }
 }
-
-/* ============================================================
-   SEND — document (via API manual)
-   ============================================================ */
 
 export async function sendDocumentViaApi(
   botToken: string,

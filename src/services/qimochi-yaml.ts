@@ -1,9 +1,6 @@
 // src/services/qimochi-yaml.ts
 import type { AniListMedia } from '../types/anime';
-
-/* ============================================================
-   METADATA — YAML frontmatter (.md)
-   ============================================================ */
+import { slugify } from '../lib/utils';
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
@@ -23,17 +20,6 @@ const STATUS_MAP: Record<string, string> = {
   CANCELLED: 'cancelled',
   HIATUS: 'hiatus',
 };
-
-function slugify(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
 
 function yamlString(s: string): string {
   const cleaned = s.replace(/\n/g, ' ').trim();
@@ -216,10 +202,6 @@ export function buildMetadataYaml(input: MetadataInput): string {
 
   return lines.join('\n');
 }
-
-/* ============================================================
-   SUMMARY (sinopsis)
-   ============================================================ */
 
 export function getSynopsisRaw(media: AniListMedia): string {
   return cleanSynopsisRaw(media.description);

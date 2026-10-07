@@ -1,27 +1,6 @@
 // src/lib/dba-common.ts
 import type { AniListMedia } from '../types/anime';
 
-export function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-export async function fetchWithTimeout<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<T | null> {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
-}
-
 export function safeFetch<T>(
   fn: () => Promise<T>,
   timeoutMs: number

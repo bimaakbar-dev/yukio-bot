@@ -3,6 +3,7 @@ import type { AniListMedia } from '../types/anime';
 import type { Env } from '../types/env';
 import { chainSearch, type ChainSearchResult } from './qimochi-chain';
 import { chatAI } from './ai';
+import { stripHtml, looksIndonesian } from '../lib/utils';
 
 export const AI_TIMEOUT_MS = 8000;
 
@@ -81,53 +82,8 @@ export function isValidHttpUrl(s: string): boolean {
   }
 }
 
-export function stripHtml(s: string): string {
-  return s
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#0?39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
 export function hasCyrillic(s: string): boolean {
   return /[\u0400-\u04FF\u0500-\u052F]/.test(s);
-}
-
-export function looksIndonesian(s: string): boolean {
-  const lower = s.toLowerCase();
-  const idWords = [
-    ' yang ',
-    ' dengan ',
-    ' untuk ',
-    ' adalah ',
-    ' dan ',
-    ' di ',
-    ' ke ',
-    ' dari ',
-    ' ini ',
-    ' itu ',
-    ' tidak ',
-    ' akan ',
-    ' setelah ',
-    ' ketika ',
-    ' seorang ',
-    ' sebuah ',
-    ' dalam ',
-    ' pada ',
-  ];
-
-  let matches = 0;
-  for (const w of idWords) {
-    if (lower.includes(w)) matches++;
-  }
-  return matches >= 3;
 }
 
 export function pick<T>(...values: (T | null | undefined)[]): T | null {
