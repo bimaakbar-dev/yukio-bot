@@ -2,9 +2,9 @@
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
 import { InlineKeyboard } from 'grammy';
-import { saveBatchSession } from './publish';
 import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
+import { startOrAppendBatch } from './publish';
 
 const MAX_INPUT_LEN = 8000;
 const MAX_FILE_CHARS = 2 * 1024 * 1024;
@@ -14,7 +14,7 @@ const MAX_CANDIDATES = 800;
 const MAX_PARAM_DEPTH = 3;
 const MSG_BUDGET = 3800;
 const JSON_INLINE_THRESHOLD = 3500;
-const BATCH_MAX = 30;
+const BATCH_MAX = 6;
 
 const BASE64_PARAM_NAMES = new Set([
   'bsrc', 'src', 'url', 'link', 'u', 'q', 'data',
@@ -498,8 +498,8 @@ function extractNextJsEmbeds(html: string): RawEntry[] {
 
   for (const m of html.matchAll(RSC_EMBED_RE)) {
     const quality = m[1] ?? '';
-    const mirror  = m[2] ?? '';
-    let link      = m[3] ?? '';
+    const mirror = m[2] ?? '';
+    let link = m[3] ?? '';
 
     if (!link) continue;
 
@@ -1136,6 +1136,10 @@ async function handleUrlAuto(ctx: Context, env: Env, url: string): Promise<void>
   }
 }
 
+// =================================================================
+// BATCH
+// =================================================================
+
 function extractSlugHint(url: string): string | null {
   const m = url.match(/\/tonton\/([^/]+)/i);
   return m?.[1] ?? null;
@@ -1177,12 +1181,12 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
         '<b>Usage:</b>\n' +
         '<code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n\n' +
         '<b>Contoh 1 (base URL):</b>\n' +
-        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>\n\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 1-6</code>\n\n' +
         '<b>Contoh 2 (pakai placeholder):</b>\n' +
-        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-{n}-sub-indo 7-12</code>\n\n' +
+        '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-{n}-sub-indo 1-6</code>\n\n' +
         '<b>Contoh 3 (URL episode existing):</b>\n' +
         '<code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/episode-6-sub-indo 7-12</code>\n\n' +
-        `<i>Max ${BATCH_MAX} episode per batch.</i>`,
+        `<i>Max ${BATCH_MAX} episode per batch. Bisa ditambah pakai ➕ Tambah Batch.</i>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
     return;
@@ -1193,7 +1197,7 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
     await ctx.reply(
       '❌ Format salah.\n\n' +
         'Usage: <code>/batch &lt;url&gt; &lt;start&gt;-&lt;end&gt;</code>\n' +
-        'Contoh: <code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 7-12</code>',
+        'Contoh: <code>/batch https://lexanime.web.id/tonton/yozakura-san-chi-no-daisakusen-season-2/ 1-6</code>',
       { parse_mode: 'HTML' }
     );
     return;
@@ -1204,7 +1208,7 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
   const end = parseInt(m[3] ?? '0', 10);
 
   if (start < 1 || end < start) {
-    await ctx.reply('❌ Range tidak valid. Contoh: <code>7-12</code>', {
+    await ctx.reply('❌ Range tidak valid. Contoh: <code>1-6</code>', {
       parse_mode: 'HTML',
     });
     return;
@@ -1212,7 +1216,13 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
 
   const total = end - start + 1;
   if (total > BATCH_MAX) {
-    await ctx.reply(`❌ Max ${BATCH_MAX} episode per batch (kamu minta ${total}).`);
+    await ctx.reply(
+      `❌ Max ${BATCH_MAX} episode per batch (kamu minta ${total}).\n\n` +
+        `<i>Kirim 2x, contoh:</i>\n` +
+        `<code>/batch ${input} ${start}-${start + BATCH_MAX - 1}</code>\n` +
+        `<code>/batch ${input} ${start + BATCH_MAX}-${end}</code>`,
+      { parse_mode: 'HTML' }
+    );
     return;
   }
 
@@ -1261,82 +1271,88 @@ async function handleBatch(ctx: Context, env: Env): Promise<void> {
 
   results.sort((a, b) => a.number - b.number);
 
-  const combinedJson = JSON.stringify(results, null, 2) + '\n';
+  await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
 
-  const totalUrls = results.reduce(
-    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
-    0
-  );
-
-  const filename = `batch-${start}-${end}.json`;
-
-  const captionLines = [
-    `✅ <b>Batch selesai!</b>`,
-    `📊 Berhasil: <b>${results.length}/${total}</b> episode`,
-    `🎬 Total URL: <b>${totalUrls}</b>`,
-  ];
-  if (errors.length > 0) {
-    captionLines.push('');
-    captionLines.push(`⚠️ <b>Gagal (${errors.length}):</b>`);
-    for (const e of errors.slice(0, 10)) {
-      captionLines.push(`• Ep ${e.number}: <code>${escapeHtml(e.error)}</code>`);
-    }
-    if (errors.length > 10) {
-      captionLines.push(`<i>...dan ${errors.length - 10} lainnya</i>`);
-    }
+  if (results.length === 0) {
+    await ctx.reply(
+      `❌ Tidak ada episode yang berhasil di-fetch.\n\n` +
+        (errors.length > 0
+          ? `<b>Error:</b>\n` +
+            errors
+              .slice(0, 5)
+              .map((e) => `• Ep ${e.number}: <code>${escapeHtml(e.error)}</code>`)
+              .join('\n')
+          : ''),
+      { parse_mode: 'HTML' }
+    );
+    return;
   }
 
-  const caption = captionLines.join('\n');
+  if (!ctx.from?.id) return;
+
+  const slugHint = extractSlugHint(input);
 
   try {
-  await sendDocumentViaApi(
-    env.TELEGRAM_BOT_TOKEN,
-    ctx.chat!.id,
-    filename,
-    combinedJson,
-    caption
-  );
-  await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
-  if (ctx.from?.id) {
-    const slugHint = extractSlugHint(input);
-    const sessionId = await saveBatchSession(env.DB, ctx.from.id, {
+    const result = await startOrAppendBatch(env.DB, ctx.from.id, {
       slugHint,
-      startEp: start,
-      endEp: end,
-      jsonData: combinedJson,
-      totalUrls,
+      newEpisodes: results,
       errors: errors.map((e) => `Ep ${e.number}: ${e.error}`),
     });
 
     const kb = new InlineKeyboard()
-      .text('📤 Publish ke Web', `pub:ba:${sessionId}`)
-      .text('❌ Batal', `pub:bax:${sessionId}`);
+      .text('➕ Tambah Batch', `pub:baadd:${result.sessionId}`)
+      .text('📤 Publish', `pub:ba:${result.sessionId}`)
+      .row()
+      .text('❌ Batal', `pub:bax:${result.sessionId}`);
 
-    await ctx.reply(
-      `📦 <b>Batch siap di-publish!</b>\n\n` +
-        `📊 ${results.length}/${total} episode\n` +
-        `🎬 ${totalUrls} URL\n` +
-        (slugHint ? `🔗 Slug hint: <code>${escapeHtml(slugHint)}</code>\n` : '') +
-        `🆔 Session: <code>${sessionId}</code>\n\n` +
-        `<i>Klik tombol di bawah untuk publish ke repo web.</i>`,
-      {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: kb,
-      }
+    const lines: string[] = [];
+    lines.push(`✅ <b>Batch ${start}-${end} selesai</b>`);
+    lines.push('');
+
+    if (slugHint) lines.push(`🎬 <code>${escapeHtml(slugHint)}</code>`);
+
+    if (result.mode === 'reset_and_created') {
+      lines.push(`⚠️ <i>Session lama di-reset (slug berbeda).</i>`);
+    }
+
+    lines.push(
+      `📦 Episode terkumpul: <b>${result.totalEpisodes}</b> (Ep ${result.minEp}-${result.maxEp})`
     );
-  }
-} catch (err: any) {
-    console.error('[Batch] sendDocument failed:', err);
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        loading.message_id,
-        `❌ Gagal kirim file: <code>${escapeHtml(err?.message ?? 'unknown')}</code>\n\n` +
-          caption,
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      )
-      .catch(() => {});
+    lines.push(`🎬 Total URL: <b>${result.totalUrls}</b>`);
+
+    if (result.skipped.length > 0) {
+      lines.push('');
+      lines.push(`⏭️ Skip (sudah ada): Ep ${result.skipped.join(', ')}`);
+      if (result.added.length > 0) {
+        lines.push(`➕ Baru: Ep ${result.added.join(', ')}`);
+      }
+    }
+
+    if (errors.length > 0) {
+      lines.push('');
+      lines.push(`⚠️ Gagal: ${errors.length} episode`);
+      for (const e of errors.slice(0, 3)) {
+        lines.push(`   • Ep ${e.number}: ${escapeHtml(e.error.slice(0, 40))}`);
+      }
+      if (errors.length > 3) {
+        lines.push(`   <i>...dan ${errors.length - 3} lainnya</i>`);
+      }
+    }
+
+    lines.push('');
+    lines.push(`🆔 <code>${result.sessionId}</code>`);
+
+    await ctx.reply(lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    });
+  } catch (err: any) {
+    console.error('[Batch] save session error:', err);
+    await ctx.reply(
+      `❌ Gagal simpan session: <code>${escapeHtml(err?.message ?? 'unknown')}</code>`,
+      { parse_mode: 'HTML' }
+    );
   }
 }
 
