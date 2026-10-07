@@ -24,6 +24,8 @@ import {
   clearTrackedSession,
   type Tracker,
 } from '../lib/telegram-utils';
+
+/* ---------- DBA modules ---------- */
 import {
   escapeHtml,
   fetchWithTimeout,
@@ -62,9 +64,17 @@ import { saveEpCache } from '../lib/dba-episodes';
 import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
+/* ============================================================
+   CONSTANTS
+   ============================================================ */
+
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
 const CHAR_FETCH_TIMEOUT_MS = 25000;
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
 
 function buildChainContext(session: SessionRow): ChainContext {
   return {
@@ -101,6 +111,10 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
+/* ============================================================
+   AI SYNOPSIS
+   ============================================================ */
+
 async function rewriteSynopsis(
   env: Env,
   title: string,
@@ -133,6 +147,10 @@ async function rewriteSynopsis(
     return null;
   }
 }
+
+/* ============================================================
+   COMMAND: /dba
+   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -241,6 +259,10 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
+/* ============================================================
+   COMMAND: /end
+   ============================================================ */
+
 export const endCommand: CommandDefinition = {
   name: 'end',
   description: 'Hapus semua pesan session /dba aktif',
@@ -283,6 +305,10 @@ export const endCommand: CommandDefinition = {
     );
   },
 };
+
+/* ============================================================
+   METADATA HANDLERS
+   ============================================================ */
 
 async function handleMetadataShow(
   ctx: Context,
@@ -397,6 +423,10 @@ async function handleMetadataMerge(
   });
   await tracker(msg.message_id);
 }
+
+/* ============================================================
+   CALLBACK HANDLERS
+   ============================================================ */
 
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(
@@ -636,34 +666,52 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-		if (action === 'e') {
-  		const { data: result, error } = await safeFetch(
-    		() => chainEpisodes(chainCtx),
-    		30000
-  		);
+        if (action === 'e') {
+          const { data: result, error } = await safeFetch(
+            () => chainEpisodes(chainCtx),
+            30000
+          );
 
-  		if (!result || !result.data || result.data.length === 0) {
-    		const errs = result?.errors ?? [error ?? 'unknown'];
-    		await sendTextSection(
-      		ctx,
-      		`Episodes — ${session.title} [FAILED]`,
-      		fallbackJson(errs),
-      		tracker
-    		);
-    		return;
-  		}
+          if (!result || !result.data || result.data.length === 0) {
+            const errs = result?.errors ?? [error ?? 'unknown'];
+            await sendTextSection(
+              ctx,
+              `Episodes — ${session.title} [FAILED]`,
+              fallbackJson(errs),
+              tracker
+            );
+            return;
+          }
 
-  		const eps = result.data;
-  		const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
+          const eps = result.data;
 
-  		await sendJsonSection(
-    		ctx,
-    		`Episodes — ${session.title} [${result.source}]${truncNote}`,
-    		eps,
-    		tracker
-  		);
-  		return;
-		}
+          try {
+            await saveEpCache(
+              env.DB,
+              sessionId,
+              eps.map((e) => ({
+                number: e.number,
+                title: e.title,
+                aired: e.aired,
+                duration: e.duration,
+              })),
+              result.source,
+              result.truncated ?? false
+            );
+          } catch (err) {
+            console.warn('[DBA] Gagal simpan ep cache:', err);
+          }
+
+          const truncNote = result.truncated ? ' [⚠️ truncated]' : '';
+
+          await sendJsonSection(
+            ctx,
+            `Episodes — ${session.title} [${result.source}]${truncNote}`,
+            eps,
+            tracker
+          );
+          return;
+        }
 
         if (action === 'f') {
           const { data: result, error } = await safeFetch(
@@ -705,26 +753,26 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           }
 
           const raw = getSynopsisRaw(result.media);
-		  const { data: ai } = await safeFetch(
-  			() => rewriteSynopsis(env, session.title, raw),
-  			AI_TIMEOUT_MS
-		  );
+          const { data: ai } = await safeFetch(
+            () => rewriteSynopsis(env, session.title, raw),
+            AI_TIMEOUT_MS
+          );
 
-		  const body = ai ?? raw ?? 'Tulis sinopsis manual...';
+          const body = ai ?? raw ?? 'Tulis sinopsis manual...';
 
-		  try {
-  			await updateSessionSummary(env.DB, sessionId, body);
-		  } catch (err) {
-  		  console.warn('[DBA] Gagal simpan summary:', err);
-		  }
+          try {
+            await updateSessionSummary(env.DB, sessionId, body);
+          } catch (err) {
+            console.warn('[DBA] Gagal simpan summary:', err);
+          }
 
-		  await sendTextSection(
-  		  ctx,
-  		  `Summary — ${session.title}`,
-  		  body,
-  		  tracker
-		  );
-		return;
+          await sendTextSection(
+            ctx,
+            `Summary — ${session.title}`,
+            body,
+            tracker
+          );
+          return;
         }
       } catch (err: any) {
         console.error('[DBA] callback error:', err);
