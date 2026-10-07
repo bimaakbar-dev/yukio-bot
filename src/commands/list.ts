@@ -26,6 +26,7 @@ import {
 } from './publish';
 import { postCommand } from './post';
 import { killCommand } from './kill';
+import { trackCommand } from './track';
 import { editCommand } from './edit';
 
 export const COMMANDS: CommandDefinition[] = [
@@ -49,5 +50,6 @@ export const COMMANDS: CommandDefinition[] = [
   publishCommand,
   postCommand,
   editCommand,
+  trackCommand,
   killCommand,
 ];
