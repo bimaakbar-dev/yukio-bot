@@ -8,16 +8,12 @@ import {
   deleteTrackedAnime,
   listAllTrackedAnime,
   setTrackedStatus,
+  updateTrackedSourceSlug,
+  formatScheduleTime,
   type SiteKey,
 } from '../lib/cron/state';
-import {
-  createTrackSession,
-  getTrackSession,
-} from './track/state';
-import {
-  buildSiteKeyboard,
-  buildSitePrompt,
-} from './track/ui';
+import { createTrackSession, getTrackSession } from './track/state';
+import { buildSiteKeyboard, buildSitePrompt } from './track/ui';
 import {
   handleSitePick,
   handleDayPick,
@@ -29,7 +25,7 @@ import {
 export const trackCommand: CommandDefinition = {
   name: 'track',
   description: 'Auto-fetch episode baru dari situs streaming',
-  usage: '/track add | list | remove | pause | resume',
+  usage: '/track add | list | remove | pause | resume | check | edit-slug',
   adminOnly: true,
 
   handler: async (ctx, env) => {
@@ -37,6 +33,7 @@ export const trackCommand: CommandDefinition = {
     const parts = arg.split(/\s+/).filter(Boolean);
     const sub = (parts[0] ?? '').toLowerCase();
 
+    /* ── /track (no arg) ─────────────────────── */
     if (!sub) {
       await ctx.reply(
         '<b>📡 Track Anime</b>\n\n' +
@@ -46,13 +43,15 @@ export const trackCommand: CommandDefinition = {
           '• <code>/track remove &lt;slug&gt;</code> — hapus dari tracking\n' +
           '• <code>/track pause &lt;slug&gt;</code> — pause\n' +
           '• <code>/track resume &lt;slug&gt;</code> — resume\n' +
-          '• <code>/track check &lt;slug&gt;</code> — cek manual (coming soon)\n\n' +
+          '• <code>/track check &lt;slug&gt;</code> — cek manual sekarang\n' +
+          '• <code>/track edit-slug &lt;slug&gt; &lt;source_slug&gt;</code> — perbaiki slug situs\n\n' +
           '<i>Bot cek situs setiap hari &amp; auto-push episode baru ke qimochi.</i>',
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
       return;
     }
 
+    /* ── /track add ──────────────────────────── */
     if (sub === 'add') {
       const userId = ctx.from?.id;
       if (!userId) return;
@@ -66,6 +65,7 @@ export const trackCommand: CommandDefinition = {
       return;
     }
 
+    /* ── /track list ─────────────────────────── */
     if (sub === 'list') {
       const rows = await listAllTrackedAnime(env.DB);
       if (rows.length === 0) {
@@ -92,9 +92,10 @@ export const trackCommand: CommandDefinition = {
             r.chunk_start > 0
               ? ` · chunk ${r.chunk_start}-${r.chunk_end}`
               : '';
+          const time = formatScheduleTime(r);
           lines.push(
             `• <code>${escapeHtml(r.slug)}</code>\n` +
-              `  ${r.site} · ${r.schedule_day} ${String(r.schedule_hour).padStart(2, '0')}:00 · last ep ${r.last_ep}${chunkInfo}`
+              `  ${r.site} · ${r.schedule_day} ${time} · last ep ${r.last_ep}${chunkInfo}`
           );
         }
         lines.push('');
@@ -124,6 +125,7 @@ export const trackCommand: CommandDefinition = {
       return;
     }
 
+    /* ── /track remove <slug> ────────────────── */
     if (sub === 'remove') {
       const slug = parts[1];
       if (!slug) {
@@ -142,6 +144,7 @@ export const trackCommand: CommandDefinition = {
       return;
     }
 
+    /* ── /track pause|resume <slug> ──────────── */
     if (sub === 'pause' || sub === 'resume') {
       const slug = parts[1];
       if (!slug) {
@@ -154,14 +157,41 @@ export const trackCommand: CommandDefinition = {
       const ok = await setTrackedStatus(env.DB, slug, status);
       await ctx.reply(
         ok
-          ? `✅ <code>${escapeHtml(slug)}</code> ${sub === 'pause' ? 'di-pause' : 'di-resume'}.`
+          ? `✅ <code>${escapeHtml(slug)}</code> ${
+              sub === 'pause' ? 'di-pause' : 'di-resume'
+            }.`
           : `❌ Tidak ada: <code>${escapeHtml(slug)}</code>`,
         { parse_mode: 'HTML' }
       );
       return;
     }
 
-        /* ── /track check <slug> ─────────────────── */
+    /* ── /track edit-slug <slug> <new_source_slug> ── */
+    if (sub === 'edit-slug') {
+      const slug = parts[1];
+      const newSourceSlug = parts[2];
+
+      if (!slug || !newSourceSlug) {
+        await ctx.reply(
+          'Usage: <code>/track edit-slug &lt;qimochi_slug&gt; &lt;source_slug_baru&gt;</code>\n\n' +
+            '<b>Contoh:</b>\n' +
+            '<code>/track edit-slug tensei-goblin-dakedo-shitsumon-aru tensei-goblin-shitsumon-sub-indo</code>',
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+
+      const ok = await updateTrackedSourceSlug(env.DB, slug, newSourceSlug);
+      await ctx.reply(
+        ok
+          ? `✅ Slug sumber untuk <code>${escapeHtml(slug)}</code> diupdate:\n<code>${escapeHtml(newSourceSlug)}</code>`
+          : `❌ Tidak ada: <code>${escapeHtml(slug)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    /* ── /track check <slug> ─────────────────── */
     if (sub === 'check') {
       const slug = parts[1];
       if (!slug) {
@@ -205,7 +235,9 @@ export const trackCommand: CommandDefinition = {
           .editMessageText(
             ctx.chat!.id,
             loading.message_id,
-            `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+            `❌ <b>Error:</b> <code>${escapeHtml(
+              (err?.message ?? 'unknown').slice(0, 300)
+            )}</code>`,
             { parse_mode: 'HTML' }
           )
           .catch(() => {});
@@ -219,6 +251,10 @@ export const trackCommand: CommandDefinition = {
   },
 };
 
+/* ============================================================
+   TEXT INPUT HANDLER (dipanggil dari index.ts)
+   ============================================================ */
+
 export async function handleTrackInput(
   ctx: Context,
   env: Env
@@ -226,7 +262,12 @@ export async function handleTrackInput(
   return handleTrackTextInput(ctx, env);
 }
 
+/* ============================================================
+   CALLBACK HANDLERS
+   ============================================================ */
+
 export function setupTrackCallbacks(bot: Bot, env: Env): void {
+  /* Pilih site */
   bot.callbackQuery(
     /^tr:site:(tr_[a-z0-9]+):(lexanime|animesub)$/,
     async (ctx) => {
@@ -255,6 +296,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     }
   );
 
+  /* Pilih hari */
   bot.callbackQuery(/^tr:day:(tr_[a-z0-9]+):([A-Za-z]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const day = ctx.match[2] ?? '';
@@ -280,6 +322,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await handleDayPick(ctx, env, session, day);
   });
 
+  /* Simpan */
   bot.callbackQuery(/^tr:save:(tr_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     if (!sessionId) {
@@ -303,6 +346,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await handleConfirmSave(ctx, env, session);
   });
 
+  /* Cancel */
   bot.callbackQuery(/^tr:x:(tr_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     await handleCancel(ctx, env, sessionId);
