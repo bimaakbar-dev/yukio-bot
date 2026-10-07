@@ -150,13 +150,22 @@ async function pushAnime(
 
   if (files.length === 1) {
     const f = files[0]!;
-    result = await githubCommitFile(
-      env,
-      f.path,
-      f.content,
-      message,
-      'qimochi'
-    );
+    if (f.content === null) {
+      result = await githubCommitMultipleFiles(
+        env,
+        files,
+        message,
+        'qimochi'
+      );
+    } else {
+      result = await githubCommitFile(
+        env,
+        f.path,
+        f.content,
+        message,
+        'qimochi'
+      );
+    }
   } else {
     result = await githubCommitMultipleFiles(
       env,
