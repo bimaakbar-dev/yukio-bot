@@ -66,12 +66,9 @@ function createBot(env: Env): Bot {
   return bot;
 }
 
-interface ApplyCommandsResult {
-  commands: { command: string; description: string }[];
-  skipped: string[];
-}
-
-async function applyBotCommands(bot: Bot): Promise<ApplyCommandsResult> {
+async function applyBotCommands(
+  bot: Bot
+): Promise<{ commands: { command: string; description: string }[]; skipped: string[] }> {
   const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map(
     (c) => ({
       command: c.name,
@@ -149,33 +146,6 @@ export default {
         }),
         { headers: { 'Content-Type': 'application/json' } }
       );
-    }
-
-    if (url.pathname === '/setup-commands') {
-      try {
-        const bot = await getBot(env);
-        const { commands, skipped } = await applyBotCommands(bot);
-        menuSetForToken = env.TELEGRAM_BOT_TOKEN;
-
-        return new Response(
-          JSON.stringify(
-            {
-              ok: true,
-              count: commands.length,
-              commands: commands.map((c) => `/${c.command}`),
-              skipped,
-            },
-            null,
-            2
-          ),
-          { headers: { 'Content-Type': 'application/json' } }
-        );
-      } catch (err: any) {
-        return new Response(
-          JSON.stringify({ ok: false, error: err?.message ?? String(err) }),
-          { status: 500, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
     }
 
     if (url.pathname === '/debug') {
