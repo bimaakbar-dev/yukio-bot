@@ -1079,7 +1079,7 @@ async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       qimochi: { franchises: 0, files: 0 },
     };
 
-    const metaFile = await buildMetadataFile(env, session, slug);
+    const metaFile = await buildMetadataFile(session, slug);
     if (metaFile) {
       files.push(metaFile);
       summary.yukionime.metadata = true;
