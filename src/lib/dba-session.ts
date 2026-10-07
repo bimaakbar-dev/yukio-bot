@@ -5,10 +5,6 @@ import { ensureTrackDb } from './telegram-utils';
 
 export const SESSION_TTL_MS = 30 * 60 * 1000;
 
-/* ============================================================
-   DB INIT
-   ============================================================ */
-
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
 
@@ -39,15 +35,14 @@ export async function ensureDb(db: D1Database): Promise<void> {
         )
         .run();
 
-      // Migration: tambah kolom baru kalau belum ada
       for (const col of ['metadata', 'fetched_sources']) {
-        try {
-          await db
-            .prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
-            .run();
-        } catch {
-          // ignore
-        }
+  		try {
+    		await db
+      		.prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
+      		.run();
+  		} catch {
+    		// ignore
+  		}
       }
 
       await db
@@ -76,10 +71,6 @@ export async function ensureDb(db: D1Database): Promise<void> {
   return dbInitPromise;
 }
 
-/* ============================================================
-   TYPES
-   ============================================================ */
-
 export interface SessionRow {
   session_id: string;
   user_id: number;
@@ -93,6 +84,7 @@ export interface SessionRow {
   source: string | null;
   metadata: string | null;
   fetched_sources: string | null;
+  summary: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -109,10 +101,6 @@ export interface SaveSessionInput {
   metadata?: AniListMedia | null;
   fetchedSources?: string[];
 }
-
-/* ============================================================
-   SAVE
-   ============================================================ */
 
 export async function saveSession(
   db: D1Database,
@@ -151,10 +139,6 @@ export async function saveSession(
   return sessionId;
 }
 
-/* ============================================================
-   UPDATE METADATA
-   ============================================================ */
-
 export async function updateSessionMetadata(
   db: D1Database,
   sessionId: string,
@@ -177,10 +161,6 @@ export async function updateSessionMetadata(
     )
     .run();
 }
-
-/* ============================================================
-   GET
-   ============================================================ */
 
 export async function getSession(
   db: D1Database,
@@ -223,9 +203,19 @@ export async function getLatestSessionByUser(
     .first<SessionRow>();
 }
 
-/* ============================================================
-   DELETE
-   ============================================================ */
+export async function updateSessionSummary(
+  db: D1Database,
+  sessionId: string,
+  summary: string
+): Promise<void> {
+  await ensureDb(db);
+  await db
+    .prepare(
+      `UPDATE qimochi_sessions SET summary = ? WHERE session_id = ?`
+    )
+    .bind(summary, sessionId)
+    .run();
+}
 
 export async function deleteSession(
   db: D1Database,
