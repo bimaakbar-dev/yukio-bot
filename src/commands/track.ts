@@ -13,7 +13,6 @@ import {
 import {
   createTrackSession,
   getTrackSession,
-  updateTrackSession,
 } from './track/state';
 import {
   buildSiteKeyboard,
