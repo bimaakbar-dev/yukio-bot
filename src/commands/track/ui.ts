@@ -90,8 +90,8 @@ export function buildHourPrompt(day: string): string {
     '<b>Format:</b>\n' +
     '• <code>18</code> → jam 18:00 WIB\n' +
     '• <code>18:30</code> → jam 18:30 WIB\n' +
-    '• <code>18:15</code> → jam 18:15 WIB\n\n' +
-    '<i>Bot akan cek mulai jam tersebut + buffer 60 menit (jadi 19:00 / 19:30).</i>'
+    '• <code>18.15</code> → jam 18:15 WIB\n\n' +
+    '<i>Bot akan cek mulai jam tersebut + buffer 60 menit.</i>'
   );
 }
 
@@ -106,7 +106,9 @@ export function buildSummary(
   lines.push('<b>📋 Konfirmasi Track</b>');
   lines.push('');
   lines.push(`🎬 <b>Situs:</b> ${escapeHtml(session.site ?? '-')}`);
-  lines.push(`🆔 <b>Slug Qimochi:</b> <code>${escapeHtml(session.slug ?? '-')}</code>`);
+  lines.push(
+    `🆔 <b>Slug Qimochi:</b> <code>${escapeHtml(session.slug ?? '-')}</code>`
+  );
   if (session.source_slug && session.source_slug !== session.slug) {
     lines.push(
       `🔗 <b>Slug Sumber:</b> <code>${escapeHtml(session.source_slug)}</code>`
