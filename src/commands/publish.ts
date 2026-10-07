@@ -20,10 +20,6 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/* ============================================================
-   TYPES
-   ============================================================ */
-
 export interface EpisodeObject {
   number: number;
   streams: { quality: string; servers: { name: string; url: string }[] }[];
@@ -97,10 +93,6 @@ interface PublishSummary {
   qimochi: { franchises: number; files: number };
 }
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
 function slugify(str: string): string {
   return str
     .toLowerCase()
@@ -125,10 +117,6 @@ function stripHtml(s: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
-
-/* ============================================================
-   ANIME SESSION (temp_anime)
-   ============================================================ */
 
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
@@ -209,10 +197,6 @@ function buildMarkdown(session: SessionRow): string {
   const body = session.body.trim();
   return `${session.yaml}\n\n${body}\n`;
 }
-
-/* ============================================================
-   BATCH SESSION
-   ============================================================ */
 
 let batchDbReady = false;
 let batchDbInitPromise: Promise<void> | null = null;
@@ -507,10 +491,6 @@ export async function startOrAppendBatch(
   };
 }
 
-/* ============================================================
-   LEVENSHTEIN
-   ============================================================ */
-
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
@@ -571,10 +551,6 @@ async function findSimilarSlugs(
     return [];
   }
 }
-
-/* ============================================================
-   ANIME PUSH
-   ============================================================ */
 
 async function doPublishAnime(
   ctx: Context,
@@ -679,10 +655,6 @@ async function doPublishAnime(
     )
     .catch(() => {});
 }
-
-/* ============================================================
-   BATCH PUSH
-   ============================================================ */
 
 async function doPublishBatchInitial(
   ctx: Context,
@@ -921,10 +893,6 @@ async function doPublishBatchPush(
     .catch(() => {});
 }
 
-/* ============================================================
-   DBA SESSION + PUBLISH SCAN
-   ============================================================ */
-
 async function getDbaSession(
   env: Env,
   userId: number
@@ -1046,7 +1014,6 @@ async function deletePendingPublish(
 }
 
 async function buildMetadataFile(
-  env: Env,
   session: DbaSessionRow,
   slug: string
 ): Promise<FileToCommit | null> {
@@ -1172,10 +1139,6 @@ async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       .catch(() => {});
   }
 }
-
-/* ============================================================
-   COMMANDS
-   ============================================================ */
 
 export const publishAnimeCommand: CommandDefinition = {
   name: 'publish_anime',
