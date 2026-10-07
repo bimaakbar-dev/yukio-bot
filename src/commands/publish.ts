@@ -7,14 +7,18 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { AniListMedia } from '../types/anime';
 import {
   githubCommitFile,
+  githubCommitMultipleFiles,
   githubGetFile,
   githubListDir,
   type FileToCommit,
+  type RepoTarget,
 } from '../lib/github';
 import { buildMetadataYaml } from '../services/qimochi-yaml';
+import { getCharCache } from '../lib/dba-characters';
 
 const BATCH_TTL_MS = 24 * 60 * 60 * 1000;
 const PUBLISH_TTL_MS = 30 * 60 * 1000;
+const CHAR_PART_SIZE = 50;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -87,10 +91,37 @@ interface PendingPublishRow {
   expires_at: number;
 }
 
+interface SectionInfo {
+  count: number;
+  files: number;
+}
+
 interface PublishSummary {
-  yukionime: { metadata: boolean; files: number };
-  yukioData: { characters: number; episodes: number; franchises: number; actors: number; files: number };
-  qimochi: { franchises: number; files: number };
+  yukionime: { metadata: boolean };
+  yukioData: {
+    characters: SectionInfo;
+    episodes: SectionInfo;
+    franchises: SectionInfo;
+    actors: SectionInfo;
+  };
+  qimochi: {
+    franchises: SectionInfo;
+  };
+}
+
+function emptySummary(): PublishSummary {
+  return {
+    yukionime: { metadata: false },
+    yukioData: {
+      characters: { count: 0, files: 0 },
+      episodes: { count: 0, files: 0 },
+      franchises: { count: 0, files: 0 },
+      actors: { count: 0, files: 0 },
+    },
+    qimochi: {
+      franchises: { count: 0, files: 0 },
+    },
+  };
 }
 
 function slugify(str: string): string {
@@ -116,6 +147,14 @@ function stripHtml(s: string): string {
     .replace(/&#0?39;/g, "'")
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
 }
 
 let dbReady = false;
@@ -1013,10 +1052,10 @@ async function deletePendingPublish(
   }
 }
 
-async function buildMetadataFile(
+function buildMetadataFile(
   session: DbaSessionRow,
   slug: string
-): Promise<FileToCommit | null> {
+): FileToCommit | null {
   if (!session.metadata) return null;
 
   let media: AniListMedia;
@@ -1048,7 +1087,100 @@ async function buildMetadataFile(
   return {
     path: `src/content/anime/${slug}.md`,
     content: `${yaml}\n\n${body}\n`,
+    target: 'yukionime',
   };
+}
+
+async function buildCharacterFiles(
+  env: Env,
+  sessionId: string,
+  slug: string
+): Promise<FileToCommit[]> {
+  const cache = await getCharCache(env.DB, sessionId);
+  if (!cache || cache.chars.length === 0) return [];
+
+  const chunks = chunkArray(cache.chars, CHAR_PART_SIZE);
+  const files: FileToCommit[] = [];
+
+  let cursor = 1;
+  for (const chunk of chunks) {
+    const start = cursor;
+    const end = cursor + chunk.length - 1;
+    files.push({
+      path: `data/anime/${slug}/characters/${start}-${end}.json`,
+      content: JSON.stringify(chunk, null, 2) + '\n',
+      target: 'yukio-data',
+      itemCount: chunk.length,
+    });
+    cursor = end + 1;
+  }
+
+  return files;
+}
+
+function buildPreviewLines(
+  session: DbaSessionRow,
+  slug: string,
+  summary: PublishSummary,
+  totalFiles: number
+): string {
+  const lines: string[] = [];
+  lines.push(`📋 <b>Preview Publish</b>`);
+  lines.push('');
+  lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
+  lines.push(`🆔 <code>${slug}</code>`);
+  lines.push('');
+
+  const hasAny = () => {
+    if (summary.yukionime.metadata) return true;
+    const d = summary.yukioData;
+    if (d.characters.count > 0) return true;
+    if (d.episodes.count > 0) return true;
+    if (d.franchises.count > 0) return true;
+    if (d.actors.count > 0) return true;
+    if (summary.qimochi.franchises.count > 0) return true;
+    return false;
+  };
+
+  if (!hasAny()) {
+    lines.push(`<i>Tidak ada data siap di-publish.</i>`);
+    return lines.join('\n');
+  }
+
+  if (summary.yukionime.metadata) {
+    lines.push(`📄 <b>Metadata + Summary</b> → yukionime`);
+  }
+
+  const d = summary.yukioData;
+  if (d.characters.count > 0) {
+    lines.push(
+      `👥 <b>Characters</b> (${d.characters.count}) → yukio-data (${d.characters.files} file)`
+    );
+  }
+  if (d.episodes.count > 0) {
+    lines.push(
+      `🎬 <b>Episodes</b> (${d.episodes.count}) → yukio-data (${d.episodes.files} file)`
+    );
+  }
+  if (d.franchises.count > 0) {
+    lines.push(
+      `🔗 <b>Franchises</b> (${d.franchises.count}) → yukio-data`
+    );
+  }
+  if (d.actors.count > 0) {
+    lines.push(
+      `🎤 <b>Actors</b> (${d.actors.count}) → yukio-data (${d.actors.files} file)`
+    );
+  }
+  if (summary.qimochi.franchises.count > 0) {
+    lines.push(
+      `🔗 <b>Franchises</b> → qimochi`
+    );
+  }
+
+  lines.push('');
+  lines.push(`📦 Total: <b>${totalFiles}</b> file`);
+  return lines.join('\n');
 }
 
 async function doPublishNew(ctx: Context, env: Env): Promise<void> {
@@ -1073,25 +1205,37 @@ async function doPublishNew(ctx: Context, env: Env): Promise<void> {
 
     const slug = slugify(session.title);
     const files: FileToCommit[] = [];
-    const summary: PublishSummary = {
-      yukionime: { metadata: false, files: 0 },
-      yukioData: { characters: 0, episodes: 0, franchises: 0, actors: 0, files: 0 },
-      qimochi: { franchises: 0, files: 0 },
-    };
+    const summary = emptySummary();
 
-    const metaFile = await buildMetadataFile(session, slug);
+    const metaFile = buildMetadataFile(session, slug);
     if (metaFile) {
       files.push(metaFile);
       summary.yukionime.metadata = true;
-      summary.yukionime.files = 1;
     }
+
+    try {
+      const charFiles = await buildCharacterFiles(env, session.session_id, slug);
+      if (charFiles.length > 0) {
+        files.push(...charFiles);
+        let totalChars = 0;
+        for (const cf of charFiles) totalChars += cf.itemCount ?? 0;
+        summary.yukioData.characters = {
+          count: totalChars,
+          files: charFiles.length,
+        };
+      }
+    } catch (err) {
+      console.warn('[Publish] buildCharacterFiles error:', err);
+    }
+
+    const previewText = buildPreviewLines(session, slug, summary, files.length);
 
     if (files.length === 0) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
         `⚠️ <b>Tidak ada data siap di-publish.</b>\n\n` +
-          `Buka <code>/dba</code> → klik <b>📋 Metadata</b> atau section lain dulu.`,
+          `Buka <code>/dba</code> → klik <b>📋 Metadata</b>, <b>👥 Characters</b>, atau section lain dulu.`,
         { parse_mode: 'HTML' }
       );
       return;
@@ -1099,34 +1243,15 @@ async function doPublishNew(ctx: Context, env: Env): Promise<void> {
 
     const pendingId = await savePendingPublish(env.DB, userId, files, summary);
 
-    const lines: string[] = [];
-    lines.push(`📋 <b>Preview Publish</b>`);
-    lines.push('');
-    lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
-    lines.push(`🆔 <code>${slug}</code>`);
-    lines.push('');
-
-    if (summary.yukionime.metadata) {
-      lines.push(`📄 <b>Metadata + Summary</b> → yukionime`);
-    }
-
-    lines.push('');
-    lines.push(`📦 Total: <b>${files.length}</b> file`);
-
     const kb = new InlineKeyboard()
       .text('📤 Push', `pp:push:${pendingId}`)
       .text('❌ Batal', `pp:cancel:${pendingId}`);
 
-    await ctx.api.editMessageText(
-      ctx.chat!.id,
-      loading.message_id,
-      lines.join('\n'),
-      {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: kb,
-      }
-    );
+    await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, previewText, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    });
   } catch (err: any) {
     console.error('[Publish] scan error:', err);
     await ctx.api
@@ -1291,10 +1416,6 @@ export const publishCommand: CommandDefinition = {
   },
 };
 
-/* ============================================================
-   CALLBACKS
-   ============================================================ */
-
 export function setupPublishCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^pub:an:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
@@ -1431,49 +1552,117 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      const metaFile = files.find((f) => f.path.startsWith('src/content/anime/'));
-
-      if (!metaFile) {
-        await ctx.reply('❌ Metadata tidak ada di pending.').catch(() => {});
-        return;
+      const groups = new Map<RepoTarget, FileToCommit[]>();
+      for (const f of files) {
+        const target = f.target ?? 'qimochi';
+        if (!groups.has(target)) groups.set(target, []);
+        groups.get(target)!.push(f);
       }
 
-      const slug = metaFile.path.split('/').pop()?.replace(/\.md$/, '') ?? '';
-
-      const result = await githubCommitFile(
-        env,
-        metaFile.path,
-        metaFile.content,
-        `feat(anime): add ${slug}`,
-        'yukionime'
+      const metaFile = files.find(
+        (f) => f.target === 'yukionime' && f.path.startsWith('src/content/anime/')
       );
+      const slug =
+        metaFile?.path.split('/').pop()?.replace(/\.md$/, '') ??
+        (files[0]?.path.split('/').slice(-2, -1)[0] ?? 'unknown');
 
-      if (!result.ok) {
+      const message = `feat: publish data for ${slug}`;
+
+      const results: {
+        target: RepoTarget;
+        ok: boolean;
+        sha?: string;
+        commitUrl?: string;
+        count: number;
+        error?: string;
+      }[] = [];
+
+      for (const [target, groupFiles] of groups) {
+        let r: {
+          ok: boolean;
+          sha?: string;
+          commitUrl?: string;
+          error?: string;
+        };
+
+        if (groupFiles.length === 1) {
+          const f = groupFiles[0]!;
+          r = await githubCommitFile(env, f.path, f.content, message, target);
+        } else {
+          r = await githubCommitMultipleFiles(
+            env,
+            groupFiles,
+            message,
+            target
+          );
+        }
+
+        results.push({
+          target,
+          ok: r.ok,
+          sha: r.sha,
+          commitUrl: r.commitUrl,
+          count: groupFiles.length,
+          error: r.error,
+        });
+      }
+
+      const okCount = results.filter((r) => r.ok).length;
+      const failCount = results.length - okCount;
+
+      if (okCount === 0) {
+        const errLines: string[] = ['❌ <b>Gagal push semua</b>', ''];
+        for (const r of results) {
+          errLines.push(
+            `• <b>${r.target}</b>: <code>${escapeHtml((r.error ?? 'unknown').slice(0, 200))}</code>`
+          );
+        }
         await ctx
-          .reply(
-            `❌ Gagal push: <code>${escapeHtml(result.error ?? 'unknown')}</code>`,
-            { parse_mode: 'HTML' }
-          )
+          .editMessageText(errLines.join('\n'), {
+            parse_mode: 'HTML',
+            reply_markup: undefined,
+          })
           .catch(() => {});
         return;
       }
 
-      await deletePendingPublish(env.DB, pendingId);
+      if (failCount === 0) {
+        await deletePendingPublish(env.DB, pendingId);
+      }
 
-      const commitShort = result.sha?.slice(0, 7) ?? '?';
+      const lines: string[] = [];
+      lines.push(
+        failCount === 0
+          ? `✅ <b>Published!</b>`
+          : `⚠️ <b>Publish sebagian</b> (${okCount}/${results.length})`
+      );
+      lines.push('');
+
+      for (const r of results) {
+        const status = r.ok ? '✅' : '❌';
+        const short = r.sha?.slice(0, 7) ?? '?';
+        lines.push(
+          `${status} <b>${r.target}</b> — ${r.count} file` +
+            (r.ok ? ` · <code>${short}</code>` : ` · <i>${escapeHtml((r.error ?? 'unknown').slice(0, 100))}</i>`)
+        );
+      }
+
+      if (failCount === 0) {
+        lines.push('');
+        lines.push(`⏳ Deploy ~2 menit`);
+      } else {
+        lines.push('');
+        lines.push(
+          `<i>Yang sukses tidak di-rollback. Ulangi /publish untuk retry yang gagal.</i>`
+        );
+      }
 
       await ctx
-        .editMessageText(
-          `✅ <b>Published!</b>\n\n` +
-            `📄 <code>${escapeHtml(metaFile.path)}</code>\n` +
-            `🔗 Commit: <code>${commitShort}</code>\n` +
-            `⏳ Deploy ~2 menit`,
-          {
-            parse_mode: 'HTML',
-            link_preview_options: { is_disabled: true },
-            reply_markup: undefined,
-          }
-        )
+        .editMessageText(lines.join('\n'), {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: undefined,
+        })
         .catch(() => {});
     } catch (err: any) {
       console.error('[Publish] push error:', err);
