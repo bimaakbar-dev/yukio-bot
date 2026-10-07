@@ -4,6 +4,7 @@ import { registerCommands } from './commands/registry';
 import { setupBusinessHandler } from './business/autoReply';
 import { cleanupCache } from './lib/cache';
 import { isAdmin } from './lib/permissions';
+import { escapeHtml } from './lib/utils';
 import { handleDocumentAuto } from './commands/decode';
 import { setupAnimeCallbacks } from './commands/anime';
 import { setupVaCallbacks } from './commands/va';
