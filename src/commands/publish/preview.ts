@@ -44,7 +44,9 @@ export function buildPreviewLines(
   const check = (k: SectionKey) => (selected.has(k) ? '✅' : '⬜');
 
   if (hasMeta) {
-    lines.push(`${check('meta')} ${SECTION_LABEL.meta} → yukionime`);
+    lines.push(
+      `${check('meta')} ${SECTION_LABEL.meta} → yukionime + qimochi`
+    );
   }
   if (hasChars) {
     lines.push(
