@@ -15,10 +15,12 @@ import {
 } from '../lib/github';
 import { buildMetadataYaml } from '../services/qimochi-yaml';
 import { getCharCache } from '../lib/dba-characters';
+import { getEpCache } from '../lib/dba-episodes';
 
 const BATCH_TTL_MS = 24 * 60 * 60 * 1000;
 const PUBLISH_TTL_MS = 30 * 60 * 1000;
 const CHAR_PART_SIZE = 50;
+const EP_PART_SIZE = 12;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -28,6 +30,18 @@ export interface EpisodeObject {
   number: number;
   streams: { quality: string; servers: { name: string; url: string }[] }[];
 }
+
+type SectionKey = 'meta' | 'chars' | 'eps' | 'fr' | 'va';
+
+const ALL_SECTIONS: SectionKey[] = ['meta', 'chars', 'eps', 'fr', 'va'];
+
+const SECTION_LABEL: Record<SectionKey, string> = {
+  meta: '📄 Metadata + Summary',
+  chars: '👥 Characters',
+  eps: '🎬 Episodes',
+  fr: '🔗 Franchises',
+  va: '🎤 Actors',
+};
 
 interface SessionRow {
   session_id: string;
@@ -87,6 +101,7 @@ interface PendingPublishRow {
   user_id: number;
   files_json: string;
   summary_json: string;
+  selected_json: string | null;
   created_at: number;
   expires_at: number;
 }
@@ -155,6 +170,15 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
     chunks.push(arr.slice(i, i + size));
   }
   return chunks;
+}
+
+function sectionFromPath(path: string): SectionKey {
+  if (path.startsWith('src/content/anime/')) return 'meta';
+  if (path.includes('/characters/')) return 'chars';
+  if (path.includes('/episodes/')) return 'eps';
+  if (path.endsWith('/franchises.json')) return 'fr';
+  if (path.startsWith('data/actors/')) return 'va';
+  return 'meta';
 }
 
 let dbReady = false;
@@ -963,15 +987,23 @@ async function ensurePendingPublishDb(db: D1Database): Promise<void> {
       await db
         .prepare(
           `CREATE TABLE IF NOT EXISTS pending_publish (
-            session_id   TEXT PRIMARY KEY,
-            user_id      INTEGER NOT NULL,
-            files_json   TEXT NOT NULL,
-            summary_json TEXT NOT NULL,
-            created_at   INTEGER NOT NULL,
-            expires_at   INTEGER NOT NULL
+            session_id    TEXT PRIMARY KEY,
+            user_id       INTEGER NOT NULL,
+            files_json    TEXT NOT NULL,
+            summary_json  TEXT NOT NULL,
+            selected_json TEXT,
+            created_at    INTEGER NOT NULL,
+            expires_at    INTEGER NOT NULL
           )`
         )
         .run();
+      try {
+        await db
+          .prepare(
+            'ALTER TABLE pending_publish ADD COLUMN selected_json TEXT'
+          )
+          .run();
+      } catch {}
       pendingPublishDbReady = true;
     } catch (err) {
       console.error('[Publish] pending DB init error:', err);
@@ -987,7 +1019,8 @@ async function savePendingPublish(
   db: D1Database,
   userId: number,
   files: FileToCommit[],
-  summary: PublishSummary
+  summary: PublishSummary,
+  selected: SectionKey[]
 ): Promise<string> {
   await ensurePendingPublishDb(db);
   const sessionId = 'pp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
@@ -996,14 +1029,15 @@ async function savePendingPublish(
   await db
     .prepare(
       `INSERT INTO pending_publish
-        (session_id, user_id, files_json, summary_json, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
+        (session_id, user_id, files_json, summary_json, selected_json, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
       userId,
       JSON.stringify(files),
       JSON.stringify(summary),
+      JSON.stringify(selected),
       now,
       now + PUBLISH_TTL_MS
     )
@@ -1035,6 +1069,18 @@ async function getPendingPublish(
   }
 
   return row;
+}
+
+async function updatePendingSelected(
+  db: D1Database,
+  sessionId: string,
+  selected: SectionKey[]
+): Promise<void> {
+  await ensurePendingPublishDb(db);
+  await db
+    .prepare('UPDATE pending_publish SET selected_json = ? WHERE session_id = ?')
+    .bind(JSON.stringify(selected), sessionId)
+    .run();
 }
 
 async function deletePendingPublish(
@@ -1118,11 +1164,38 @@ async function buildCharacterFiles(
   return files;
 }
 
+async function buildEpisodeFiles(
+  env: Env,
+  sessionId: string,
+  slug: string
+): Promise<FileToCommit[]> {
+  const cache = await getEpCache(env.DB, sessionId);
+  if (!cache || cache.episodes.length === 0) return [];
+
+  const chunks = chunkArray(cache.episodes, EP_PART_SIZE);
+  const files: FileToCommit[] = [];
+
+  let cursor = 1;
+  for (const chunk of chunks) {
+    const start = cursor;
+    const end = cursor + chunk.length - 1;
+    files.push({
+      path: `data/anime/${slug}/episodes/${start}-${end}.json`,
+      content: JSON.stringify(chunk, null, 2) + '\n',
+      target: 'yukio-data',
+      itemCount: chunk.length,
+    });
+    cursor = end + 1;
+  }
+
+  return files;
+}
+
 function buildPreviewLines(
   session: DbaSessionRow,
   slug: string,
   summary: PublishSummary,
-  totalFiles: number
+  selected: Set<SectionKey>
 ): string {
   const lines: string[] = [];
   lines.push(`📋 <b>Preview Publish</b>`);
@@ -1131,56 +1204,109 @@ function buildPreviewLines(
   lines.push(`🆔 <code>${slug}</code>`);
   lines.push('');
 
-  const hasAny = () => {
-    if (summary.yukionime.metadata) return true;
-    const d = summary.yukioData;
-    if (d.characters.count > 0) return true;
-    if (d.episodes.count > 0) return true;
-    if (d.franchises.count > 0) return true;
-    if (d.actors.count > 0) return true;
-    if (summary.qimochi.franchises.count > 0) return true;
-    return false;
-  };
+  const hasMeta = summary.yukionime.metadata;
+  const d = summary.yukioData;
+  const hasChars = d.characters.count > 0;
+  const hasEps = d.episodes.count > 0;
+  const hasFr = d.franchises.count > 0;
+  const hasVa = d.actors.count > 0;
+  const hasQFr = summary.qimochi.franchises.count > 0;
 
-  if (!hasAny()) {
-    lines.push(`<i>Tidak ada data siap di-publish.</i>`);
+  const totalReady =
+    (hasMeta ? 1 : 0) +
+    (hasChars ? 1 : 0) +
+    (hasEps ? 1 : 0) +
+    (hasFr ? 1 : 0) +
+    (hasVa ? 1 : 0) +
+    (hasQFr ? 1 : 0);
+
+  if (totalReady === 0) {
+    lines.push('<i>Tidak ada data siap di-publish.</i>');
     return lines.join('\n');
   }
 
-  if (summary.yukionime.metadata) {
-    lines.push(`📄 <b>Metadata + Summary</b> → yukionime`);
-  }
+  const check = (k: SectionKey) => (selected.has(k) ? '✅' : '⬜');
 
-  const d = summary.yukioData;
-  if (d.characters.count > 0) {
+  if (hasMeta) {
+    lines.push(`${check('meta')} ${SECTION_LABEL.meta} → yukionime`);
+  }
+  if (hasChars) {
     lines.push(
-      `👥 <b>Characters</b> (${d.characters.count}) → yukio-data (${d.characters.files} file)`
+      `${check('chars')} ${SECTION_LABEL.chars} (${d.characters.count}) → yukio-data (${d.characters.files} file)`
     );
   }
-  if (d.episodes.count > 0) {
+  if (hasEps) {
     lines.push(
-      `🎬 <b>Episodes</b> (${d.episodes.count}) → yukio-data (${d.episodes.files} file)`
+      `${check('eps')} ${SECTION_LABEL.eps} (${d.episodes.count}) → yukio-data (${d.episodes.files} file)`
     );
   }
-  if (d.franchises.count > 0) {
+  if (hasFr) {
     lines.push(
-      `🔗 <b>Franchises</b> (${d.franchises.count}) → yukio-data`
+      `${check('fr')} ${SECTION_LABEL.fr} (${d.franchises.count}) → yukio-data`
     );
   }
-  if (d.actors.count > 0) {
+  if (hasVa) {
     lines.push(
-      `🎤 <b>Actors</b> (${d.actors.count}) → yukio-data (${d.actors.files} file)`
+      `${check('va')} ${SECTION_LABEL.va} (${d.actors.count}) → yukio-data (${d.actors.files} file)`
     );
   }
-  if (summary.qimochi.franchises.count > 0) {
-    lines.push(
-      `🔗 <b>Franchises</b> → qimochi`
-    );
+  if (hasQFr) {
+    lines.push(`${check('fr')} ${SECTION_LABEL.fr} → qimochi`);
   }
 
   lines.push('');
-  lines.push(`📦 Total: <b>${totalFiles}</b> file`);
+  lines.push(
+    `<i>Tap section untuk toggle. Tap 📤 Push untuk commit yang dipilih.</i>`
+  );
+
   return lines.join('\n');
+}
+
+function buildPreviewKeyboard(
+  pendingId: string,
+  summary: PublishSummary,
+  selected: Set<SectionKey>
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  const d = summary.yukioData;
+
+  const hasMeta = summary.yukionime.metadata;
+  const hasChars = d.characters.count > 0;
+  const hasEps = d.episodes.count > 0;
+  const hasFr = d.franchises.count > 0;
+  const hasVa = d.actors.count > 0;
+
+  const mark = (k: SectionKey) => (selected.has(k) ? '✅' : '⬜');
+
+  if (hasMeta) {
+    kb.text(`${mark('meta')} Metadata`, `pp:t:${pendingId}:meta`).row();
+  }
+  if (hasChars) {
+    kb.text(
+      `${mark('chars')} Characters (${d.characters.count})`,
+      `pp:t:${pendingId}:chars`
+    ).row();
+  }
+  if (hasEps) {
+    kb.text(
+      `${mark('eps')} Episodes (${d.episodes.count})`,
+      `pp:t:${pendingId}:eps`
+    ).row();
+  }
+  if (hasFr) {
+    kb.text(`${mark('fr')} Franchises`, `pp:t:${pendingId}:fr`).row();
+  }
+  if (hasVa) {
+    kb.text(
+      `${mark('va')} Actors (${d.actors.count})`,
+      `pp:t:${pendingId}:va`
+    ).row();
+  }
+
+  kb.text('📤 Push', `pp:push:${pendingId}`)
+    .text('❌ Batal', `pp:cancel:${pendingId}`);
+
+  return kb;
 }
 
 async function doPublishNew(ctx: Context, env: Env): Promise<void> {
@@ -1217,35 +1343,56 @@ async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       const charFiles = await buildCharacterFiles(env, session.session_id, slug);
       if (charFiles.length > 0) {
         files.push(...charFiles);
-        let totalChars = 0;
-        for (const cf of charFiles) totalChars += cf.itemCount ?? 0;
-        summary.yukioData.characters = {
-          count: totalChars,
-          files: charFiles.length,
-        };
+        let total = 0;
+        for (const cf of charFiles) total += cf.itemCount ?? 0;
+        summary.yukioData.characters = { count: total, files: charFiles.length };
       }
     } catch (err) {
       console.warn('[Publish] buildCharacterFiles error:', err);
     }
 
-    const previewText = buildPreviewLines(session, slug, summary, files.length);
+    try {
+      const epFiles = await buildEpisodeFiles(env, session.session_id, slug);
+      if (epFiles.length > 0) {
+        files.push(...epFiles);
+        let total = 0;
+        for (const ef of epFiles) total += ef.itemCount ?? 0;
+        summary.yukioData.episodes = { count: total, files: epFiles.length };
+      }
+    } catch (err) {
+      console.warn('[Publish] buildEpisodeFiles error:', err);
+    }
 
     if (files.length === 0) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
         loading.message_id,
         `⚠️ <b>Tidak ada data siap di-publish.</b>\n\n` +
-          `Buka <code>/dba</code> → klik <b>📋 Metadata</b>, <b>👥 Characters</b>, atau section lain dulu.`,
+          `Buka <code>/dba</code> → klik <b>📋 Metadata</b>, <b>👥 Characters</b>, atau <b>🎬 Episodes</b> dulu.`,
         { parse_mode: 'HTML' }
       );
       return;
     }
 
-    const pendingId = await savePendingPublish(env.DB, userId, files, summary);
+    const availableSections = new Set<SectionKey>();
+    for (const f of files) {
+      availableSections.add(sectionFromPath(f.path));
+    }
 
-    const kb = new InlineKeyboard()
-      .text('📤 Push', `pp:push:${pendingId}`)
-      .text('❌ Batal', `pp:cancel:${pendingId}`);
+    const selected = new Set<SectionKey>(
+      ALL_SECTIONS.filter((s) => availableSections.has(s))
+    );
+
+    const pendingId = await savePendingPublish(
+      env.DB,
+      userId,
+      files,
+      summary,
+      [...selected]
+    );
+
+    const previewText = buildPreviewLines(session, slug, summary, selected);
+    const kb = buildPreviewKeyboard(pendingId, summary, selected);
 
     await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, previewText, {
       parse_mode: 'HTML',
@@ -1516,6 +1663,85 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     );
   });
 
+  bot.callbackQuery(/^pp:t:(pp_[a-z0-9]+):(meta|chars|eps|fr|va)$/, async (ctx) => {
+    try {
+      const pendingId = ctx.match[1] ?? '';
+      const section = (ctx.match[2] ?? '') as SectionKey;
+
+      if (!pendingId || !ALL_SECTIONS.includes(section)) {
+        await ctx.answerCallbackQuery({ text: '❌' });
+        return;
+      }
+
+      const pending = await getPendingPublish(env.DB, pendingId);
+      if (!pending) {
+        await ctx.answerCallbackQuery({
+          text: '⏱️ Kadaluarsa. Ulangi /publish.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      if (ctx.from?.id !== pending.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
+        return;
+      }
+
+      let selected: SectionKey[] = [];
+      try {
+        if (pending.selected_json) {
+          selected = JSON.parse(pending.selected_json) as SectionKey[];
+        }
+      } catch {
+        selected = [];
+      }
+
+      const set = new Set(selected);
+      if (set.has(section)) {
+        set.delete(section);
+      } else {
+        set.add(section);
+      }
+
+      const newSelected = ALL_SECTIONS.filter((s) => set.has(s));
+      await updatePendingSelected(env.DB, pendingId, newSelected);
+
+      let summary: PublishSummary;
+      try {
+        summary = JSON.parse(pending.summary_json) as PublishSummary;
+      } catch {
+        summary = emptySummary();
+      }
+
+      const session = await getDbaSession(env, pending.user_id);
+      const title = session?.title ?? 'unknown';
+      const slug = session ? slugify(session.title) : 'unknown';
+
+      const previewText = buildPreviewLines(
+        { ...(session ?? ({} as DbaSessionRow)), title } as DbaSessionRow,
+        slug,
+        summary,
+        set
+      );
+      const kb = buildPreviewKeyboard(pendingId, summary, set);
+
+      await ctx.answerCallbackQuery({
+        text: set.has(section) ? `✅ ${section} on` : `⬜ ${section} off`,
+      });
+
+      await ctx
+        .editMessageText(previewText, {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: kb,
+        })
+        .catch(() => {});
+    } catch (err: any) {
+      console.error('[Publish] toggle error:', err);
+      await ctx.answerCallbackQuery({ text: '❌ Gagal toggle' }).catch(() => {});
+    }
+  });
+
   bot.callbackQuery(/^pp:push:(pp_[a-z0-9]+)$/, async (ctx) => {
     try {
       const pendingId = ctx.match[1] ?? '';
@@ -1538,17 +1764,39 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
-
-      let files: FileToCommit[] = [];
+      let selected: SectionKey[] = [];
       try {
-        files = JSON.parse(pending.files_json) as FileToCommit[];
+        if (pending.selected_json) {
+          selected = JSON.parse(pending.selected_json) as SectionKey[];
+        }
       } catch {
-        files = [];
+        selected = [];
       }
 
+      if (selected.length === 0) {
+        await ctx.answerCallbackQuery({
+          text: '❌ Tidak ada section dipilih.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
+
+      let allFiles: FileToCommit[] = [];
+      try {
+        allFiles = JSON.parse(pending.files_json) as FileToCommit[];
+      } catch {
+        allFiles = [];
+      }
+
+      const selectedSet = new Set(selected);
+      const files = allFiles.filter((f) =>
+        selectedSet.has(sectionFromPath(f.path))
+      );
+
       if (files.length === 0) {
-        await ctx.reply('❌ Tidak ada file.').catch(() => {});
+        await ctx.reply('❌ Tidak ada file untuk di-push.').catch(() => {});
         return;
       }
 
@@ -1572,7 +1820,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
         target: RepoTarget;
         ok: boolean;
         sha?: string;
-        commitUrl?: string;
         count: number;
         error?: string;
       }[] = [];
@@ -1589,19 +1836,13 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
           const f = groupFiles[0]!;
           r = await githubCommitFile(env, f.path, f.content, message, target);
         } else {
-          r = await githubCommitMultipleFiles(
-            env,
-            groupFiles,
-            message,
-            target
-          );
+          r = await githubCommitMultipleFiles(env, groupFiles, message, target);
         }
 
         results.push({
           target,
           ok: r.ok,
           sha: r.sha,
-          commitUrl: r.commitUrl,
           count: groupFiles.length,
           error: r.error,
         });
@@ -1643,7 +1884,9 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
         const short = r.sha?.slice(0, 7) ?? '?';
         lines.push(
           `${status} <b>${r.target}</b> — ${r.count} file` +
-            (r.ok ? ` · <code>${short}</code>` : ` · <i>${escapeHtml((r.error ?? 'unknown').slice(0, 100))}</i>`)
+            (r.ok
+              ? ` · <code>${short}</code>`
+              : ` · <i>${escapeHtml((r.error ?? 'unknown').slice(0, 100))}</i>`)
         );
       }
 
