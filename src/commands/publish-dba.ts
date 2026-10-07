@@ -22,6 +22,7 @@ interface SessionRow {
   kitsu_id: string | null;
   title: string;
   metadata: string | null;
+  summary: string | null;
   expires_at: number;
 }
 
@@ -220,8 +221,14 @@ async function buildMarkdown(
     kitsuId: session.kitsu_id ?? null,
   });
 
-  const rawSynopsis = media.description ?? '';
-  const body = await buildSynopsis(env, session.title, rawSynopsis);
+  let body: string;
+
+  if (session.summary && session.summary.trim().length > 50) {
+    body = session.summary.trim();
+  } else {
+    const rawSynopsis = media.description ?? '';
+    body = await buildSynopsis(env, session.title, rawSynopsis);
+  }
 
   return `${yaml}\n\n${body}\n`;
 }
@@ -250,27 +257,36 @@ async function doPublishDba(
   if (!ctx.from?.id) return;
 
   const slug = slugify(session.title);
+  const hasSummary = !!session.summary && session.summary.trim().length > 50;
 
-  const loadingMsg = await ctx.reply('🤖 Generate sinopsis Indonesia...');
+  let loadingMsg: { message_id: number } | null = null;
+
+  if (!hasSummary) {
+    loadingMsg = await ctx.reply('🤖 Generate sinopsis Indonesia...');
+  }
 
   let markdown: string;
   try {
     markdown = await buildMarkdown(env, session, media);
   } catch (err) {
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        loadingMsg.message_id,
-        `❌ Gagal generate sinopsis: <code>${escapeHtml((err as Error).message ?? 'unknown')}</code>`,
-        { parse_mode: 'HTML' }
-      )
-      .catch(() => {});
+    if (loadingMsg) {
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loadingMsg.message_id,
+          `❌ Gagal generate sinopsis: <code>${escapeHtml((err as Error).message ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+    }
     return;
   }
 
-  await ctx.api
-    .deleteMessage(ctx.chat!.id, loadingMsg.message_id)
-    .catch(() => {});
+  if (loadingMsg) {
+    await ctx.api
+      .deleteMessage(ctx.chat!.id, loadingMsg.message_id)
+      .catch(() => {});
+  }
 
   const targetPath = `src/content/anime/${slug}.md`;
   const pendingId = await savePending(env.DB, ctx.from.id, slug, markdown);
@@ -288,6 +304,7 @@ async function doPublishDba(
   lines.push(`📁 <code>${escapeHtml(targetPath)}</code>`);
   lines.push(`📏 ${sizeKB} KB`);
   lines.push(`🎬 ${escapeHtml(session.title)}`);
+  if (hasSummary) lines.push(`📝 Sinopsis: dari /dba summary`);
   lines.push('');
 
   if (existing) {
