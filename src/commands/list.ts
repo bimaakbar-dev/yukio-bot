@@ -24,9 +24,9 @@ import {
   batchResetCommand,
   publishCommand,
 } from './publish';
-
 import { postCommand } from './post';
 import { killCommand } from './kill';
+import { editCommand } from './edit';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -48,5 +48,6 @@ export const COMMANDS: CommandDefinition[] = [
   batchResetCommand,
   publishCommand,
   postCommand,
+  editCommand,
   killCommand,
 ];
