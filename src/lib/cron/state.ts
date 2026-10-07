@@ -11,6 +11,7 @@ export interface TrackedAnimeRow {
   fallback_site: SiteKey | null;
   schedule_day: string;
   schedule_hour: number;
+  schedule_minute: number;
   buffer_min: number;
   chunk_start: number;
   chunk_end: number;
@@ -43,24 +44,33 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS tracked_anime (
-        slug           TEXT PRIMARY KEY,
-        site           TEXT NOT NULL,
-        source_slug    TEXT NOT NULL,
-        fallback_site  TEXT,
-        schedule_day   TEXT NOT NULL,
-        schedule_hour  INTEGER NOT NULL,
-        buffer_min     INTEGER NOT NULL DEFAULT 60,
-        chunk_start    INTEGER NOT NULL DEFAULT 0,
-        chunk_end      INTEGER NOT NULL DEFAULT 0,
-        last_ep        INTEGER NOT NULL DEFAULT 0,
-        status         TEXT NOT NULL DEFAULT 'active',
-        last_check_at  INTEGER,
-        last_push_at   INTEGER,
-        created_at     INTEGER NOT NULL,
-        updated_at     INTEGER NOT NULL
+        slug             TEXT PRIMARY KEY,
+        site             TEXT NOT NULL,
+        source_slug      TEXT NOT NULL,
+        fallback_site    TEXT,
+        schedule_day     TEXT NOT NULL,
+        schedule_hour    INTEGER NOT NULL,
+        schedule_minute  INTEGER NOT NULL DEFAULT 0,
+        buffer_min       INTEGER NOT NULL DEFAULT 60,
+        chunk_start      INTEGER NOT NULL DEFAULT 0,
+        chunk_end        INTEGER NOT NULL DEFAULT 0,
+        last_ep          INTEGER NOT NULL DEFAULT 0,
+        status           TEXT NOT NULL DEFAULT 'active',
+        last_check_at    INTEGER,
+        last_push_at     INTEGER,
+        created_at       INTEGER NOT NULL,
+        updated_at       INTEGER NOT NULL
       )`
     )
     .run();
+  
+  try {
+    await db
+      .prepare(
+        'ALTER TABLE tracked_anime ADD COLUMN schedule_minute INTEGER NOT NULL DEFAULT 0'
+      )
+      .run();
+  } catch {}
 
   await db
     .prepare(
@@ -103,6 +113,7 @@ export interface SaveTrackedAnimeInput {
   fallbackSite: SiteKey | null;
   scheduleDay: string;
   scheduleHour: number;
+  scheduleMinute?: number;
   bufferMin?: number;
 }
 
@@ -117,15 +128,16 @@ export async function saveTrackedAnime(
     .prepare(
       `INSERT INTO tracked_anime
         (slug, site, source_slug, fallback_site, schedule_day, schedule_hour,
-         buffer_min, chunk_start, chunk_end, last_ep, status,
+         schedule_minute, buffer_min, chunk_start, chunk_end, last_ep, status,
          created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', ?, ?)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', ?, ?)
        ON CONFLICT(slug) DO UPDATE SET
          site = excluded.site,
          source_slug = excluded.source_slug,
          fallback_site = excluded.fallback_site,
          schedule_day = excluded.schedule_day,
          schedule_hour = excluded.schedule_hour,
+         schedule_minute = excluded.schedule_minute,
          buffer_min = excluded.buffer_min,
          status = 'active',
          updated_at = excluded.updated_at`
@@ -137,6 +149,7 @@ export async function saveTrackedAnime(
       data.fallbackSite,
       data.scheduleDay,
       data.scheduleHour,
+      data.scheduleMinute ?? 0,
       data.bufferMin ?? 60,
       now,
       now
@@ -163,7 +176,7 @@ export async function listTrackedAnime(
     .prepare(
       `SELECT * FROM tracked_anime
        WHERE status = 'active'
-       ORDER BY schedule_day, schedule_hour`
+       ORDER BY schedule_hour, schedule_minute`
     )
     .all<TrackedAnimeRow>();
   return res.results ?? [];
@@ -176,7 +189,7 @@ export async function listAllTrackedAnime(
   const res = await db
     .prepare(
       `SELECT * FROM tracked_anime
-       ORDER BY status, schedule_day, schedule_hour`
+       ORDER BY status, schedule_hour, schedule_minute`
     )
     .all<TrackedAnimeRow>();
   return res.results ?? [];
@@ -207,6 +220,23 @@ export async function setTrackedStatus(
        WHERE slug = ?`
     )
     .bind(status, Date.now(), slug)
+    .run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
+export async function updateTrackedSourceSlug(
+  db: D1Database,
+  slug: string,
+  newSourceSlug: string
+): Promise<boolean> {
+  await ensureCronDb(db);
+  const res = await db
+    .prepare(
+      `UPDATE tracked_anime
+       SET source_slug = ?, updated_at = ?
+       WHERE slug = ?`
+    )
+    .bind(newSourceSlug, Date.now(), slug)
     .run();
   return (res.meta?.changes ?? 0) > 0;
 }
@@ -349,12 +379,22 @@ export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
 
   const now = new Date();
   const wibHour = (now.getUTCHours() + 7) % 24;
-  const wibDay = (now.getUTCDay() + 0) % 7;
+  const wibMinute = now.getUTCMinutes();
+  const wibDay = now.getUTCDay();
 
   const targetDay = dayNameToIndex(row.schedule_day);
   if (targetDay === -1) return false;
+
   if (wibDay !== targetDay) return false;
-  
-  const targetHour = row.schedule_hour + Math.floor(row.buffer_min / 60);
-  return wibHour >= targetHour;
+
+  const nowTotal = wibHour * 60 + wibMinute;
+  const targetTotal = row.schedule_hour * 60 + row.schedule_minute + row.buffer_min;
+
+  return nowTotal >= targetTotal;
+}
+
+export function formatScheduleTime(row: TrackedAnimeRow): string {
+  const hh = String(row.schedule_hour).padStart(2, '0');
+  const mm = String(row.schedule_minute ?? 0).padStart(2, '0');
+  return `${hh}:${mm}`;
 }
