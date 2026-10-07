@@ -4,7 +4,13 @@ import { createLazyInit } from '../../lib/lazy-init';
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
 
-export type TrackStep = 'site' | 'slug' | 'source_slug' | 'day' | 'hour' | 'confirm';
+export type TrackStep =
+  | 'site'
+  | 'slug'
+  | 'source_slug'
+  | 'day'
+  | 'hour'
+  | 'confirm';
 
 export interface TrackSessionRow {
   session_id: string;
@@ -137,7 +143,9 @@ export async function updateTrackSession(
   values.push(sessionId);
 
   await db
-    .prepare(`UPDATE track_sessions SET ${sets.join(', ')} WHERE session_id = ?`)
+    .prepare(
+      `UPDATE track_sessions SET ${sets.join(', ')} WHERE session_id = ?`
+    )
     .bind(...values)
     .run();
 }
