@@ -255,20 +255,75 @@ export default {
         return new Response('OK', { status: 200 });
       }
     }
-
     return new Response('Not Found', { status: 404 });
   },
 
-  async scheduled(
-    _event: ScheduledEvent,
+    async scheduled(
+    event: ScheduledEvent,
     env: Env,
     _ctx: ExecutionContext
   ): Promise<void> {
-    try {
-      const cleaned = await cleanupCache(env.DB);
-      console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
-    } catch (err) {
-      console.error('[Cron] cleanup error:', err);
+    const cron = event.cron;
+    console.log(`[Cron] trigger: ${cron}`);
+      
+    if (cron === '0 3 * * *') {
+      try {
+        const cleaned = await cleanupCache(env.DB);
+        console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
+      } catch (err) {
+        console.error('[Cron] cleanup error:', err);
+      }
+      return;
     }
+    if (cron === '0 23 * * *' || cron === '0 11 * * *') {
+      try {
+        const { runCron } = await import('./lib/cron/runner');
+        const result = await runCron(env);
+
+        const summaryLines: string[] = [];
+        summaryLines.push(
+          `<b>📡 Cron Episode Report</b>\n` +
+            `🕐 <code>${cron}</code>\n`
+        );
+        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b> anime`);
+        summaryLines.push(
+          `📼 Push: <b>${result.episodesPushed}</b> episode baru`
+        );
+
+        if (result.errors.length > 0) {
+          summaryLines.push('');
+          summaryLines.push(`⚠️ <b>Error (${result.errors.length}):</b>`);
+          for (const e of result.errors.slice(0, 5)) {
+            summaryLines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
+          }
+          if (result.errors.length > 5) {
+            summaryLines.push(
+              `<i>…dan ${result.errors.length - 5} lainnya</i>`
+            );
+          }
+        }
+        try {
+          const { Bot: BotCtor } = await import('grammy');
+          const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
+          await bot.api.sendMessage(
+            env.ADMIN_USER_ID,
+            summaryLines.join('\n'),
+            {
+              parse_mode: 'HTML',
+              link_preview_options: { is_disabled: true },
+            }
+          );
+        } catch (notifErr) {
+          console.error('[Cron] notif error:', notifErr);
+        }
+
+        console.log(
+          `[Cron] episode check done — pushed ${result.episodesPushed}, errors ${result.errors.length}`
+        );
+      } catch (err) {
+        console.error('[Cron] episode check error:', err);
+      }
+      return;
+    }
+    console.warn(`[Cron] unknown trigger: ${cron}`);
   },
-};
