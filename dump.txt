@@ -1,6 +1,6 @@
 === REPO DUMP ===
-Generated: Wed Oct  7 08:06:26 UTC 2026
-Commit: ad23baa
+Generated: Wed Oct  7 08:26:28 UTC 2026
+Commit: 75a897b
 
 === STRUCTURE ===
 .
@@ -55,6 +55,7 @@ Commit: ad23baa
 ./src/lib/http.ts
 ./src/lib/permissions.ts
 ./src/lib/telegram-utils.ts
+./src/lib/utils.ts
 ./src/services/ai.ts
 ./src/services/anilist.ts
 ./src/services/anime-core.ts
@@ -1437,10 +1438,9 @@ import {
   type Tracker,
 } from '../lib/telegram-utils';
 
-/* ---------- DBA modules ---------- */
+import { escapeHtml, withTimeout } from '../lib/utils';
+
 import {
-  escapeHtml,
-  fetchWithTimeout,
   safeFetch,
   fallbackJson,
   parseJsonArray,
@@ -1476,17 +1476,9 @@ import { saveEpCache } from '../lib/dba-episodes';
 import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
-/* ============================================================
-   CONSTANTS
-   ============================================================ */
-
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
 const CHAR_FETCH_TIMEOUT_MS = 25000;
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
 
 function buildChainContext(session: SessionRow): ChainContext {
   return {
@@ -1523,10 +1515,6 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
-/* ============================================================
-   AI SYNOPSIS
-   ============================================================ */
-
 async function rewriteSynopsis(
   env: Env,
   title: string,
@@ -1559,10 +1547,6 @@ async function rewriteSynopsis(
     return null;
   }
 }
-
-/* ============================================================
-   COMMAND: /dba
-   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -1671,10 +1655,6 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
-/* ============================================================
-   COMMAND: /end
-   ============================================================ */
-
 export const endCommand: CommandDefinition = {
   name: 'end',
   description: 'Hapus semua pesan session /dba aktif',
@@ -1718,10 +1698,6 @@ export const endCommand: CommandDefinition = {
   },
 };
 
-/* ============================================================
-   METADATA HANDLERS
-   ============================================================ */
-
 async function handleMetadataShow(
   ctx: Context,
   env: Env,
@@ -1731,7 +1707,7 @@ async function handleMetadataShow(
   let media = parseJsonMedia(session.metadata);
 
   if (!media) {
-    const fetched = await fetchWithTimeout(
+    const fetched = await withTimeout(
       () => getMetadataFromAniList(session.title),
       SOURCE_TIMEOUT_MS
     );
@@ -1788,13 +1764,13 @@ async function handleMetadataMerge(
   let incoming: AniListMedia | null = null;
 
   if (sourceName === 'shikimori') {
-    const shiki = await fetchWithTimeout(
+    const shiki = await withTimeout(
       () => searchShikimori(session.title),
       SOURCE_TIMEOUT_MS
     );
     if (shiki) incoming = shikimoriToAniList(shiki);
   } else if (sourceName === 'kitsu') {
-    const kitsu = await fetchWithTimeout(
+    const kitsu = await withTimeout(
       () => searchKitsu(session.title),
       SOURCE_TIMEOUT_MS
     );
@@ -1835,10 +1811,6 @@ async function handleMetadataMerge(
   });
   await tracker(msg.message_id);
 }
-
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
 
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(
@@ -4160,10 +4132,7 @@ export const publishFranchisesCommand: CommandDefinition = {
 import type { CommandDefinition } from './registry';
 import { COMMANDS } from './list';
 import { isAdmin } from '../lib/permissions';
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+import { escapeHtml } from '../lib/utils';
 
 export const helpCommand: CommandDefinition = {
   name: 'help',
@@ -4191,7 +4160,6 @@ export const helpCommand: CommandDefinition = {
       msg += '<i>Beberapa command memerlukan akses admin.</i>';
     }
 
-    // Telegram limit 4096 char
     if (msg.length > 4000) {
       msg = msg.slice(0, 3950) + '\n\n<i>… [truncated]</i>';
     }
@@ -7272,7 +7240,6 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
       .catch(() => {});
   });
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/commands/registry.ts =====
@@ -7384,7 +7351,6 @@ export const statusCommand: CommandDefinition = {
 import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
-import type { D1Database } from '@cloudflare/workers-types';
 import type { CommandDefinition } from './registry';
 import {
   trackMessage,
@@ -7395,35 +7361,7 @@ import {
   ensureTrackDb,
   type Tracker,
 } from '../lib/telegram-utils';
-
-/* ============================================================
-   VA DATA
-   ============================================================ */
-
-interface VoiceActorRow {
-  id: string;
-  name: string;
-  nameNative: string | null;
-  image: string | null;
-  defaultLanguage: string | null;
-}
-
-async function getAllVoiceActors(
-  db: D1Database
-): Promise<VoiceActorRow[]> {
-  const res = await db
-    .prepare(
-      `SELECT id, name, nameNative, image, defaultLanguage
-       FROM voice_actors
-       ORDER BY id ASC`
-    )
-    .all<VoiceActorRow>();
-  return res.results ?? [];
-}
-
-/* ============================================================
-   SHOW MENU (dipakai /va dan redirect dari /dba)
-   ============================================================ */
+import { getAllVoiceActors } from '../lib/dba-voice-actors';
 
 export async function showVaMenu(
   ctx: Context,
@@ -7433,10 +7371,8 @@ export async function showVaMenu(
 
   const vas = await getAllVoiceActors(env.DB);
   const total = vas.length;
-
   const sessionId = `va_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
 
-  // Track pesan user
   if (ctx.message?.message_id) {
     await trackMessage(env.DB, sessionId, ctx.message.message_id);
   }
@@ -7461,10 +7397,6 @@ export async function showVaMenu(
   await trackMessage(env.DB, sessionId, msg.message_id);
 }
 
-/* ============================================================
-   COMMAND /va
-   ============================================================ */
-
 export const vaCommand: CommandDefinition = {
   name: 'va',
   description: 'Lihat & kelola voice actors',
@@ -7474,10 +7406,6 @@ export const vaCommand: CommandDefinition = {
     await showVaMenu(ctx, env);
   },
 };
-
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
 
 export function setupVaCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^va:([pfx]):(va_[a-f0-9]+)$/, async (ctx) => {
@@ -7492,8 +7420,6 @@ export function setupVaCallbacks(bot: Bot, env: Env): void {
 
     const chatId = ctx.chat?.id;
     if (!chatId) return;
-
-    // === BATAL ===
     if (action === 'x') {
       await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
       const deleted = await clearTrackedSession(
@@ -7524,7 +7450,6 @@ export function setupVaCallbacks(bot: Bot, env: Env): void {
     const tracker: Tracker = (msgId) =>
       trackMessage(env.DB, sessionId, msgId);
 
-    // Hapus keyboard dari menu
     await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
 
     if (action === 'p') {
@@ -7559,7 +7484,7 @@ export function setupVaCallbacks(bot: Bot, env: Env): void {
         await sendJsonSection(
           ctx,
           `Voice Actors (${vas.length})`,
-          json ? vas : vas,
+          vas,
           tracker
         );
       }
@@ -9714,27 +9639,6 @@ export function buildPartsKeyboard(
 // src/lib/dba-common.ts
 import type { AniListMedia } from '../types/anime';
 
-export function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-export async function fetchWithTimeout<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<T | null> {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
-}
-
 export function safeFetch<T>(
   fn: () => Promise<T>,
   timeoutMs: number
@@ -9789,7 +9693,6 @@ export function parseJsonMedia(raw: string | null): AniListMedia | null {
     return null;
   }
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/lib/dba-episodes.ts =====
@@ -9942,12 +9845,8 @@ export async function deleteEpCache(
 import { InlineKeyboard } from 'grammy';
 import type { AniListMedia } from '../types/anime';
 import { buildMetadataYaml } from '../services/qimochi-yaml';
-import { escapeHtml } from './dba-common';
+import { escapeHtml } from './utils';
 import type { SessionRow } from './dba-session';
-
-/* ============================================================
-   DETECT MISSING
-   ============================================================ */
 
 export interface MissingInfo {
   fields: string[];
@@ -9995,10 +9894,6 @@ export function detectMissing(
 
   return { fields, canShikimori, canKitsu };
 }
-
-/* ============================================================
-   MERGE
-   ============================================================ */
 
 export interface MergeResult {
   merged: AniListMedia;
@@ -10089,10 +9984,6 @@ export function mergeMetadata(
   return { merged, filled };
 }
 
-/* ============================================================
-   KEYBOARD + VIEW
-   ============================================================ */
-
 export function buildMetadataKeyboard(
   sessionId: string,
   missing: MissingInfo
@@ -10151,7 +10042,6 @@ export function buildMetadataView(
 
   return lines.join('\n');
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/lib/dba-session.ts =====
@@ -10950,7 +10840,6 @@ export async function githubListDir(
   const data = (await res.json()) as GithubListItem[];
   return Array.isArray(data) ? data : [];
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/lib/http.ts =====
@@ -11007,21 +10896,11 @@ export function isOwner(userId: number | undefined, env: Env): boolean {
 // src/lib/telegram-utils.ts
 import type { Context, Api } from 'grammy';
 import type { D1Database } from '@cloudflare/workers-types';
+import { escapeHtml } from './utils';
 
 export const MSG_LIMIT = 3500;
 export const BATCH_OVERHEAD = 300;
 export const AUTO_DELETE_DELAY_MS = 3000;
-
-/* ============================================================
-   HTML / SPLIT
-   ============================================================ */
-
-export function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 
 export function splitText(text: string, max: number): string[] {
   if (text.length <= max) return [text];
@@ -11058,10 +10937,6 @@ export function splitText(text: string, max: number): string[] {
   if (current) parts.push(current);
   return parts;
 }
-
-/* ============================================================
-   MESSAGE TRACKING (D1)
-   ============================================================ */
 
 let trackDbReady = false;
 let trackDbInitPromise: Promise<void> | null = null;
@@ -11168,10 +11043,6 @@ export async function clearTrackedSession(
   return deleted;
 }
 
-/* ============================================================
-   SEND — text section
-   ============================================================ */
-
 export async function sendTextSection(
   ctx: Context,
   label: string,
@@ -11199,10 +11070,6 @@ export async function sendTextSection(
     }
   }
 }
-
-/* ============================================================
-   SEND — JSON section (split per item)
-   ============================================================ */
 
 export async function sendJsonSection<T>(
   ctx: Context,
@@ -11254,10 +11121,6 @@ export async function sendJsonSection<T>(
   }
 }
 
-/* ============================================================
-   SEND — auto-delete
-   ============================================================ */
-
 export async function sendAutoDelete(
   ctx: Context,
   text: string,
@@ -11278,10 +11141,6 @@ export async function sendAutoDelete(
     console.warn('[Send] autoDelete failed:', err);
   }
 }
-
-/* ============================================================
-   SEND — document (via API manual)
-   ============================================================ */
 
 export async function sendDocumentViaApi(
   botToken: string,
@@ -11346,6 +11205,95 @@ export async function sendDocumentViaApi(
     throw new Error(
       `sendDocument HTTP ${res.status}: ${errText.slice(0, 200)}`
     );
+  }
+}
+===== END FILE =====
+
+===== FILE: ./src/lib/utils.ts =====
+// src/lib/utils.ts
+
+export function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+export function stripHtml(s: string): string {
+  return s
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+export function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+const ID_WORDS = [
+  ' yang ',
+  ' dengan ',
+  ' untuk ',
+  ' adalah ',
+  ' dan ',
+  ' di ',
+  ' ke ',
+  ' dari ',
+  ' ini ',
+  ' itu ',
+  ' tidak ',
+  ' akan ',
+  ' setelah ',
+  ' ketika ',
+  ' seorang ',
+  ' sebuah ',
+  ' dalam ',
+  ' pada ',
+];
+
+export function looksIndonesian(s: string): boolean {
+  const lower = s.toLowerCase();
+  let matches = 0;
+  for (const w of ID_WORDS) {
+    if (lower.includes(w)) matches++;
+  }
+  return matches >= 3;
+}
+
+export async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
+    ]);
+  } catch {
+    return null;
   }
 }
 ===== END FILE =====
@@ -11922,6 +11870,7 @@ import type { AniListMedia } from '../types/anime';
 import type { Env } from '../types/env';
 import { chainSearch, type ChainSearchResult } from './qimochi-chain';
 import { chatAI } from './ai';
+import { stripHtml, looksIndonesian } from '../lib/utils';
 
 export const AI_TIMEOUT_MS = 8000;
 
@@ -12000,53 +11949,8 @@ export function isValidHttpUrl(s: string): boolean {
   }
 }
 
-export function stripHtml(s: string): string {
-  return s
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#0?39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
 export function hasCyrillic(s: string): boolean {
   return /[\u0400-\u04FF\u0500-\u052F]/.test(s);
-}
-
-export function looksIndonesian(s: string): boolean {
-  const lower = s.toLowerCase();
-  const idWords = [
-    ' yang ',
-    ' dengan ',
-    ' untuk ',
-    ' adalah ',
-    ' dan ',
-    ' di ',
-    ' ke ',
-    ' dari ',
-    ' ini ',
-    ' itu ',
-    ' tidak ',
-    ' akan ',
-    ' setelah ',
-    ' ketika ',
-    ' seorang ',
-    ' sebuah ',
-    ' dalam ',
-    ' pada ',
-  ];
-
-  let matches = 0;
-  for (const w of idWords) {
-    if (lower.includes(w)) matches++;
-  }
-  return matches >= 3;
 }
 
 export function pick<T>(...values: (T | null | undefined)[]): T | null {
@@ -12376,7 +12280,6 @@ export function buildQimochiHubResult(
 
   return { yaml, body: synopsis, missing, aiUsed };
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/services/animeapi.ts =====
@@ -12651,6 +12554,7 @@ export function kitsuToAniList(result: KitsuSearchResult): AniListMedia {
 // src/services/qimochi-chain-extras.ts
 import { fetchWithRetry } from '../lib/http';
 import { getCharactersFromAniList } from './anilist';
+import { withTimeout, slugify } from '../lib/utils';
 
 export interface UnifiedVoiceActor {
   id: string;
@@ -12704,31 +12608,6 @@ const KITSU_PAGE_LIMIT = 20;
 const PARALLEL_BATCH = 5;
 const EPISODES_TIME_BUDGET_MS = 20000;
 const MAX_RELATIONS = 30;
-
-async function withTimeout<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<T | null> {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
-}
-
-function slugify(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
 
 interface KitsuIncluded {
   id: string;
@@ -12964,18 +12843,16 @@ async function getKitsuEpisodes(
       attr.canonicalTitle ??
       `Episode ${number}`;
     const aired = attr.airdate ? attr.airdate.split('T')[0] : undefined;
-	const duration =
-  	attr.length && attr.length > 0
-    	? attr.length
-    	: undefined;
+    const duration =
+      attr.length && attr.length > 0 ? attr.length : undefined;
 
-	out.push({
-  	number,
-  	title,
-  	...(aired ? { aired } : {}),
-  	...(duration ? { duration } : {}),
-	});
-	if (out.length >= MAX_EPISODES) break;
+    out.push({
+      number,
+      title,
+      ...(aired ? { aired } : {}),
+      ...(duration ? { duration } : {}),
+    });
+    if (out.length >= MAX_EPISODES) break;
   }
 
   out.sort((a, b) => a.number - b.number);
@@ -13307,7 +13184,6 @@ export async function chainRelations(
 
   return { data: null, source: 'none', errors };
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/services/qimochi-chain.ts =====
@@ -13316,6 +13192,7 @@ import type { AniListMedia } from '../types/anime';
 import { searchKitsu, kitsuToAniList } from './kitsu';
 import { searchShikimori, shikimoriToAniList } from './shikimori';
 import { getMetadataFromAniList } from './anilist';
+import { withTimeout } from '../lib/utils';
 
 const TIMEOUT_PER_SOURCE = 8000;
 
@@ -13328,36 +13205,11 @@ export interface ChainSearchResult {
   errors: string[];
 }
 
-async function withTimeout<T>(
-  fn: () => Promise<T>,
-  timeoutMs: number
-): Promise<T | null> {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<null>((r) => setTimeout(() => r(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Chain search:
- *   1. AniList (via Val Town) + Kitsu — paralel
- *      AniList = metadata lengkap
- *      Kitsu = kitsuId (untuk episodes)
- *   2. AniList gagal → fallback Shikimori
- *   3. Shikimori gagal → fallback Kitsu saja
- *
- * Jikan sudah di-drop (blocked dari CF Workers).
- */
 export async function chainSearch(query: string): Promise<ChainSearchResult> {
   const t0 = Date.now();
   const tried: string[] = ['AniList', 'Kitsu'];
   const errors: string[] = [];
 
-  // === 1. AniList + Kitsu (paralel) ===
   const [aniListR, kitsuR] = await Promise.allSettled([
     withTimeout(() => getMetadataFromAniList(query), TIMEOUT_PER_SOURCE),
     withTimeout(() => searchKitsu(query), TIMEOUT_PER_SOURCE),
@@ -13379,7 +13231,6 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
 
   const kitsuId = kitsuResult?.anime.id ?? null;
 
-  // === 2. AniList sukses → PRIMARY ===
   if (aniList) {
     return {
       media: aniList,
@@ -13391,7 +13242,6 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
     };
   }
 
-  // === 3. Fallback: Shikimori ===
   tried.push('Shikimori');
   const shiki = await withTimeout(
     () => searchShikimori(query),
@@ -13410,7 +13260,6 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
   }
   errors.push('Shikimori: timeout atau gagal');
 
-  // === 4. Fallback: Kitsu only ===
   if (kitsuResult) {
     return {
       media: kitsuToAniList(kitsuResult),
@@ -13422,7 +13271,6 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
     };
   }
 
-  // === 5. Semua gagal ===
   throw new Error(
     `Semua sumber gagal.\n\n` +
       `Sudah dicoba:\n` +
@@ -13430,9 +13278,6 @@ export async function chainSearch(query: string): Promise<ChainSearchResult> {
   );
 }
 
-/**
- * Wrapper untuk cari by title — butuh malId/kitsuId.
- */
 export async function resolveAnimeIds(
   query: string
 ): Promise<{
@@ -13539,10 +13384,7 @@ export function chunkRangeLabel(
 ===== FILE: ./src/services/qimochi-yaml.ts =====
 // src/services/qimochi-yaml.ts
 import type { AniListMedia } from '../types/anime';
-
-/* ============================================================
-   METADATA — YAML frontmatter (.md)
-   ============================================================ */
+import { slugify } from '../lib/utils';
 
 const FORMAT_MAP: Record<string, string> = {
   TV: 'TV',
@@ -13562,17 +13404,6 @@ const STATUS_MAP: Record<string, string> = {
   CANCELLED: 'cancelled',
   HIATUS: 'hiatus',
 };
-
-function slugify(str: string): string {
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
 
 function yamlString(s: string): string {
   const cleaned = s.replace(/\n/g, ' ').trim();
@@ -13756,14 +13587,9 @@ export function buildMetadataYaml(input: MetadataInput): string {
   return lines.join('\n');
 }
 
-/* ============================================================
-   SUMMARY (sinopsis)
-   ============================================================ */
-
 export function getSynopsisRaw(media: AniListMedia): string {
   return cleanSynopsisRaw(media.description);
 }
-
 ===== END FILE =====
 
 ===== FILE: ./src/services/shikimori.ts =====
