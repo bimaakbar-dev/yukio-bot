@@ -8,6 +8,7 @@ import {
   getEditSession,
   parseEdits,
   updateEditSession,
+  trackEditMessage,
 } from './state';
 import {
   buildFieldMenuKeyboard,
@@ -44,11 +45,12 @@ export async function showFieldMenu(
     return;
   }
 
-  await ctx.reply(text, {
+  const sent = await ctx.reply(text, {
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
     reply_markup: kb,
   });
+  await trackEditMessage(env.DB, session.session_id, sent.message_id);
 }
 
 export async function showValuePrompt(
@@ -67,26 +69,31 @@ export async function showValuePrompt(
     active_field: field.key,
   });
 
-  await ctx.reply(text, {
+  const sent = await ctx.reply(text, {
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
     reply_markup: kb,
   });
+  await trackEditMessage(env.DB, session.session_id, sent.message_id);
 }
 
-/** Handle text input user saat state=awaiting_slug */
 export async function handleSlugInput(
   ctx: Context,
   env: Env,
   session: PendingEditRow,
   slug: string
 ): Promise<void> {
+  if (ctx.message?.message_id) {
+    await trackEditMessage(env.DB, session.session_id, ctx.message.message_id);
+  }
+
   const path = filePathFor(slug);
 
   const loading = await ctx.reply(
     `🔍 Cari <code>${escapeHtml(path)}</code> di ${targetLabel(session.target)}...`,
     { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
   );
+  await trackEditMessage(env.DB, session.session_id, loading.message_id);
 
   let file: Awaited<ReturnType<typeof githubGetFile>> = null;
   try {
@@ -131,14 +138,14 @@ export async function handleSlugInput(
 
   const updated = await getEditSession(env.DB, session.session_id);
   if (!updated) {
-    await ctx.reply('⏱️ Session kadaluarsa. Ulangi /edit.');
+    const m = await ctx.reply('⏱️ Session kadaluarsa. Ulangi /edit.');
+    await trackEditMessage(env.DB, session.session_id, m.message_id);
     return;
   }
 
   await showFieldMenu(ctx, env, updated);
 }
 
-/** Handle value input (dari text atau preset) */
 export async function applyValueAndReturn(
   ctx: Context,
   env: Env,
@@ -146,6 +153,10 @@ export async function applyValueAndReturn(
   field: FieldDef,
   value: string
 ): Promise<void> {
+  if (ctx.message?.message_id) {
+    await trackEditMessage(env.DB, session.session_id, ctx.message.message_id);
+  }
+
   const edits = parseEdits(session);
   edits[field.key] = value;
 
