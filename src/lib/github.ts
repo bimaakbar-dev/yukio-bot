@@ -17,6 +17,47 @@ interface GithubListItem {
   type: 'file' | 'dir';
 }
 
+interface GitRefResponse {
+  object: { sha: string; type: string; url: string };
+  ref: string;
+  url: string;
+}
+
+interface GitCommitResponse {
+  sha: string;
+  tree: { sha: string; url: string };
+  message: string;
+  parents: { sha: string; url: string }[];
+  url: string;
+}
+
+interface GitBlobResponse {
+  sha: string;
+  url: string;
+}
+
+interface GitTreeResponse {
+  sha: string;
+  url: string;
+  truncated: boolean;
+}
+
+export interface FileToCommit {
+  path: string;
+  content: string;
+}
+
+export interface CommitResult {
+  ok: boolean;
+  sha?: string;
+  commitUrl?: string;
+  error?: string;
+}
+
+export interface MultiCommitResult extends CommitResult {
+  filesCount?: number;
+}
+
 function buildHeaders(env: Env): Record<string, string> {
   return {
     Authorization: `Bearer ${env.YUKIO_TOKEN}`,
@@ -71,13 +112,6 @@ export async function githubGetFile(
   };
 }
 
-export interface CommitResult {
-  ok: boolean;
-  sha?: string;
-  commitUrl?: string;
-  error?: string;
-}
-
 export async function githubCommitFile(
   env: Env,
   path: string,
@@ -90,9 +124,7 @@ export async function githubCommitFile(
   try {
     const existing = await githubGetFile(env, path);
     if (existing) sha = existing.sha;
-  } catch {
-    // treat as new file
-  }
+  } catch {}
 
   const body: Record<string, unknown> = {
     message,
@@ -122,6 +154,109 @@ export async function githubCommitFile(
     sha: data.commit?.sha,
     commitUrl: data.commit?.html_url,
   };
+}
+
+export async function githubCommitMultipleFiles(
+  env: Env,
+  files: FileToCommit[],
+  message: string
+): Promise<MultiCommitResult> {
+  if (files.length === 0) {
+    return { ok: false, error: 'No files to commit' };
+  }
+
+  const headers = buildHeaders(env);
+  const base = `${API_BASE}/repos/${env.GITHUB_REPO}`;
+  const branch = env.GITHUB_BRANCH;
+
+  try {
+    const refRes = await fetch(`${base}/git/ref/heads/${branch}`, { headers });
+    if (!refRes.ok) {
+      return { ok: false, error: `Get ref failed: HTTP ${refRes.status}` };
+    }
+    const refData = (await refRes.json()) as GitRefResponse;
+    const parentCommitSha = refData.object.sha;
+
+    const commitRes = await fetch(`${base}/git/commits/${parentCommitSha}`, {
+      headers,
+    });
+    if (!commitRes.ok) {
+      return { ok: false, error: `Get commit failed: HTTP ${commitRes.status}` };
+    }
+    const commitData = (await commitRes.json()) as GitCommitResponse;
+    const baseTreeSha = commitData.tree.sha;
+
+    const blobResults = await Promise.all(
+      files.map(async (f) => {
+        const res = await fetch(`${base}/git/blobs`, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: b64Encode(f.content),
+            encoding: 'base64',
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(`Blob ${f.path} failed: HTTP ${res.status}`);
+        }
+        const data = (await res.json()) as GitBlobResponse;
+        return { path: f.path, sha: data.sha };
+      })
+    );
+
+    const treeRes = await fetch(`${base}/git/trees`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_tree: baseTreeSha,
+        tree: blobResults.map((b) => ({
+          path: b.path,
+          mode: '100644',
+          type: 'blob',
+          sha: b.sha,
+        })),
+      }),
+    });
+    if (!treeRes.ok) {
+      return { ok: false, error: `Create tree failed: HTTP ${treeRes.status}` };
+    }
+    const treeData = (await treeRes.json()) as GitTreeResponse;
+
+    const newCommitRes = await fetch(`${base}/git/commits`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message,
+        tree: treeData.sha,
+        parents: [parentCommitSha],
+      }),
+    });
+    if (!newCommitRes.ok) {
+      return {
+        ok: false,
+        error: `Create commit failed: HTTP ${newCommitRes.status}`,
+      };
+    }
+    const newCommitData = (await newCommitRes.json()) as GitCommitResponse;
+
+    const updateRes = await fetch(`${base}/git/refs/heads/${branch}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha: newCommitData.sha, force: false }),
+    });
+    if (!updateRes.ok) {
+      return { ok: false, error: `Update ref failed: HTTP ${updateRes.status}` };
+    }
+
+    return {
+      ok: true,
+      sha: newCommitData.sha,
+      commitUrl: `https://github.com/${env.GITHUB_REPO}/commit/${newCommitData.sha}`,
+      filesCount: files.length,
+    };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message ?? 'unknown' };
+  }
 }
 
 export async function githubListDir(
