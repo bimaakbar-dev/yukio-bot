@@ -16,10 +16,18 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/* ============================================================
+   TYPES
+   ============================================================ */
+
 export interface EpisodeObject {
   number: number;
   streams: { quality: string; servers: { name: string; url: string }[] }[];
 }
+
+/* ============================================================
+   ANIME SESSION (temp_anime)
+   ============================================================ */
 
 interface SessionRow {
   session_id: string;
@@ -69,6 +77,10 @@ function buildMarkdown(session: SessionRow): string {
   const body = session.body.trim();
   return `${session.yaml}\n\n${body}\n`;
 }
+
+/* ============================================================
+   BATCH SESSION (batch_sessions)
+   ============================================================ */
 
 let batchDbReady = false;
 let batchDbInitPromise: Promise<void> | null = null;
@@ -236,6 +248,10 @@ export async function resetBatchSessions(
   }
 }
 
+/* ============================================================
+   START OR APPEND BATCH
+   ============================================================ */
+
 export interface StartOrAppendResult {
   sessionId: string;
   mode: 'created' | 'appended' | 'reset_and_created';
@@ -313,11 +329,16 @@ export async function startOrAppendBatch(
     throw new Error('Tidak ada episode yang bisa disimpan');
   }
 
-  const minEp = merged[0]!.number;
-  const maxEp = merged[merged.length - 1]!.number;
+  const first = merged[0];
+  const last = merged[merged.length - 1];
+  if (!first || !last) {
+    throw new Error('Gagal menghitung range episode');
+  }
+
+  const minEp = first.number;
+  const maxEp = last.number;
   const totalUrls = merged.reduce(
-    (sum, r) =>
-      sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
+    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
     0
   );
   const combinedJson = JSON.stringify(merged, null, 2) + '\n';
@@ -394,6 +415,10 @@ export async function startOrAppendBatch(
   };
 }
 
+/* ============================================================
+   LEVENSHTEIN
+   ============================================================ */
+
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
@@ -401,19 +426,27 @@ function levenshtein(a: string, b: string): number {
 
   const m: number[][] = [];
   for (let i = 0; i <= b.length; i++) m[i] = [i];
-  for (let j = 0; j <= a.length; j++) m[0]![j] = j;
+  for (let j = 0; j <= a.length; j++) {
+    const row = m[0];
+    if (row) row[j] = j;
+  }
 
   for (let i = 1; i <= b.length; i++) {
     for (let j = 1; j <= a.length; j++) {
+      const rowPrev = m[i - 1];
+      const rowCurr = m[i];
+      if (!rowPrev || !rowCurr) continue;
+
       const cost = a[j - 1] === b[i - 1] ? 0 : 1;
-      m[i]![j] = Math.min(
-        m[i - 1]![j]! + 1,
-        m[i]![j - 1]! + 1,
-        m[i - 1]![j - 1]! + cost
-      );
+      const del = (rowPrev[j] ?? 0) + 1;
+      const ins = (rowCurr[j - 1] ?? 0) + 1;
+      const sub = (rowPrev[j - 1] ?? 0) + cost;
+      rowCurr[j] = Math.min(del, ins, sub);
     }
   }
-  return m[b.length]![a.length]!;
+
+  const lastRow = m[b.length];
+  return lastRow ? (lastRow[a.length] ?? 0) : 0;
 }
 
 function similarity(a: string, b: string): number {
@@ -429,7 +462,9 @@ async function findSimilarSlugs(
   if (!hint) return [];
   try {
     const dirs = await githubListDir(env, 'src/data/anime');
-    const candidates = dirs.filter((d) => d.type === 'dir').map((d) => d.name);
+    const candidates = dirs
+      .filter((d) => d.type === 'dir')
+      .map((d) => d.name);
 
     return candidates
       .map((slug) => ({
@@ -444,6 +479,10 @@ async function findSimilarSlugs(
     return [];
   }
 }
+
+/* ============================================================
+   ANIME — PUSH
+   ============================================================ */
 
 async function doPublishAnime(
   ctx: Context,
@@ -551,6 +590,10 @@ async function doPublishAnime(
     )
     .catch(() => {});
 }
+
+/* ============================================================
+   BATCH — FLOW
+   ============================================================ */
 
 async function doPublishBatchInitial(
   ctx: Context,
@@ -688,6 +731,8 @@ async function doPublishBatchPreview(
   } catch {
     episodes = [];
   }
+
+  const episodeCount = episodes.length;
   const rangeExpected = session.max_ep - session.min_ep + 1;
   const hasGap = episodeCount !== rangeExpected;
 
@@ -800,16 +845,26 @@ async function doPublishBatchPush(
     .catch(() => {});
 }
 
+/* ============================================================
+   CALLBACKS
+   ============================================================ */
+
 export function setupPublishCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^pub:an:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
-    if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
     await doPublishAnime(ctx, env, sessionId, false);
   });
 
   bot.callbackQuery(/^pub:anforce:([a-f0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
-    if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
     await doPublishAnime(ctx, env, sessionId, true);
   });
 
@@ -817,26 +872,39 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     const sessionId = ctx.match[1] ?? '';
     if (sessionId) await deleteSession(env.DB, sessionId);
     await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
-    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-    await ctx.reply('❌ <b>Dibatalkan.</b>', { parse_mode: 'HTML' }).catch(() => {});
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: undefined })
+      .catch(() => {});
+    await ctx
+      .reply('❌ <b>Dibatalkan.</b>', { parse_mode: 'HTML' })
+      .catch(() => {});
   });
 
   bot.callbackQuery(/^pub:ba:(b_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
-    if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
     await doPublishBatchInitial(ctx, env, sessionId);
   });
 
   bot.callbackQuery(/^pub:bp:(b_[a-z0-9]+):(.+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
     const pick = ctx.match[2] ?? '';
-    if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
     await doPublishBatchPickSlug(ctx, env, sessionId, pick);
   });
 
   bot.callbackQuery(/^pub:bpush:(b_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
-    if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
     await doPublishBatchPush(ctx, env, sessionId);
   });
 
@@ -844,13 +912,20 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     const sessionId = ctx.match[1] ?? '';
     if (sessionId) await deleteBatchSession(env.DB, sessionId);
     await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
-    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
-    await ctx.reply('❌ <b>Batch dibatalkan.</b>', { parse_mode: 'HTML' }).catch(() => {});
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: undefined })
+      .catch(() => {});
+    await ctx
+      .reply('❌ <b>Batch dibatalkan.</b>', { parse_mode: 'HTML' })
+      .catch(() => {});
   });
 
   bot.callbackQuery(/^pub:baadd:(b_[a-z0-9]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
-    if (!sessionId) return await ctx.answerCallbackQuery({ text: '❌' });
+    if (!sessionId) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
 
     const session = await getBatchSession(env.DB, sessionId);
     if (!session) {
@@ -874,6 +949,10 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
     );
   });
 }
+
+/* ============================================================
+   COMMAND: /publish_anime
+   ============================================================ */
 
 export const publishAnimeCommand: CommandDefinition = {
   name: 'publish_anime',
@@ -958,6 +1037,10 @@ export const publishAnimeCommand: CommandDefinition = {
   },
 };
 
+/* ============================================================
+   COMMAND: /publish_batch
+   ============================================================ */
+
 export const publishBatchCommand: CommandDefinition = {
   name: 'publish_batch',
   description: 'Push batch episode ke repo web',
@@ -997,6 +1080,10 @@ export const publishBatchCommand: CommandDefinition = {
   },
 };
 
+/* ============================================================
+   COMMAND: /batch_reset
+   ============================================================ */
+
 export const batchResetCommand: CommandDefinition = {
   name: 'batch_reset',
   description: 'Hapus semua session batch aktif',
@@ -1009,9 +1096,8 @@ export const batchResetCommand: CommandDefinition = {
       await ctx.reply('📭 Tidak ada session batch aktif.');
       return;
     }
-    await ctx.reply(
-      `✅ <b>${count}</b> session batch dihapus.`,
-      { parse_mode: 'HTML' }
-    );
+    await ctx.reply(`✅ <b>${count}</b> session batch dihapus.`, {
+      parse_mode: 'HTML',
+    });
   },
 };
