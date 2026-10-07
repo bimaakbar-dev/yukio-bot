@@ -2,6 +2,7 @@
 import type { Context, Api } from 'grammy';
 import type { D1Database } from '@cloudflare/workers-types';
 import { escapeHtml } from './utils';
+import { createLazyInit } from './lazy-init';
 
 export const MSG_LIMIT = 3500;
 export const BATCH_OVERHEAD = 300;
@@ -43,35 +44,18 @@ export function splitText(text: string, max: number): string[] {
   return parts;
 }
 
-let trackDbReady = false;
-let trackDbInitPromise: Promise<void> | null = null;
-
-export async function ensureTrackDb(db: D1Database): Promise<void> {
-  if (trackDbReady) return;
-  if (trackDbInitPromise) return trackDbInitPromise;
-
-  trackDbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS qimochi_messages (
-            session_id  TEXT NOT NULL,
-            message_id  INTEGER NOT NULL,
-            created_at  INTEGER NOT NULL,
-            PRIMARY KEY (session_id, message_id)
-          )`
-        )
-        .run();
-      trackDbReady = true;
-    } catch (err) {
-      console.error('[Track] DB init error:', err);
-      trackDbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return trackDbInitPromise;
-}
+export const ensureTrackDb = createLazyInit('Track', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS qimochi_messages (
+        session_id  TEXT NOT NULL,
+        message_id  INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (session_id, message_id)
+      )`
+    )
+    .run();
+});
 
 export type Tracker = (msgId: number) => Promise<void>;
 

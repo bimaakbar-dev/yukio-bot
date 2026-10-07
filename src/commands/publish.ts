@@ -3,6 +3,7 @@ import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
 import type { AniListMedia } from '../types/anime';
 import {
   githubCommitFile,
@@ -30,6 +31,7 @@ import { chainRelations } from '../services/qimochi-chain-extras';
 import { askAI } from '../services/ai';
 import { safeFetch } from '../lib/dba-common';
 import { filterFranchises } from '../lib/franchises';
+import { createLazyInit } from '../lib/lazy-init';
 import {
   getTempAnime,
   getLatestTempAnimeByUser,
@@ -114,45 +116,29 @@ function sectionFromPath(path: string): SectionKey {
   return 'meta';
 }
 
-let pendingPublishDbReady = false;
-let pendingPublishDbInitPromise: Promise<void> | null = null;
-
-async function ensurePendingPublishDb(db: D1Database): Promise<void> {
-  if (pendingPublishDbReady) return;
-  if (pendingPublishDbInitPromise) return pendingPublishDbInitPromise;
-
-  pendingPublishDbInitPromise = (async () => {
+export const ensurePendingPublishDb = createLazyInit(
+  'Publish',
+  async (db) => {
+    await db
+      .prepare(
+        `CREATE TABLE IF NOT EXISTS pending_publish (
+          session_id    TEXT PRIMARY KEY,
+          user_id       INTEGER NOT NULL,
+          files_json    TEXT NOT NULL,
+          summary_json  TEXT NOT NULL,
+          selected_json TEXT,
+          created_at    INTEGER NOT NULL,
+          expires_at    INTEGER NOT NULL
+        )`
+      )
+      .run();
     try {
       await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS pending_publish (
-            session_id    TEXT PRIMARY KEY,
-            user_id       INTEGER NOT NULL,
-            files_json    TEXT NOT NULL,
-            summary_json  TEXT NOT NULL,
-            selected_json TEXT,
-            created_at    INTEGER NOT NULL,
-            expires_at    INTEGER NOT NULL
-          )`
-        )
+        .prepare('ALTER TABLE pending_publish ADD COLUMN selected_json TEXT')
         .run();
-      try {
-        await db
-          .prepare(
-            'ALTER TABLE pending_publish ADD COLUMN selected_json TEXT'
-          )
-          .run();
-      } catch {}
-      pendingPublishDbReady = true;
-    } catch (err) {
-      console.error('[Publish] pending DB init error:', err);
-      pendingPublishDbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return pendingPublishDbInitPromise;
-}
+    } catch {}
+  }
+);
 
 async function savePendingPublish(
   db: D1Database,

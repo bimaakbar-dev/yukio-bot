@@ -3,6 +3,7 @@ import type { D1Database } from '@cloudflare/workers-types';
 import type { Env } from '../types/env';
 import type { EpisodeObject } from '../types/anime';
 import { githubListDir } from './github';
+import { createLazyInit } from './lazy-init';
 
 export const BATCH_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -34,49 +35,32 @@ export interface StartOrAppendResult {
   skipped: number[];
 }
 
-let batchDbReady = false;
-let batchDbInitPromise: Promise<void> | null = null;
-
-export async function ensureBatchDb(db: D1Database): Promise<void> {
-  if (batchDbReady) return;
-  if (batchDbInitPromise) return batchDbInitPromise;
-
-  batchDbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS batch_sessions (
-            session_id     TEXT PRIMARY KEY,
-            user_id        INTEGER NOT NULL,
-            slug_hint      TEXT,
-            chosen_slug    TEXT,
-            suggestions    TEXT,
-            combined_json  TEXT NOT NULL,
-            min_ep         INTEGER NOT NULL,
-            max_ep         INTEGER NOT NULL,
-            total_urls     INTEGER,
-            errors         TEXT,
-            created_at     INTEGER NOT NULL,
-            updated_at     INTEGER NOT NULL,
-            expires_at     INTEGER NOT NULL
-          )`
-        )
-        .run();
-      await db
-        .prepare(
-          'CREATE INDEX IF NOT EXISTS idx_batch_sessions_user ON batch_sessions(user_id, updated_at DESC)'
-        )
-        .run();
-      batchDbReady = true;
-    } catch (err) {
-      console.error('[BatchSession] DB init error:', err);
-      batchDbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return batchDbInitPromise;
-}
+export const ensureBatchDb = createLazyInit('BatchSession', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS batch_sessions (
+        session_id     TEXT PRIMARY KEY,
+        user_id        INTEGER NOT NULL,
+        slug_hint      TEXT,
+        chosen_slug    TEXT,
+        suggestions    TEXT,
+        combined_json  TEXT NOT NULL,
+        min_ep         INTEGER NOT NULL,
+        max_ep         INTEGER NOT NULL,
+        total_urls     INTEGER,
+        errors         TEXT,
+        created_at     INTEGER NOT NULL,
+        updated_at     INTEGER NOT NULL,
+        expires_at     INTEGER NOT NULL
+      )`
+    )
+    .run();
+  await db
+    .prepare(
+      'CREATE INDEX IF NOT EXISTS idx_batch_sessions_user ON batch_sessions(user_id, updated_at DESC)'
+    )
+    .run();
+});
 
 export async function getActiveSession(
   db: D1Database,

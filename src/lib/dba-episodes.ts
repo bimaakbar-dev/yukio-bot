@@ -1,5 +1,6 @@
 // src/lib/dba-episodes.ts
 import type { D1Database } from '@cloudflare/workers-types';
+import { createLazyInit } from './lazy-init';
 
 export interface CachedEpisode {
   number: number;
@@ -16,38 +17,21 @@ export interface EpCacheData {
 
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
-let dbReady = false;
-let dbInitPromise: Promise<void> | null = null;
-
-export async function ensureEpCacheTable(db: D1Database): Promise<void> {
-  if (dbReady) return;
-  if (dbInitPromise) return dbInitPromise;
-
-  dbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS qimochi_ep_cache (
-            session_id  TEXT PRIMARY KEY,
-            source      TEXT NOT NULL,
-            total       INTEGER NOT NULL,
-            data        TEXT NOT NULL,
-            truncated   INTEGER DEFAULT 0,
-            created_at  INTEGER NOT NULL,
-            expires_at  INTEGER NOT NULL
-          )`
-        )
-        .run();
-      dbReady = true;
-    } catch (err) {
-      console.error('[EpCache] DB init error:', err);
-      dbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return dbInitPromise;
-}
+export const ensureEpCacheTable = createLazyInit('EpCache', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS qimochi_ep_cache (
+        session_id  TEXT PRIMARY KEY,
+        source      TEXT NOT NULL,
+        total       INTEGER NOT NULL,
+        data        TEXT NOT NULL,
+        truncated   INTEGER DEFAULT 0,
+        created_at  INTEGER NOT NULL,
+        expires_at  INTEGER NOT NULL
+      )`
+    )
+    .run();
+});
 
 export async function saveEpCache(
   db: D1Database,

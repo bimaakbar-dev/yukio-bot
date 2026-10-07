@@ -1,54 +1,36 @@
 // src/lib/dba-characters.ts
 import type { D1Database } from '@cloudflare/workers-types';
-import type { UnifiedCharacter, UnifiedVoiceActor } from '../services/qimochi-chain-extras';
+import type {
+  UnifiedCharacter,
+  UnifiedVoiceActor,
+} from '../services/qimochi-chain-extras';
 import { InlineKeyboard } from 'grammy';
+import { createLazyInit } from './lazy-init';
 
 export const CHAR_PART_SIZE = 50;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
-let cacheDbReady = false;
-let cacheDbInitPromise: Promise<void> | null = null;
-
-export async function ensureCharCacheTable(db: D1Database): Promise<void> {
-  if (cacheDbReady) return;
-  if (cacheDbInitPromise) return cacheDbInitPromise;
-
-  cacheDbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS qimochi_char_cache (
-            session_id   TEXT PRIMARY KEY,
-            source       TEXT NOT NULL,
-            total        INTEGER NOT NULL,
-            data         TEXT NOT NULL,
-            voice_actors TEXT,
-            sent_parts   TEXT,
-            created_at   INTEGER NOT NULL,
-            expires_at   INTEGER NOT NULL
-          )`
-        )
-        .run();
-      try {
-        await db
-          .prepare(
-            'ALTER TABLE qimochi_char_cache ADD COLUMN sent_parts TEXT'
-          )
-          .run();
-      } catch {
-        // ignore
-      }
-
-      cacheDbReady = true;
-    } catch (err) {
-      console.error('[CharCache] DB init error:', err);
-      cacheDbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return cacheDbInitPromise;
-}
+export const ensureCharCacheTable = createLazyInit('CharCache', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS qimochi_char_cache (
+        session_id   TEXT PRIMARY KEY,
+        source       TEXT NOT NULL,
+        total        INTEGER NOT NULL,
+        data         TEXT NOT NULL,
+        voice_actors TEXT,
+        sent_parts   TEXT,
+        created_at   INTEGER NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )`
+    )
+    .run();
+  try {
+    await db
+      .prepare('ALTER TABLE qimochi_char_cache ADD COLUMN sent_parts TEXT')
+      .run();
+  } catch {}
+});
 
 export async function saveCharCache(
   db: D1Database,
@@ -130,10 +112,9 @@ export async function getCharCache(
     if (row.sent_parts) {
       try {
         const arr = JSON.parse(row.sent_parts);
-        if (Array.isArray(arr)) sentParts = arr.filter((n) => typeof n === 'number');
-      } catch {
-        // ignore
-      }
+        if (Array.isArray(arr))
+          sentParts = arr.filter((n) => typeof n === 'number');
+      } catch {}
     }
 
     return {
@@ -166,10 +147,9 @@ export async function markPartSent(
     if (row.sent_parts) {
       try {
         const arr = JSON.parse(row.sent_parts);
-        if (Array.isArray(arr)) sentParts = arr.filter((n) => typeof n === 'number');
-      } catch {
-        // ignore
-      }
+        if (Array.isArray(arr))
+          sentParts = arr.filter((n) => typeof n === 'number');
+      } catch {}
     }
 
     if (!sentParts.includes(partIndex)) {

@@ -19,6 +19,8 @@ import {
   buildQimochiHubResult,
   pickTitle,
   isValidHttpUrl,
+  QH_FORMAT_MAP,
+  QH_STATUS_MAP,
   type Enriched,
 } from '../services/anime-core';
 import { escapeHtml, slugify } from '../lib/utils';
@@ -35,6 +37,10 @@ import { safeFetch } from '../lib/dba-common';
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const RELATION_FETCH_TIMEOUT_MS = 8000;
 
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
 function buildInfoMessage(media: AniListMedia): string {
   const title = pickTitle(media);
   const year = media.startDate?.year ?? media.seasonYear ?? '-';
@@ -44,26 +50,8 @@ function buildInfoMessage(media: AniListMedia): string {
     ? (media.averageScore / 10).toFixed(1)
     : '-';
 
-  const FORMAT_MAP: Record<string, string> = {
-    TV: 'TV',
-    TV_SHORT: 'TV',
-    MOVIE: 'Movie',
-    SPECIAL: 'Special',
-    OVA: 'OVA',
-    ONA: 'ONA',
-    MUSIC: 'Special',
-  };
-
-  const STATUS_MAP: Record<string, string> = {
-    FINISHED: 'Completed',
-    RELEASING: 'Ongoing',
-    NOT_YET_RELEASED: 'Ongoing',
-    CANCELLED: 'Hiatus',
-    HIATUS: 'Hiatus',
-  };
-
-  const status = STATUS_MAP[media.status] ?? media.status;
-  const type = FORMAT_MAP[media.format] ?? media.format;
+  const status = QH_STATUS_MAP[media.status] ?? media.status;
+  const type = QH_FORMAT_MAP[media.format] ?? media.format;
 
   return (
     `<b>${escapeHtml(title)}</b>\n\n` +
@@ -88,6 +76,10 @@ function extractTitleFromMALUrl(url: string): string | null {
   if (!slug) return null;
   return decodeURIComponent(slug).replace(/_/g, ' ').trim() || null;
 }
+
+/* ============================================================
+   YUKIONIME HELPERS
+   ============================================================ */
 
 interface YukionimeCheckResult {
   match: YukionimeAnime | null;
@@ -160,6 +152,10 @@ function buildYukionimeWarning(
   return lines.join('\n');
 }
 
+/* ============================================================
+   COMMAND
+   ============================================================ */
+
 export const animeCommand: CommandDefinition = {
   name: 'anime',
   description: 'Cari metadata anime → tombol convert YAML',
@@ -196,6 +192,9 @@ export const animeCommand: CommandDefinition = {
         if (t) searchQuery = t;
       }
 
+      /* ========================================================
+         STEP 1: CEK YUKIONIME
+         ======================================================== */
       const yukionime = await checkYukionime(searchQuery);
 
       if (yukionime.match && yukionime.complete) {
@@ -260,6 +259,9 @@ export const animeCommand: CommandDefinition = {
         );
       }
 
+      /* ========================================================
+         STEP 2: FETCH ANILIST
+         ======================================================== */
       let media: AniListMedia | null = null;
       let sourceLabel = '';
 
@@ -312,6 +314,9 @@ export const animeCommand: CommandDefinition = {
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       );
 
+      /* ========================================================
+         STEP 3: DETECT MISSING
+         ======================================================== */
       let need = detectMissing(media);
 
       if (yukionime.synopsis) {
@@ -323,6 +328,9 @@ export const animeCommand: CommandDefinition = {
         `[Anime] missing after merge: [${need.join(', ') || 'none'}]`
       );
 
+      /* ========================================================
+         STEP 4: AI ENRICH
+         ======================================================== */
       let enriched: Enriched | null = null;
 
       if (need.length > 0) {
@@ -554,9 +562,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     );
   });
 
-  /* ────────────────────────────────────────────────────────
-     an:fr — Fetch franchises & push ke qimochi
-     ──────────────────────────────────────────────────────── */
   bot.callbackQuery(/^an:fr:([a-f0-9]+)$/, async (ctx) => {
     const [, sessionId] = ctx.match as RegExpMatchArray;
     if (!sessionId) {

@@ -9,33 +9,13 @@ import {
   buildQimochiHubResult,
   pickTitle,
   isValidHttpUrl,
+  QH_FORMAT_MAP,
+  QH_STATUS_MAP,
   type Enriched,
 } from '../../services/anime-core';
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const DISCORD_MSG_LIMIT = 1900;
-
-const FORMAT_MAP: Record<string, string> = {
-  TV: 'TV',
-  TV_SHORT: 'TV',
-  MOVIE: 'Movie',
-  SPECIAL: 'Special',
-  OVA: 'OVA',
-  ONA: 'ONA',
-  MUSIC: 'Special',
-};
-
-const STATUS_MAP: Record<string, string> = {
-  FINISHED: 'Completed',
-  RELEASING: 'Ongoing',
-  NOT_YET_RELEASED: 'Ongoing',
-  CANCELLED: 'Hiatus',
-  HIATUS: 'Hiatus',
-};
-
-/* ═══════════════════════════════════════════════
-   DB: TEMP SESSIONS
-   ═══════════════════════════════════════════════ */
 
 let dbReady = false;
 let dbInitPromise: Promise<void> | null = null;
@@ -319,8 +299,8 @@ async function processAnime(
     const rating = media.averageScore
       ? (media.averageScore / 10).toFixed(1)
       : '-';
-    const statusText = STATUS_MAP[media.status] ?? media.status;
-    const typeText = FORMAT_MAP[media.format] ?? media.format;
+    const statusText = QH_STATUS_MAP[media.status] ?? media.status;
+    const typeText = QH_FORMAT_MAP[media.format] ?? media.format;
 
     const infoMsg =
       `**${title}**\n\n` +

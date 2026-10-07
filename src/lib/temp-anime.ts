@@ -1,5 +1,6 @@
 // src/lib/temp-anime.ts
 import type { D1Database } from '@cloudflare/workers-types';
+import { createLazyInit } from './lazy-init';
 
 export const ANIME_SESSION_TTL_MS = 30 * 60 * 1000;
 
@@ -18,51 +19,34 @@ export interface TempAnimeRow {
   expires_at: number;
 }
 
-let dbReady = false;
-let dbInitPromise: Promise<void> | null = null;
-
-export async function ensureDb(db: D1Database): Promise<void> {
-  if (dbReady) return;
-  if (dbInitPromise) return dbInitPromise;
-
-  dbInitPromise = (async () => {
-    try {
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS temp_anime (
-            session_id    TEXT PRIMARY KEY,
-            user_id       INTEGER NOT NULL,
-            yaml          TEXT NOT NULL,
-            body          TEXT NOT NULL,
-            missing       TEXT NOT NULL,
-            ai_used       TEXT NOT NULL,
-            cover         TEXT,
-            source_label  TEXT,
-            slug          TEXT,
-            metadata_json TEXT,
-            created_at    INTEGER NOT NULL,
-            expires_at    INTEGER NOT NULL
-          )`
-        )
-        .run();
-      try {
-        await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
-      } catch {}
-      try {
-        await db
-          .prepare('ALTER TABLE temp_anime ADD COLUMN metadata_json TEXT')
-          .run();
-      } catch {}
-      dbReady = true;
-    } catch (err) {
-      console.error('[TempAnime] DB init error:', err);
-      dbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return dbInitPromise;
-}
+export const ensureDb = createLazyInit('TempAnime', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS temp_anime (
+        session_id    TEXT PRIMARY KEY,
+        user_id       INTEGER NOT NULL,
+        yaml          TEXT NOT NULL,
+        body          TEXT NOT NULL,
+        missing       TEXT NOT NULL,
+        ai_used       TEXT NOT NULL,
+        cover         TEXT,
+        source_label  TEXT,
+        slug          TEXT,
+        metadata_json TEXT,
+        created_at    INTEGER NOT NULL,
+        expires_at    INTEGER NOT NULL
+      )`
+    )
+    .run();
+  try {
+    await db.prepare('ALTER TABLE temp_anime ADD COLUMN slug TEXT').run();
+  } catch {}
+  try {
+    await db
+      .prepare('ALTER TABLE temp_anime ADD COLUMN metadata_json TEXT')
+      .run();
+  } catch {}
+});
 
 export interface SaveTempAnimeInput {
   yaml: string;

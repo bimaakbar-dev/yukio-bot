@@ -66,28 +66,39 @@ function createBot(env: Env): Bot {
   return bot;
 }
 
+interface ApplyCommandsResult {
+  commands: { command: string; description: string }[];
+  skipped: string[];
+}
+
+async function applyBotCommands(bot: Bot): Promise<ApplyCommandsResult> {
+  const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map(
+    (c) => ({
+      command: c.name,
+      description: (c.description || c.name).slice(0, 256),
+    })
+  );
+
+  const skipped = COMMANDS.filter(
+    (c) => !COMMAND_NAME_RE.test(c.name)
+  ).map((c) => c.name);
+
+  if (skipped.length > 0) {
+    console.warn(
+      `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
+    );
+  }
+
+  await bot.api.setMyCommands(commands);
+
+  return { commands, skipped };
+}
+
 async function setupBotMenu(bot: Bot, token: string): Promise<void> {
   if (menuSetForToken === token) return;
 
   try {
-    const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map(
-      (c) => ({
-        command: c.name,
-        description: (c.description || c.name).slice(0, 256),
-      })
-    );
-
-    const skipped = COMMANDS.filter(
-      (c) => !COMMAND_NAME_RE.test(c.name)
-    ).map((c) => c.name);
-
-    if (skipped.length > 0) {
-      console.warn(
-        `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
-      );
-    }
-
-    await bot.api.setMyCommands(commands);
+    const { commands } = await applyBotCommands(bot);
     menuSetForToken = token;
     console.log(`[Bot] setMyCommands: ${commands.length} commands registered`);
   } catch (err) {
@@ -143,18 +154,7 @@ export default {
     if (url.pathname === '/setup-commands') {
       try {
         const bot = await getBot(env);
-        const commands = COMMANDS.filter((c) =>
-          COMMAND_NAME_RE.test(c.name)
-        ).map((c) => ({
-          command: c.name,
-          description: (c.description || c.name).slice(0, 256),
-        }));
-
-        const skipped = COMMANDS.filter(
-          (c) => !COMMAND_NAME_RE.test(c.name)
-        ).map((c) => c.name);
-
-        await bot.api.setMyCommands(commands);
+        const { commands, skipped } = await applyBotCommands(bot);
         menuSetForToken = env.TELEGRAM_BOT_TOKEN;
 
         return new Response(

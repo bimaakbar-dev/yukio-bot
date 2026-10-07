@@ -2,74 +2,55 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import type { AniListMedia } from '../types/anime';
 import { ensureTrackDb } from './telegram-utils';
+import { createLazyInit } from './lazy-init';
 
 export const SESSION_TTL_MS = 30 * 60 * 1000;
 
-let dbReady = false;
-let dbInitPromise: Promise<void> | null = null;
+export const ensureDb = createLazyInit('DBA', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS qimochi_sessions (
+        session_id   TEXT PRIMARY KEY,
+        user_id      INTEGER NOT NULL,
+        mal_id       INTEGER,
+        kitsu_id     TEXT,
+        title        TEXT NOT NULL,
+        cover        TEXT,
+        year         TEXT,
+        type         TEXT,
+        studio       TEXT,
+        source       TEXT,
+        metadata     TEXT,
+        fetched_sources TEXT,
+        created_at   INTEGER NOT NULL,
+        expires_at   INTEGER NOT NULL
+      )`
+    )
+    .run();
 
-export async function ensureDb(db: D1Database): Promise<void> {
-  if (dbReady) return;
-  if (dbInitPromise) return dbInitPromise;
-
-  dbInitPromise = (async () => {
+  for (const col of ['metadata', 'fetched_sources']) {
     try {
       await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS qimochi_sessions (
-            session_id   TEXT PRIMARY KEY,
-            user_id      INTEGER NOT NULL,
-            mal_id       INTEGER,
-            kitsu_id     TEXT,
-            title        TEXT NOT NULL,
-            cover        TEXT,
-            year         TEXT,
-            type         TEXT,
-            studio       TEXT,
-            source       TEXT,
-            metadata     TEXT,
-            fetched_sources TEXT,
-            created_at   INTEGER NOT NULL,
-            expires_at   INTEGER NOT NULL
-          )`
-        )
+        .prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
         .run();
+    } catch {}
+  }
 
-      for (const col of ['metadata', 'fetched_sources']) {
-  		try {
-    		await db
-      		.prepare(`ALTER TABLE qimochi_sessions ADD COLUMN ${col} TEXT`)
-      		.run();
-  		} catch {
-    		// ignore
-  		}
-      }
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS voice_actors (
+        id              TEXT PRIMARY KEY,
+        name            TEXT NOT NULL,
+        nameNative      TEXT,
+        image           TEXT,
+        defaultLanguage TEXT,
+        created_at      INTEGER NOT NULL
+      )`
+    )
+    .run();
 
-      await db
-        .prepare(
-          `CREATE TABLE IF NOT EXISTS voice_actors (
-            id              TEXT PRIMARY KEY,
-            name            TEXT NOT NULL,
-            nameNative      TEXT,
-            image           TEXT,
-            defaultLanguage TEXT,
-            created_at      INTEGER NOT NULL
-          )`
-        )
-        .run();
-
-      await ensureTrackDb(db);
-
-      dbReady = true;
-    } catch (err) {
-      console.error('[DBA] DB init error:', err);
-      dbInitPromise = null;
-      throw err;
-    }
-  })();
-
-  return dbInitPromise;
-}
+  await ensureTrackDb(db);
+});
 
 export interface SessionRow {
   session_id: string;
@@ -210,9 +191,7 @@ export async function updateSessionSummary(
 ): Promise<void> {
   await ensureDb(db);
   await db
-    .prepare(
-      `UPDATE qimochi_sessions SET summary = ? WHERE session_id = ?`
-    )
+    .prepare('UPDATE qimochi_sessions SET summary = ? WHERE session_id = ?')
     .bind(summary, sessionId)
     .run();
 }
