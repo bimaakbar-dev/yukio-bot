@@ -13,7 +13,11 @@ import {
   endCommand,
 } from './database-anime';
 import { vaCommand } from './va';
-import { publishAnimeCommand, publishBatchCommand } from './publish';
+import {
+  publishAnimeCommand,
+  publishBatchCommand,
+  batchResetCommand,
+} from './publish';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -32,4 +36,5 @@ export const COMMANDS: CommandDefinition[] = [
   deleteCommand,
   publishAnimeCommand,
   publishBatchCommand,
+  batchResetCommand,
 ];
