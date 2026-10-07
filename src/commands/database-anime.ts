@@ -24,8 +24,6 @@ import {
   clearTrackedSession,
   type Tracker,
 } from '../lib/telegram-utils';
-
-/* ---------- DBA modules ---------- */
 import {
   escapeHtml,
   fetchWithTimeout,
@@ -40,6 +38,7 @@ import {
   getSession,
   getLatestSessionByUser,
   updateSessionMetadata,
+  updateSessionSummary,
   deleteSession,
   type SessionRow,
 } from '../lib/dba-session';
@@ -62,17 +61,9 @@ import {
 import { saveVoiceActors } from '../lib/dba-voice-actors';
 import { showVaMenu } from './va';
 
-/* ============================================================
-   CONSTANTS
-   ============================================================ */
-
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
 const CHAR_FETCH_TIMEOUT_MS = 25000;
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
 
 function buildChainContext(session: SessionRow): ChainContext {
   return {
@@ -109,10 +100,6 @@ function buildPreviewText(session: SessionRow): string {
   return lines.join('\n');
 }
 
-/* ============================================================
-   AI SYNOPSIS
-   ============================================================ */
-
 async function rewriteSynopsis(
   env: Env,
   title: string,
@@ -145,10 +132,6 @@ async function rewriteSynopsis(
     return null;
   }
 }
-
-/* ============================================================
-   COMMAND: /dba
-   ============================================================ */
 
 async function handleCommand(ctx: Context, env: Env): Promise<void> {
   const query = typeof ctx.match === 'string' ? ctx.match.trim() : '';
@@ -257,10 +240,6 @@ export const dbaShortCommand: CommandDefinition = {
   handler: handleCommand,
 };
 
-/* ============================================================
-   COMMAND: /end
-   ============================================================ */
-
 export const endCommand: CommandDefinition = {
   name: 'end',
   description: 'Hapus semua pesan session /dba aktif',
@@ -303,10 +282,6 @@ export const endCommand: CommandDefinition = {
     );
   },
 };
-
-/* ============================================================
-   METADATA HANDLERS
-   ============================================================ */
 
 async function handleMetadataShow(
   ctx: Context,
@@ -422,14 +397,7 @@ async function handleMetadataMerge(
   await tracker(msg.message_id);
 }
 
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
-
 export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
-  /* ========================================================
-     PART HANDLER (per-part characters)
-     ======================================================== */
   bot.callbackQuery(
     /^qd:cp:(\d+):(q_[a-f0-9]+)$/,
     async (ctx) => {
@@ -481,7 +449,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
 
       const numParts = countParts(cache.total);
 
-      // Kirim part
       await sendJsonSection(
         ctx,
         `Characters ${part.start}-${part.end} dari ${cache.total} — ${session.title} [${partIndex + 1}/${numParts}]`,
@@ -489,14 +456,10 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         tracker
       );
 
-      // Mark part as sent
       await markPartSent(env.DB, sessionId, partIndex);
     }
   );
 
-  /* ========================================================
-     MAIN ACTIONS
-     ======================================================== */
   bot.callbackQuery(
     /^qd:(ms|mk|mo|m|c|e|f|s|v|x):(q_[a-f0-9]+)$/,
     async (ctx) => {
@@ -525,7 +488,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === BATAL ===
       if (action === 'x') {
         await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
         const chatId = ctx.chat?.id;
@@ -547,7 +509,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === SELESAI (metadata) ===
       if (action === 'mo') {
         await ctx.answerCallbackQuery({ text: '✅ Selesai!' });
         await ctx
@@ -556,7 +517,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === METADATA → Shikimori ===
       if (action === 'ms') {
         await ctx.answerCallbackQuery({ text: '📡 Cari Shikimori...' });
         const tracker: Tracker = (msgId) =>
@@ -565,7 +525,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === METADATA → Kitsu ===
       if (action === 'mk') {
         await ctx.answerCallbackQuery({ text: '📡 Cari Kitsu...' });
         const tracker: Tracker = (msgId) =>
@@ -574,7 +533,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      // === VOICE ACTORS redirect ===
       if (action === 'v') {
         await ctx.answerCallbackQuery({ text: '🎤 Buka menu Voice Actors...' });
         await showVaMenu(ctx, env);
@@ -589,15 +547,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
       try {
         const chainCtx = buildChainContext(session);
 
-        /* ---------- METADATA ---------- */
         if (action === 'm') {
           await handleMetadataShow(ctx, env, session, tracker);
           return;
         }
 
-        /* ---------- CHARACTERS ---------- */
         if (action === 'c') {
-          // Cek cache dulu
           const cached = await getCharCache(env.DB, sessionId);
 
           if (cached) {
@@ -622,7 +577,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             return;
           }
 
-          // Belum ada cache → fetch dari chain
           const { data: result, error } = await safeFetch(
             () => chainCharacters(chainCtx),
             CHAR_FETCH_TIMEOUT_MS
@@ -643,7 +597,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           const vas = result.voiceActors;
           const source = result.source;
 
-          // Simpan VA
           let vaResult = { newCount: 0, skippedCount: 0 };
           if (vas.length > 0) {
             try {
@@ -653,14 +606,12 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
             }
           }
 
-          // Simpan cache karakter
           try {
             await saveCharCache(env.DB, sessionId, chars, vas, source);
           } catch (err) {
             console.warn('[DBA] Gagal simpan cache chars:', err);
           }
 
-          // Tampilkan menu part
           const total = chars.length;
           const numParts = countParts(total);
           const kb = buildPartsKeyboard(sessionId, total);
@@ -684,7 +635,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        /* ---------- EPISODES ---------- */
         if (action === 'e') {
           const { data: result, error } = await safeFetch(
             () => chainEpisodes(chainCtx),
@@ -714,7 +664,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        /* ---------- FRANCHISES ---------- */
         if (action === 'f') {
           const { data: result, error } = await safeFetch(
             () => chainRelations(chainCtx),
@@ -741,7 +690,6 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           return;
         }
 
-        /* ---------- SUMMARY ---------- */
         if (action === 's') {
           let result;
           try {
@@ -756,19 +704,26 @@ export function setupDatabaseAnimeCallbacks(bot: Bot, env: Env): void {
           }
 
           const raw = getSynopsisRaw(result.media);
-          const { data: ai } = await safeFetch(
-            () => rewriteSynopsis(env, session.title, raw),
-            AI_TIMEOUT_MS
-          );
+		  const { data: ai } = await safeFetch(
+  			() => rewriteSynopsis(env, session.title, raw),
+  			AI_TIMEOUT_MS
+		  );
 
-          const body = ai ?? raw ?? 'Tulis sinopsis manual...';
-          await sendTextSection(
-            ctx,
-            `Summary — ${session.title}`,
-            body,
-            tracker
-          );
-          return;
+		  const body = ai ?? raw ?? 'Tulis sinopsis manual...';
+
+		  try {
+  			await updateSessionSummary(env.DB, sessionId, body);
+		  } catch (err) {
+  		  console.warn('[DBA] Gagal simpan summary:', err);
+		  }
+
+		  await sendTextSection(
+  		  ctx,
+  		  `Summary — ${session.title}`,
+  		  body,
+  		  tracker
+		  );
+		return;
         }
       } catch (err: any) {
         console.error('[DBA] callback error:', err);
