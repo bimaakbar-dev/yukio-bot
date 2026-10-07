@@ -723,8 +723,6 @@ async function doPublishBatchPreview(
   } catch {
     episodes = [];
   }
-
-  const episodeCount = episodes.length;
   const rangeExpected = session.max_ep - session.min_ep + 1;
   const hasGap = episodeCount !== rangeExpected;
 
