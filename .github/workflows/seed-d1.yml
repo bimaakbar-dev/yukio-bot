@@ -1,0 +1,58 @@
+name: Seed D1
+
+on:
+  workflow_dispatch:
+    inputs:
+      file:
+        description: 'SQL file path (default: seed/update-last-ep.sql)'
+        required: false
+        default: 'seed/update-last-ep.sql'
+        type: string
+      confirm:
+        description: 'Ketik "yes" untuk konfirmasi'
+        required: true
+        type: string
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "yes" ]; then
+            echo "❌ Konfirmasi tidak valid. Harus ketik 'yes'."
+            exit 1
+          fi
+          echo "✅ Konfirmasi OK"
+
+      - name: Check file exists
+        run: |
+          if [ ! -f "${{ inputs.file }}" ]; then
+            echo "❌ File tidak ditemukan: ${{ inputs.file }}"
+            exit 1
+          fi
+          echo "=== File content ==="
+          cat "${{ inputs.file }}"
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install wrangler
+        run: npm install -g wrangler@3
+
+      - name: Execute SQL on D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          wrangler d1 execute yukio-db --remote --file="${{ inputs.file }}"
+
+      - name: Done
+        run: echo "✅ Seed selesai"
