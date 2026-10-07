@@ -15,6 +15,7 @@ export interface TrackSessionRow {
   source_slug: string | null;
   schedule_day: string | null;
   schedule_hour: number | null;
+  schedule_minute: number | null;
   buffer_min: number;
   created_at: number;
   expires_at: number;
@@ -26,20 +27,29 @@ export const ensureTrackSessionDb = createLazyInit(
     await db
       .prepare(
         `CREATE TABLE IF NOT EXISTS track_sessions (
-          session_id    TEXT PRIMARY KEY,
-          user_id       INTEGER NOT NULL,
-          step          TEXT NOT NULL,
-          site          TEXT,
-          slug          TEXT,
-          source_slug   TEXT,
-          schedule_day  TEXT,
-          schedule_hour INTEGER,
-          buffer_min    INTEGER NOT NULL DEFAULT 60,
-          created_at    INTEGER NOT NULL,
-          expires_at    INTEGER NOT NULL
+          session_id       TEXT PRIMARY KEY,
+          user_id          INTEGER NOT NULL,
+          step             TEXT NOT NULL,
+          site             TEXT,
+          slug             TEXT,
+          source_slug      TEXT,
+          schedule_day     TEXT,
+          schedule_hour    INTEGER,
+          schedule_minute  INTEGER,
+          buffer_min       INTEGER NOT NULL DEFAULT 60,
+          created_at       INTEGER NOT NULL,
+          expires_at       INTEGER NOT NULL
         )`
       )
       .run();
+
+    try {
+      await db
+        .prepare(
+          'ALTER TABLE track_sessions ADD COLUMN schedule_minute INTEGER'
+        )
+        .run();
+    } catch {}
   }
 );
 
@@ -105,6 +115,7 @@ export interface TrackSessionPatch {
   source_slug?: string;
   schedule_day?: string;
   schedule_hour?: number;
+  schedule_minute?: number;
   buffer_min?: number;
 }
 
