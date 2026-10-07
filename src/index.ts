@@ -11,6 +11,7 @@ import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
 import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
 import { setupPublishCallbacks } from './commands/publish';
+import { setupFranchisesCallbacks } from './commands/franchises';
 import { COMMANDS } from './commands/list';
 
 let cachedBot: Bot | null = null;
@@ -35,6 +36,7 @@ function createBot(env: Env): Bot {
   setupDatabaseAnimeCallbacks(bot, env);
   setupVaCallbacks(bot, env);
   setupPublishCallbacks(bot, env);
+setupFranchisesCallbacks(bot, env);
 
   bot.on('message:document', async (ctx) => {
     const caption = ctx.message.caption ?? '';
