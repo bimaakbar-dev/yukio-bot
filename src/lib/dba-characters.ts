@@ -6,10 +6,6 @@ import { InlineKeyboard } from 'grammy';
 export const CHAR_PART_SIZE = 50;
 const CACHE_TTL_MS = 30 * 60 * 1000;
 
-/* ============================================================
-   TABLE
-   ============================================================ */
-
 let cacheDbReady = false;
 let cacheDbInitPromise: Promise<void> | null = null;
 
@@ -33,8 +29,6 @@ export async function ensureCharCacheTable(db: D1Database): Promise<void> {
           )`
         )
         .run();
-
-      // Migration: tambah kolom sent_parts kalau belum ada
       try {
         await db
           .prepare(
@@ -55,10 +49,6 @@ export async function ensureCharCacheTable(db: D1Database): Promise<void> {
 
   return cacheDbInitPromise;
 }
-
-/* ============================================================
-   SAVE
-   ============================================================ */
 
 export async function saveCharCache(
   db: D1Database,
@@ -98,10 +88,6 @@ export async function saveCharCache(
 
   console.log(`[CharCache] saved ${chars.length} chars for ${sessionId}`);
 }
-
-/* ============================================================
-   READ
-   ============================================================ */
 
 export interface CharCacheData {
   chars: UnifiedCharacter[];
@@ -161,10 +147,6 @@ export async function getCharCache(
   }
 }
 
-/* ============================================================
-   MARK SENT
-   ============================================================ */
-
 export async function markPartSent(
   db: D1Database,
   sessionId: string,
@@ -204,10 +186,6 @@ export async function markPartSent(
   }
 }
 
-/* ============================================================
-   DELETE
-   ============================================================ */
-
 export async function deleteCharCache(
   db: D1Database,
   sessionId: string
@@ -222,10 +200,6 @@ export async function deleteCharCache(
     console.warn('[CharCache] delete error:', err);
   }
 }
-
-/* ============================================================
-   PARTS
-   ============================================================ */
 
 export function getCharacterPart(
   chars: UnifiedCharacter[],
@@ -248,10 +222,6 @@ export function getCharacterPart(
 export function countParts(total: number, partSize = CHAR_PART_SIZE): number {
   return Math.ceil(total / partSize);
 }
-
-/* ============================================================
-   MENU KEYBOARD
-   ============================================================ */
 
 const PARTS_PER_ROW = 5;
 
