@@ -304,7 +304,22 @@ export function setupPublishCallbacks(bot: Bot, env: Env): void {
 
         if (groupFiles.length === 1) {
           const f = groupFiles[0]!;
-          r = await githubCommitFile(env, f.path, f.content, message, target);
+          if (f.content === null) {
+            r = await githubCommitMultipleFiles(
+              env,
+              groupFiles,
+              message,
+              target
+            );
+          } else {
+            r = await githubCommitFile(
+              env,
+              f.path,
+              f.content,
+              message,
+              target
+            );
+          }
         } else {
           r = await githubCommitMultipleFiles(env, groupFiles, message, target);
         }
