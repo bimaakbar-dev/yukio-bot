@@ -25,3 +25,9 @@ VAL_TOWN_FETCH_URL = "https://yukio-anime.val.run/"
 
 GITHUB_REPO = "bimaakbar-dev/qimochi"
 GITHUB_BRANCH = "main"
+
+YUKIONIME_REPO = "bimaakbar-dev/yukionime"
+YUKIONIME_BRANCH = "main"
+
+YUKIO_DATA_REPO = "bimaakbar-dev/yukio-data"
+YUKIO_DATA_BRANCH = "main"
