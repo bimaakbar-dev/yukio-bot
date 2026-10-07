@@ -15,6 +15,10 @@ import { setupPostCallbacks } from './commands/post';
 import { setupKillCallbacks } from './commands/kill';
 import { setupEditCallbacks } from './commands/edit/callbacks';
 import { handleEditTextInput } from './commands/edit';
+import {
+  setupTrackCallbacks,
+  handleTrackInput,
+} from './commands/track';
 import { COMMANDS } from './commands/list';
 
 const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
@@ -43,18 +47,21 @@ function createBot(env: Env): Bot {
   setupPublishCallbacks(bot, env);
   setupPostCallbacks(bot, env);
   setupKillCallbacks(bot, env);
+  setupTrackCallbacks(bot, env);
   setupEditCallbacks(bot, env);
 
-  // Handler teks bebas — buat input slug / value di flow /edit
   bot.on('message:text', async (ctx) => {
     if (!isAdmin(ctx.from?.id, env)) return;
     if (ctx.chat?.type !== 'private') return;
 
     try {
-      const handled = await handleEditTextInput(ctx, env);
-      void handled;
+      const handledEdit = await handleEditTextInput(ctx, env);
+      if (handledEdit) return;
+
+      const handledTrack = await handleTrackInput(ctx, env);
+      void handledTrack;
     } catch (err) {
-      console.error('[Edit] text handler error:', err);
+      console.error('[Text] handler error:', err);
     }
   });
 
