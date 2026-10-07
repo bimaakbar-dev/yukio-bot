@@ -144,7 +144,6 @@ export function translateEdit(
   fieldFrom: string,
   valueFrom: string
 ): TranslatedEdit | null {
-  const to: EditTarget = from === 'qimochi' ? 'yukionime' : 'qimochi';
   const map = from === 'qimochi' ? SYNC_Q2Y : SYNC_Y2Q;
   const fieldTo = map[fieldFrom];
   if (!fieldTo) return null;
