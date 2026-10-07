@@ -2,6 +2,10 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { createLazyInit } from '../lazy-init';
 
+/* ============================================================
+   TYPES
+   ============================================================ */
+
 export type SiteKey = 'lexanime' | 'animesub';
 
 export interface TrackedAnimeRow {
@@ -40,6 +44,10 @@ export interface CronLogRow {
   errors_json: string;
 }
 
+/* ============================================================
+   LAZY INIT
+   ============================================================ */
+
 export const ensureCronDb = createLazyInit('Cron', async (db) => {
   await db
     .prepare(
@@ -63,7 +71,7 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
       )`
     )
     .run();
-  
+
   try {
     await db
       .prepare(
@@ -105,6 +113,10 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
     )
     .run();
 });
+
+/* ============================================================
+   TRACKED ANIME CRUD
+   ============================================================ */
 
 export interface SaveTrackedAnimeInput {
   slug: string;
@@ -282,6 +294,10 @@ export async function setLastCheckAt(
     .run();
 }
 
+/* ============================================================
+   PUBLISHED EPISODES
+   ============================================================ */
+
 export async function markEpisodePublished(
   db: D1Database,
   slug: string,
@@ -333,6 +349,10 @@ export async function countEpisodesLast24h(
   return row?.c ?? 0;
 }
 
+/* ============================================================
+   CRON LOG
+   ============================================================ */
+
 export async function writeCronLog(
   db: D1Database,
   data: {
@@ -359,6 +379,10 @@ export async function writeCronLog(
     .run();
 }
 
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
 export const DAY_NAMES_ID = [
   'Minggu',
   'Senin',
@@ -384,11 +408,11 @@ export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
 
   const targetDay = dayNameToIndex(row.schedule_day);
   if (targetDay === -1) return false;
-
   if (wibDay !== targetDay) return false;
 
   const nowTotal = wibHour * 60 + wibMinute;
-  const targetTotal = row.schedule_hour * 60 + row.schedule_minute + row.buffer_min;
+  const targetTotal =
+    row.schedule_hour * 60 + row.schedule_minute + row.buffer_min;
 
   return nowTotal >= targetTotal;
 }
