@@ -378,7 +378,7 @@ export async function handleTrackInput(
 
 export function setupTrackCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(
-    /^tr:site:(tr_[a-z0-9]+):(lexanime|animesub)$/,
+  /^tr:site:(tr_[a-z0-9]+):(lexanime|animesub|samehadaku)$/,
     async (ctx) => {
       const sessionId = ctx.match[1] ?? '';
       const site = (ctx.match[2] ?? '') as SiteKey;
