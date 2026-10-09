@@ -1,4 +1,4 @@
-name: Apply CMS Track
+name: Fix Track v2
 
 on:
   workflow_dispatch:
@@ -7,9 +7,8 @@ permissions:
   contents: write
 
 jobs:
-  apply:
+  fix:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -18,66 +17,75 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Apply payload
+      - name: Apply fixes
         run: |
-          if [ ! -f payload.txt ]; then
-            echo "❌ payload.txt not found"
-            exit 1
-          fi
-
           python3 << 'PYEOF'
-          import re, os, sys
+          import os, re
 
-          with open('payload.txt', 'r', encoding='utf-8') as f:
+          # 1. Delete track-callbacks.ts
+          for p in ['src/commands/track-callbacks.ts']:
+              if os.path.exists(p):
+                  os.remove(p)
+                  print(f'OK: deleted {p}')
+
+          # 2. Fix index.ts
+          p = 'src/index.ts'
+          with open(p) as f:
               content = f.read()
 
-          pattern = re.compile(
-              r'^=== FILE: (.+?) ===\n(.*?)\n=== END ===$',
-              re.MULTILINE | re.DOTALL
+          content = re.sub(
+              r"import \{ setupTrackCmsCallbacks \} from './commands/track-callbacks';\n",
+              "",
+              content
           )
 
-          count = 0
-          for match in pattern.finditer(content):
-              path = match.group(1).strip()
-              body = match.group(2)
+          if "setupTrackCallbacks" not in content:
+              if "import { handleTrackTextV2 } from './commands/track';" in content:
+                  content = content.replace(
+                      "import { handleTrackTextV2 } from './commands/track';",
+                      "import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';"
+                  )
+              else:
+                  content = content.replace(
+                      "import { COMMANDS } from './commands/list';",
+                      "import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';\nimport { COMMANDS } from './commands/list';"
+                  )
 
-              if not path or path.startswith('/'):
-                  print(f'❌ Invalid path: {path}')
-                  sys.exit(1)
+          content = content.replace(
+              "setupTrackCmsCallbacks(bot, env);",
+              "setupTrackCallbacks(bot, env);"
+          )
 
-              dirn = os.path.dirname(path)
-              if dirn:
-                  os.makedirs(dirn, exist_ok=True)
+          with open(p, 'w') as f:
+              f.write(content)
+          print('OK: fixed index.ts')
 
-              with open(path, 'w', encoding='utf-8') as f:
-                  f.write(body)
+          # 3. Fix track.ts
+          p = 'src/commands/track.ts'
+          with open(p) as f:
+              content = f.read()
 
-              print(f'✅ Wrote {path} ({len(body)} bytes)')
-              count += 1
+          # 3a. Convert 4-arg editMessageText to api.editMessageText
+          content = re.sub(
+              r'(?<!\.api)editMessageText\(',
+              'api.editMessageText(',
+              content
+          )
 
-          if count == 0:
-              print('❌ No files matched')
-              sys.exit(1)
+          # 3b. Remove unused import
+          content = re.sub(r'\s*type TrackedAnimeRow,', '', content)
 
-          print(f'\n📦 Total: {count} files written')
+          with open(p, 'w') as f:
+              f.write(content)
+          print('OK: fixed track.ts')
           PYEOF
-
-      - name: Cleanup payload
-        run: rm -f payload.txt
-
-      - name: Typecheck (optional)
-        run: |
-          npm install --silent 2>/dev/null || true
-          if [ -f tsconfig.json ]; then
-            npx tsc --noEmit 2>&1 | head -50 || echo "⚠️ typecheck skipped/failed"
-          fi
 
       - name: Commit & push
         run: |
           git add -A
           if git diff --staged --quiet; then
-            echo "ℹ️ No changes"
+            echo "No changes"
           else
-            git commit -m "feat(track): CMS-style editor via bot"
+            git commit -m "fix: track cms integration v2"
             git push
-          fi
+          fil
