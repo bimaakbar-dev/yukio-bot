@@ -2,8 +2,9 @@
 import { InlineKeyboard } from 'grammy';
 import { escapeHtml } from '../../lib/utils';
 import type { TrackSessionRow } from './state';
+import type { SiteKey, TrackedAnimeRow } from '../../lib/cron/state';
 
-export const SITE_LABELS: Record<string, string> = {
+export const SITE_LABEL: Record<SiteKey, string> = {
   lexanime: '🎬 lexanime',
   animesub: '🎬 animesub',
   samehadaku: '🎬 samehadaku',
@@ -19,6 +20,44 @@ export const DAYS_ORDER = [
   'Minggu',
   'Random',
 ];
+
+/* ============================================================
+   MAIN MENU
+   ============================================================ */
+
+export function buildMainMenuKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('➕ Tambah Baru', 'tr:a')
+    .text('📋 Lihat Daftar', 'tr:l')
+    .row()
+    .text('🗑️ Hapus Anime', 'tr:dm')
+    .text('🔄 Cek Episode Baru', 'tr:c');
+}
+
+export function buildMainMenuText(
+  total: number,
+  active: number,
+  paused: number,
+  pending: number
+): string {
+  const lines: string[] = [];
+  lines.push('📡 <b>Track Anime</b>');
+  lines.push('');
+  lines.push(`📊 Total: <b>${total}</b> anime`);
+  if (active > 0) lines.push(`🟢 Active: ${active}`);
+  if (paused > 0) lines.push(`⏸️ Paused: ${paused}`);
+  if (pending > 0) {
+    lines.push('');
+    lines.push(`⚠️ <b>${pending} anime tertinggal!</b>`);
+  }
+  lines.push('');
+  lines.push('<i>Pilih action di bawah:</i>');
+  return lines.join('\n');
+}
+
+/* ============================================================
+   ADD FLOW (existing)
+   ============================================================ */
 
 export function buildSiteKeyboard(sessionId: string): InlineKeyboard {
   return new InlineKeyboard()
@@ -145,4 +184,200 @@ export function buildSummary(
   lines.push('');
   lines.push('<i>Klik ✅ Simpan kalau cocok.</i>');
   return lines.join('\n');
+}
+
+/* ============================================================
+   DELETE MENU
+   ============================================================ */
+
+export function buildDeleteMenuKeyboard(counts: {
+  lexanime: number;
+  animesub: number;
+  samehadaku: number;
+}): InlineKeyboard {
+  const kb = new InlineKeyboard();
+
+  const buttons: { label: string; site: SiteKey; count: number }[] = [
+    { label: '🎬 lexanime', site: 'lexanime', count: counts.lexanime },
+    { label: '🎬 animesub', site: 'animesub', count: counts.animesub },
+    { label: '🎬 samehadaku', site: 'samehadaku', count: counts.samehadaku },
+  ];
+
+  for (const b of buttons) {
+    if (b.count > 0) {
+      kb.text(`${b.label} (${b.count})`, `tr:ds:${b.site}`).row();
+    }
+  }
+
+  kb.text('◀️ Kembali', 'tr:h');
+  return kb;
+}
+
+export function buildDeleteMenuText(counts: {
+  lexanime: number;
+  animesub: number;
+  samehadaku: number;
+}): string {
+  const total = counts.lexanime + counts.animesub + counts.samehadaku;
+  return (
+    '🗑️ <b>Hapus Anime</b>\n\n' +
+    `Total: <b>${total}</b> anime\n\n` +
+    '<i>Pilih situs untuk lihat daftarnya:</i>'
+  );
+}
+
+export function buildDeleteSiteActionKeyboard(
+  site: SiteKey,
+  count: number
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text(`🗑️ Hapus Semua (${count})`, `tr:dall:${site}`).row();
+  kb.text('☑️ Pilih Satu-satu', `tr:dsel:${site}`).row();
+  kb.text('◀️ Kembali', 'tr:dm');
+  return kb;
+}
+
+export function buildDeleteSiteActionText(
+  site: SiteKey,
+  list: TrackedAnimeRow[]
+): string {
+  const lines: string[] = [];
+  lines.push(`🗑️ <b>Hapus dari ${escapeHtml(site)}</b>`);
+  lines.push('');
+  lines.push(`📊 Total: <b>${list.length}</b> anime`);
+  lines.push('');
+  lines.push('<b>Daftar:</b>');
+  const preview = list.slice(0, 8);
+  for (const r of preview) {
+    lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  }
+  if (list.length > preview.length) {
+    lines.push(`<i>… dan ${list.length - preview.length} lainnya</i>`);
+  }
+  lines.push('');
+  lines.push('<i>Pilih action:</i>');
+  return lines.join('\n');
+}
+
+export function buildDeleteAllConfirmKeyboard(site: SiteKey): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('✅ Ya, Hapus Semua', `tr:dally:${site}`)
+    .text('❌ Batal', `tr:ds:${site}`);
+}
+
+export function buildDeleteAllConfirmText(
+  site: SiteKey,
+  list: TrackedAnimeRow[]
+): string {
+  const lines: string[] = [];
+  lines.push('⚠️ <b>Konfirmasi Hapus Semua</b>');
+  lines.push('');
+  lines.push(
+    `Yakin hapus <b>${list.length}</b> anime dari <b>${escapeHtml(site)}</b>?`
+  );
+  lines.push('');
+  const preview = list.slice(0, 10);
+  for (const r of preview) {
+    lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  }
+  if (list.length > preview.length) {
+    lines.push(`<i>… dan ${list.length - preview.length} lainnya</i>`);
+  }
+  lines.push('');
+  lines.push('<b>⚠️ Tidak bisa dibatalkan.</b>');
+  return lines.join('\n');
+}
+
+/* ============================================================
+   DELETE SELECT MODE
+   ============================================================ */
+
+export function buildDeleteSelectKeyboard(
+  site: SiteKey,
+  list: TrackedAnimeRow[],
+  mask: number
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+
+  list.forEach((row, i) => {
+    const checked = (mask & (1 << i)) !== 0;
+    const mark = checked ? '✅' : '⬜';
+    const label = `${mark} ${row.slug}`;
+    const shortLabel = label.length > 40 ? label.slice(0, 38) + '…' : label;
+
+    kb.text(shortLabel, `tr:dt:${site}:${mask}:${i}`);
+    kb.row();
+  });
+
+  const selectedCount = countBits(mask);
+  const delLabel =
+    selectedCount > 0
+      ? `🗑️ Hapus (${selectedCount})`
+      : `🗑️ Hapus (0)`;
+
+  kb.text(delLabel, `tr:dgo:${site}:${mask}`)
+    .text('❌ Batal', `tr:ds:${site}`);
+
+  return kb;
+}
+
+export function buildDeleteSelectText(
+  site: SiteKey,
+  list: TrackedAnimeRow[],
+  mask: number
+): string {
+  const selected = countBits(mask);
+  const lines: string[] = [];
+  lines.push(`☑️ <b>Pilih Anime — ${escapeHtml(site)}</b>`);
+  lines.push('');
+  lines.push(`Total: <b>${list.length}</b> · Dipilih: <b>${selected}</b>`);
+  lines.push('');
+  lines.push('<i>Tap untuk toggle. Klik 🗑️ Hapus kalau sudah selesai.</i>');
+  return lines.join('\n');
+}
+
+export function buildDeleteSelectedConfirmKeyboard(
+  site: SiteKey,
+  mask: number
+): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('✅ Ya, Hapus', `tr:dgy:${site}:${mask}`)
+    .text('❌ Batal', `tr:dsel:${site}`);
+}
+
+export function buildDeleteSelectedConfirmText(
+  site: SiteKey,
+  list: TrackedAnimeRow[],
+  mask: number
+): string {
+  const selected = list.filter((_, i) => (mask & (1 << i)) !== 0);
+
+  const lines: string[] = [];
+  lines.push('⚠️ <b>Konfirmasi Hapus</b>');
+  lines.push('');
+  lines.push(
+    `Yakin hapus <b>${selected.length}</b> anime dari <b>${escapeHtml(site)}</b>?`
+  );
+  lines.push('');
+  for (const r of selected.slice(0, 15)) {
+    lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  }
+  if (selected.length > 15) {
+    lines.push(`<i>… dan ${selected.length - 15} lainnya</i>`);
+  }
+  return lines.join('\n');
+}
+
+/* ============================================================
+   HELPERS
+   ============================================================ */
+
+export function countBits(n: number): number {
+  let count = 0;
+  let x = n;
+  while (x > 0) {
+    count += x & 1;
+    x >>>= 1;
+  }
+  return count;
 }
