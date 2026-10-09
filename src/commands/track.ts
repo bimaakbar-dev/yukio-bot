@@ -273,11 +273,20 @@ export async function showList(ctx: Context, env: Env, page = 0): Promise<void> 
   };
 
   if (hasCb) {
-    await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, lines.join('\n'), payload).catch(() => {});
-    return;
-  }
-  await ctx.reply(lines.join('\n'), payload);
-}
+    try {
+      await ctx.api.editMessageText(
+      	ctx.chat!.id,
+      	ctx.callbackQuery!.message!.message_id!,
+      	lines.join('\n'),
+      	payload
+    	);
+    	return;
+  	} catch (err) {
+    	console.error('[Track] editMessageText failed:', err);
+  	}
+	}
+	await ctx.reply(lines.join('\n'), payload);
+	}
 
 export async function showDetail(
   ctx: Context,
@@ -795,9 +804,19 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await handleCatchup(ctx, env);
   });
   bot.callbackQuery(/^tr:lp:(\d+)$/, async (ctx) => {
-    const page = parseInt(ctx.match[1] ?? '0', 10);
-    await ctx.answerCallbackQuery().catch(() => {});
-    await showList(ctx, env, page);
+  	const page = parseInt(ctx.match[1] ?? '0', 10);
+  	try {
+    	await ctx.answerCallbackQuery({ text: `📄 Hal. ${page + 1}` });
+  	} catch {}
+  	try {
+    	await showList(ctx, env, page);
+  	} catch (err) {
+    	console.error('[Track] pagination failed:', err);
+    	const msg = err instanceof Error ? err.message : 'unknown';
+    	await ctx.reply(`❌ Pagination error: <code>${msg.slice(0, 200)}</code>`, {
+      	parse_mode: 'HTML',
+    	}).catch(() => {});
+  	}
   });
   bot.callbackQuery(/^tr:v:(.+)$/, async (ctx) => {
     const slug = ctx.match[1] ?? '';
