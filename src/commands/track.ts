@@ -143,6 +143,22 @@ function countBits(n: number): number {
   return c;
 }
 
+function hashSlug(slug: string): string {
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) {
+    h = ((h << 5) - h + slug.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36).padStart(7, '0').slice(0, 8);
+}
+
+async function findSlugByHash(env: Env, hash: string): Promise<string | null> {
+  const all = await listAllTrackedAnime(env.DB);
+  for (const r of all) {
+    if (hashSlug(r.slug) === hash) return r.slug;
+  }
+  return null;
+}
+
 function parseTime(input: string): { hour: number; minute: number } | null {
   const cleaned = input.trim().replace(/[.,]/g, ':');
   const parts = cleaned.split(':');
@@ -257,11 +273,11 @@ export async function showList(ctx: Context, env: Env, page = 0): Promise<void> 
     const pending = isInScheduleWindow(r) ? ' ⚠️' : '';
     const label = `${icon} ${r.slug}${pending}`;
     const short = label.length > 50 ? label.slice(0, 48) + '…' : label;
-    kb.text(short, `tr:v:${r.slug}`).row();
+    kb.text(short, `tr:v:${hashSlug(r.slug)}`).row();
   }
   if (totalPages > 1) {
-    if (p > 0) kb.text('◀️', `tr:lp:${p - 1}`);
-    if (p < totalPages - 1) kb.text('▶️', `tr:lp:${p + 1}`);
+    if (p > 0) kb.text('◀️ Prev', `tr:lp:${p - 1}`);
+    if (p < totalPages - 1) kb.text('Next ▶️', `tr:lp:${p + 1}`);
     kb.row();
   }
   kb.text('◀️ Kembali', 'tr:h');
@@ -274,19 +290,14 @@ export async function showList(ctx: Context, env: Env, page = 0): Promise<void> 
 
   if (hasCb) {
     try {
-      await ctx.api.editMessageText(
-      	ctx.chat!.id,
-      	ctx.callbackQuery!.message!.message_id!,
-      	lines.join('\n'),
-      	payload
-    	);
-    	return;
-  	} catch (err) {
-    	console.error('[Track] editMessageText failed:', err);
-  	}
-	}
-	await ctx.reply(lines.join('\n'), payload);
-	}
+      await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, lines.join('\n'), payload);
+      return;
+    } catch (err) {
+      console.error('[Track] edit list failed:', err);
+    }
+  }
+  await ctx.reply(lines.join('\n'), payload);
+}
 
 export async function showDetail(
   ctx: Context,
@@ -306,6 +317,7 @@ export async function showDetail(
   const hh = String(row.schedule_hour).padStart(2, '0');
   const mm = String(row.schedule_minute ?? 0).padStart(2, '0');
   const pending = isInScheduleWindow(row) ? ' ⚠️' : '';
+  const sh = hashSlug(slug);
 
   const lines: string[] = [];
   lines.push(`📄 <code>${escapeHtml(row.slug)}</code>${pending}`);
@@ -326,22 +338,22 @@ export async function showDetail(
   lines.push('<i>Pilih field untuk edit:</i>');
 
   const kb = new InlineKeyboard()
-    .text('🎬 Site', `tr:e:${slug}:site`)
-    .text('🔗 Source', `tr:e:${slug}:source_slug`)
+    .text('🎬 Site', `tr:e:${sh}:site`)
+    .text('🔗 Source', `tr:e:${sh}:source_slug`)
     .row()
-    .text('📅 Hari', `tr:e:${slug}:schedule_day`)
-    .text('⏰ Jam', `tr:e:${slug}:schedule_hour`)
+    .text('📅 Hari', `tr:e:${sh}:schedule_day`)
+    .text('⏰ Jam', `tr:e:${sh}:schedule_hour`)
     .row()
-    .text('📼 Last Ep', `tr:e:${slug}:last_ep`)
-    .text('📦 Chunk', `tr:e:${slug}:chunk`)
+    .text('📼 Last Ep', `tr:e:${sh}:last_ep`)
+    .text('📦 Chunk', `tr:e:${sh}:chunk`)
     .row()
-    .text('⏱️ Buffer', `tr:e:${slug}:buffer_min`)
-    .text('🔀 Status', `tr:e:${slug}:status`)
+    .text('⏱️ Buffer', `tr:e:${sh}:buffer_min`)
+    .text('🔀 Status', `tr:e:${sh}:status`)
     .row()
-    .text('🔄 Check', `tr:cx:${slug}`)
-    .text('♻️ Reset', `tr:rs:${slug}`)
+    .text('🔄 Check', `tr:cx:${sh}`)
+    .text('♻️ Reset', `tr:rs:${sh}`)
     .row()
-    .text('🗑️ Hapus', `tr:dv:${slug}`)
+    .text('🗑️ Hapus', `tr:dv:${sh}`)
     .text('◀️ Kembali', 'tr:l');
 
   const payload = {
@@ -377,6 +389,7 @@ export async function promptEdit(
   const sessionId = await createSession(env.DB, userId, 'edit_value', {
     slug, edit_field: field,
   });
+  const sh = hashSlug(slug);
 
   let prompt = '';
   let kb: InlineKeyboard | undefined;
@@ -390,7 +403,7 @@ export async function promptEdit(
         .row()
         .text('🎬 samehadaku', `tr:set:${sessionId}:samehadaku`)
         .row()
-        .text('❌ Batal', `tr:v:${slug}`);
+        .text('❌ Batal', `tr:v:${sh}`);
       break;
     case 'status':
       prompt = `🔀 <b>Edit Status</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nStatus sekarang: <b>${row.status}</b>\n\nPilih status baru:`;
@@ -400,7 +413,7 @@ export async function promptEdit(
         .row()
         .text('✅ Finished', `tr:set:${sessionId}:finished`)
         .row()
-        .text('❌ Batal', `tr:v:${slug}`);
+        .text('❌ Batal', `tr:v:${sh}`);
       break;
     case 'schedule_day': {
       prompt = `📅 <b>Edit Hari</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.schedule_day}</b>\n\nPilih hari baru:`;
@@ -410,29 +423,29 @@ export async function promptEdit(
         if ((i + 1) % 4 === 0) kbd.row();
       }
       kbd.text('🎲 Random', `tr:set:${sessionId}:Random`).row();
-      kbd.text('❌ Batal', `tr:v:${slug}`);
+      kbd.text('❌ Batal', `tr:v:${sh}`);
       kb = kbd;
       break;
     }
     case 'schedule_hour':
       prompt = `⏰ <b>Edit Jam</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${String(row.schedule_hour).padStart(2, '0')}:${String(row.schedule_minute ?? 0).padStart(2, '0')} WIB</b>\n\nKirim jam baru:\n<code>18</code> / <code>18:30</code> / <code>18.15</code>`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
     case 'last_ep':
       prompt = `📼 <b>Edit Last Episode</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.last_ep}</b>\n\nKirim angka last_ep baru (0 = reset):`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
     case 'chunk':
       prompt = `📦 <b>Edit Chunk</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.chunk_start}-${row.chunk_end}</b>\n\nKirim range: <code>2-6</code>`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
     case 'buffer_min':
       prompt = `⏱️ <b>Edit Buffer</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.buffer_min}</b> menit\n\nKirim buffer baru (5-480):`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
     case 'source_slug':
       prompt = `🔗 <b>Edit Source Slug</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <code>${escapeHtml(row.source_slug)}</code>\n\nKirim slug baru, atau URL Samehadaku:`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
     default:
       await ctx.answerCallbackQuery({ text: '❌ Field tidak dikenal' }).catch(() => {});
@@ -804,30 +817,30 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await handleCatchup(ctx, env);
   });
   bot.callbackQuery(/^tr:lp:(\d+)$/, async (ctx) => {
-  	const page = parseInt(ctx.match[1] ?? '0', 10);
-  	try {
-    	await ctx.answerCallbackQuery({ text: `📄 Hal. ${page + 1}` });
-  	} catch {}
-  	try {
-    	await showList(ctx, env, page);
-  	} catch (err) {
-    	console.error('[Track] pagination failed:', err);
-    	const msg = err instanceof Error ? err.message : 'unknown';
-    	await ctx.reply(`❌ Pagination error: <code>${msg.slice(0, 200)}</code>`, {
-      	parse_mode: 'HTML',
-    	}).catch(() => {});
-  	}
+    const page = parseInt(ctx.match[1] ?? '0', 10);
+    try { await ctx.answerCallbackQuery({ text: `📄 Hal ${page + 1}` }); } catch {}
+    try {
+      await showList(ctx, env, page);
+    } catch (err) {
+      console.error('[Track] pagination failed:', err);
+      const msg = err instanceof Error ? err.message : 'unknown';
+      await ctx.reply(`❌ Pagination error: <code>${msg.slice(0, 200)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    }
   });
   bot.callbackQuery(/^tr:v:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
     await ctx.answerCallbackQuery().catch(() => {});
     await showDetail(ctx, env, slug, true);
   });
   bot.callbackQuery(/^tr:e:(.+):(\w+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
+    const hash = ctx.match[1] ?? '';
     const field = ctx.match[2] ?? '';
     const userId = ctx.from?.id;
     if (!userId) return;
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
     await promptEdit(ctx, env, userId, slug, field);
   });
   bot.callbackQuery(/^tr:set:(ts_[a-z0-9]+):(.+)$/, async (ctx) => {
@@ -854,7 +867,9 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await showDetail(ctx, env, session.slug, true);
   });
   bot.callbackQuery(/^tr:cx:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
     await ctx.answerCallbackQuery({ text: '🔄' });
     const loading = await ctx.reply(`🔍 Cek <code>${escapeHtml(slug)}</code>...`, {
       parse_mode: 'HTML', link_preview_options: { is_disabled: true },
@@ -874,7 +889,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
       }
       await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
         parse_mode: 'HTML', link_preview_options: { is_disabled: true },
-        reply_markup: new InlineKeyboard().text('◀️ Kembali', `tr:v:${slug}`),
+        reply_markup: new InlineKeyboard().text('◀️ Kembali', `tr:v:${hashSlug(slug)}`),
       }).catch(() => {});
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'unknown';
@@ -884,25 +899,31 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     }
   });
   bot.callbackQuery(/^tr:rs:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
     await updateTrackedAnime(env.DB, slug, { last_ep: 0, chunk_start: 0, chunk_end: 0 });
     await ctx.answerCallbackQuery({ text: '♻️ Reset' });
     await showDetail(ctx, env, slug, true);
   });
   bot.callbackQuery(/^tr:dv:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
     await ctx.answerCallbackQuery({ text: '⚠️' });
     await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
       `⚠️ <b>Hapus anime?</b>\n\n<code>${escapeHtml(slug)}</code>`,
       {
         parse_mode: 'HTML', link_preview_options: { is_disabled: true },
         reply_markup: new InlineKeyboard()
-          .text('✅ Ya, Hapus', `tr:dvy:${slug}`)
-          .text('❌ Batal', `tr:v:${slug}`),
+          .text('✅ Ya, Hapus', `tr:dvy:${hash}`)
+          .text('❌ Batal', `tr:v:${hash}`),
       }).catch(() => {});
   });
   bot.callbackQuery(/^tr:dvy:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
     await deleteTrackedAnime(env.DB, slug);
     await ctx.answerCallbackQuery({ text: '🗑️' });
     await showList(ctx, env, 0);
