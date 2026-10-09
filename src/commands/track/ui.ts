@@ -6,6 +6,7 @@ import type { TrackSessionRow } from './state';
 export const SITE_LABELS: Record<string, string> = {
   lexanime: '🎬 lexanime',
   animesub: '🎬 animesub',
+  samehadaku: '🎬 samehadaku',
 };
 
 export const DAYS_ORDER = [
@@ -23,6 +24,8 @@ export function buildSiteKeyboard(sessionId: string): InlineKeyboard {
   return new InlineKeyboard()
     .text('🎬 lexanime', `tr:site:${sessionId}:lexanime`)
     .text('🎬 animesub', `tr:site:${sessionId}:animesub`)
+    .row()
+    .text('🎬 samehadaku', `tr:site:${sessionId}:samehadaku`)
     .row()
     .text('❌ Batal', `tr:x:${sessionId}`);
 }
@@ -68,6 +71,18 @@ export function buildSourceSlugPrompt(
   qimochiSlug: string,
   site: string
 ): string {
+  if (site === 'samehadaku') {
+    return (
+      `<b>Step 3/5</b> · Slug di <b>${escapeHtml(site)}</b>\n\n` +
+      `🆔 Qimochi: <code>${escapeHtml(qimochiSlug)}</code>\n\n` +
+      `<b>Opsi input:</b>\n` +
+      `• Kirim <b>URL anime</b> Samehadaku, contoh:\n` +
+      `<code>https://samehadaku.li/anime/tensei-goblin-dakedo-shitsumon-aru/</code>\n` +
+      `• Atau kirim <b>slug</b> langsung\n` +
+      `• Atau kirim <code>-</code> kalau sama dengan qimochi`
+    );
+  }
+
   return (
     `<b>Step 3/5</b> · Slug di <b>${escapeHtml(site)}</b> beda dengan qimochi?\n\n` +
     `🆔 Qimochi: <code>${escapeHtml(qimochiSlug)}</code>\n\n` +
