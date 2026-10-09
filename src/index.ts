@@ -1,3 +1,4 @@
+=== FILE: src/index.ts ===
 import { Bot, webhookCallback } from 'grammy';
 import type { Env } from './types/env';
 import { registerCommands } from './commands/registry';
@@ -16,10 +17,8 @@ import { setupPostCallbacks } from './commands/post';
 import { setupKillCallbacks } from './commands/kill';
 import { setupEditCallbacks } from './commands/edit/callbacks';
 import { handleEditTextInput } from './commands/edit';
-import {
-  setupTrackCallbacks,
-  handleTrackInput,
-} from './commands/track';
+import { handleTrackTextV2 } from './commands/track';
+import { setupTrackCmsCallbacks } from './commands/track-callbacks';
 import { COMMANDS } from './commands/list';
 
 const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
@@ -48,7 +47,7 @@ function createBot(env: Env): Bot {
   setupPublishCallbacks(bot, env);
   setupPostCallbacks(bot, env);
   setupKillCallbacks(bot, env);
-  setupTrackCallbacks(bot, env);
+  setupTrackCmsCallbacks(bot, env);
   setupEditCallbacks(bot, env);
 
   bot.on('message:text', async (ctx) => {
@@ -56,11 +55,11 @@ function createBot(env: Env): Bot {
     if (ctx.chat?.type !== 'private') return;
 
     try {
+      const handledTrackV2 = await handleTrackTextV2(ctx, env);
+      if (handledTrackV2) return;
+
       const handledEdit = await handleEditTextInput(ctx, env);
       if (handledEdit) return;
-
-      const handledTrack = await handleTrackInput(ctx, env);
-      void handledTrack;
     } catch (err) {
       console.error('[Text] handler error:', err);
     }
@@ -266,7 +265,7 @@ export default {
   ): Promise<void> {
     const cron = event.cron;
     console.log(`[Cron] trigger: ${cron}`);
-      
+
     if (cron === '0 3 * * *') {
       try {
         const cleaned = await cleanupCache(env.DB);
@@ -329,3 +328,4 @@ export default {
     console.warn(`[Cron] unknown trigger: ${cron}`);
   },
 };
+=== END ===
