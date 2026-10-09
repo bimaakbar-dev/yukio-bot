@@ -22,13 +22,11 @@ jobs:
           python3 << 'PYEOF'
           import os, re
 
-          # 1. Delete track-callbacks.ts
           for p in ['src/commands/track-callbacks.ts']:
               if os.path.exists(p):
                   os.remove(p)
                   print(f'OK: deleted {p}')
 
-          # 2. Fix index.ts
           p = 'src/index.ts'
           with open(p) as f:
               content = f.read()
@@ -60,19 +58,16 @@ jobs:
               f.write(content)
           print('OK: fixed index.ts')
 
-          # 3. Fix track.ts
           p = 'src/commands/track.ts'
           with open(p) as f:
               content = f.read()
 
-          # 3a. Convert 4-arg editMessageText to api.editMessageText
           content = re.sub(
               r'(?<!\.api)editMessageText\(',
               'api.editMessageText(',
               content
           )
 
-          # 3b. Remove unused import
           content = re.sub(r'\s*type TrackedAnimeRow,', '', content)
 
           with open(p, 'w') as f:
@@ -88,4 +83,4 @@ jobs:
           else
             git commit -m "fix: track cms integration v2"
             git push
-          fil
+          fi
