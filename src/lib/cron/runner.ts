@@ -23,10 +23,6 @@ import { fetchLatestEpisodeNumber, fetchEpisode } from './fetcher';
 
 const MAX_ANIME_PER_RUN = 5;
 
-/* ============================================================
-   CHUNK HELPERS
-   ============================================================ */
-
 function chunkPath(slug: string, start: number, end: number): string {
   return `src/data/anime/${slug}/episodes/${start}-${end}.json`;
 }
@@ -81,10 +77,6 @@ async function buildNewChunk(
   };
 }
 
-/* ============================================================
-   UPDATE MD (updatedAt field)
-   ============================================================ */
-
 async function updateQimochiMd(
   env: Env,
   slug: string
@@ -126,10 +118,6 @@ async function updateQimochiMd(
   }
 }
 
-/* ============================================================
-   PROCESS 1 ANIME
-   ============================================================ */
-
 interface ProcessResult {
   pushed: number;
   error: string | null;
@@ -154,7 +142,6 @@ async function processOneAnime(
   }
 
   if (latestEp === null) {
-    await setLastCheckAt(env.DB, slug);
     return { pushed: 0, error: `Semua site gagal cek latest ep untuk ${slug}` };
   }
 
@@ -258,12 +245,12 @@ async function processOneAnime(
     pushed++;
   }
 
+  if (!lastError) {
+    await setLastCheckAt(env.DB, slug);
+  }
+
   return { pushed, error: lastError };
 }
-
-/* ============================================================
-   RUNNER — dipanggil dari cron handler
-   ============================================================ */
 
 export interface CronRunResult {
   animeChecked: number;
@@ -321,10 +308,6 @@ export async function runCron(env: Env): Promise<CronRunResult> {
     errors,
   };
 }
-
-/* ============================================================
-   MANUAL CHECK — untuk /track check
-   ============================================================ */
 
 export async function runManualCheck(
   env: Env,
