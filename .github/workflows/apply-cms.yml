@@ -1,0 +1,83 @@
+name: Apply CMS Track
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply payload
+        run: |
+          if [ ! -f payload.txt ]; then
+            echo "❌ payload.txt not found"
+            exit 1
+          fi
+
+          python3 << 'PYEOF'
+          import re, os, sys
+
+          with open('payload.txt', 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          pattern = re.compile(
+              r'^=== FILE: (.+?) ===\n(.*?)\n=== END ===$',
+              re.MULTILINE | re.DOTALL
+          )
+
+          count = 0
+          for match in pattern.finditer(content):
+              path = match.group(1).strip()
+              body = match.group(2)
+
+              if not path or path.startswith('/'):
+                  print(f'❌ Invalid path: {path}')
+                  sys.exit(1)
+
+              dirn = os.path.dirname(path)
+              if dirn:
+                  os.makedirs(dirn, exist_ok=True)
+
+              with open(path, 'w', encoding='utf-8') as f:
+                  f.write(body)
+
+              print(f'✅ Wrote {path} ({len(body)} bytes)')
+              count += 1
+
+          if count == 0:
+              print('❌ No files matched')
+              sys.exit(1)
+
+          print(f'\n📦 Total: {count} files written')
+          PYEOF
+
+      - name: Cleanup payload
+        run: rm -f payload.txt
+
+      - name: Typecheck (optional)
+        run: |
+          npm install --silent 2>/dev/null || true
+          if [ -f tsconfig.json ]; then
+            npx tsc --noEmit 2>&1 | head -50 || echo "⚠️ typecheck skipped/failed"
+          fi
+
+      - name: Commit & push
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "ℹ️ No changes"
+          else
+            git commit -m "feat(track): CMS-style editor via bot"
+            git push
+          fi
