@@ -23,6 +23,29 @@ import {
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
 
 /* ============================================================
+   URL → SLUG EXTRACTION
+   ============================================================ */
+
+/**
+ * Extract slug dari URL Samehadaku.
+ * - Anime: https://samehadaku.li/anime/{slug}/
+ * - Episode: https://samehadaku.li/{slug}-episode-{n}-subtitle-indonesia/
+ */
+function extractSamehadakuSlug(url: string): string | null {
+  const trimmed = url.trim();
+
+  const animeMatch = trimmed.match(/\/anime\/([a-z0-9-]+)\/?/i);
+  if (animeMatch?.[1]) return animeMatch[1].toLowerCase();
+
+  const epMatch = trimmed.match(
+    /\/([a-z0-9-]+?)-episode-\d+-subtitle-indonesia\/?/i
+  );
+  if (epMatch?.[1]) return epMatch[1].toLowerCase();
+
+  return null;
+}
+
+/* ============================================================
    TEXT INPUT HANDLER
    ============================================================ */
 
@@ -106,12 +129,41 @@ async function handleSourceSlugInput(
   session: TrackSessionRow,
   input: string
 ): Promise<void> {
-  const sourceSlug = input === '-' ? session.slug ?? '' : input;
+  let sourceSlug: string;
+
+  if (input === '-') {
+    sourceSlug = session.slug ?? '';
+  } else if (session.site === 'samehadaku' && /^https?:\/\//i.test(input)) {
+    const extracted = extractSamehadakuSlug(input);
+    if (!extracted) {
+      await ctx.reply(
+        '❌ URL Samehadaku tidak valid.\n\n' +
+          'Format yang diterima:\n' +
+          '• <code>https://samehadaku.li/anime/{slug}/</code>\n' +
+          '• <code>https://samehadaku.li/{slug}-episode-N-subtitle-indonesia/</code>\n\n' +
+          'Coba lagi:',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return;
+    }
+
+    sourceSlug = extracted;
+
+    await ctx.reply(
+      `✅ Slug diekstrak: <code>${escapeHtml(sourceSlug)}</code>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+  } else {
+    sourceSlug = input.trim();
+  }
 
   if (!SLUG_RE.test(sourceSlug)) {
     await ctx.reply(
       '❌ Slug tidak valid. Hanya <code>a-z</code>, <code>0-9</code>, dan <code>-</code>.\n\n' +
-        'Atau kirim <code>-</code> kalau sama dengan qimochi.',
+        'Atau kirim <code>-</code> kalau sama dengan qimochi.\n' +
+        (session.site === 'samehadaku'
+          ? 'Atau kirim URL anime Samehadaku.'
+          : ''),
       { parse_mode: 'HTML' }
     );
     return;
@@ -259,8 +311,11 @@ export async function handleConfirmSave(
   }
 
   const site = session.site as SiteKey;
-  const fallbackSite: SiteKey | null =
-    site === 'lexanime' ? 'animesub' : 'lexanime';
+
+  let fallbackSite: SiteKey | null;
+  if (site === 'lexanime') fallbackSite = 'animesub';
+  else if (site === 'animesub') fallbackSite = 'lexanime';
+  else fallbackSite = null;
 
   try {
     await saveTrackedAnime(env.DB, {
