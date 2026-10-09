@@ -1,3 +1,4 @@
+
 // src/commands/track/flow.ts
 import type { Context } from 'grammy';
 import type { Env } from '../../types/env';
@@ -22,15 +23,6 @@ import {
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
 
-/* ============================================================
-   URL → SLUG EXTRACTION
-   ============================================================ */
-
-/**
- * Extract slug dari URL Samehadaku.
- * - Anime: https://samehadaku.li/anime/{slug}/
- * - Episode: https://samehadaku.li/{slug}-episode-{n}-subtitle-indonesia/
- */
 function extractSamehadakuSlug(url: string): string | null {
   const trimmed = url.trim();
 
@@ -44,10 +36,6 @@ function extractSamehadakuSlug(url: string): string | null {
 
   return null;
 }
-
-/* ============================================================
-   TEXT INPUT HANDLER
-   ============================================================ */
 
 export async function handleTrackTextInput(
   ctx: Context,
@@ -85,8 +73,7 @@ async function handleSlugInput(
 ): Promise<void> {
   if (!SLUG_RE.test(slug)) {
     await ctx.reply(
-      '❌ Slug tidak valid. Hanya <code>a-z</code>, <code>0-9</code>, dan <code>-</code>.\n\n' +
-        'Coba lagi:',
+      '❌ Slug tidak valid. Hanya <code>a-z</code>, <code>0-9</code>, dan <code>-</code>.\n\nCoba lagi:',
       { parse_mode: 'HTML' }
     );
     return;
@@ -146,9 +133,7 @@ async function handleSourceSlugInput(
       );
       return;
     }
-
     sourceSlug = extracted;
-
     await ctx.reply(
       `✅ Slug diekstrak: <code>${escapeHtml(sourceSlug)}</code>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
@@ -255,10 +240,6 @@ async function handleHourInput(
   });
 }
 
-/* ============================================================
-   CALLBACK HANDLERS
-   ============================================================ */
-
 export async function handleSitePick(
   ctx: Context,
   env: Env,
@@ -354,9 +335,7 @@ export async function handleConfirmSave(
   lines.push('✅ <b>Anime di-track!</b>');
   lines.push('');
   lines.push(`🆔 <code>${escapeHtml(session.slug)}</code>`);
-  lines.push(
-    `🎬 ${site}${fallbackSite ? ` (fallback: ${fallbackSite})` : ''}`
-  );
+  lines.push(`🎬 ${site}${fallbackSite ? ` (fallback: ${fallbackSite})` : ''}`);
   lines.push(`📅 ${session.schedule_day} ${hh}:${mm} WIB`);
   lines.push('');
   lines.push(
