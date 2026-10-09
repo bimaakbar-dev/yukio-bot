@@ -7,7 +7,6 @@ import { escapeHtml } from '../lib/utils';
 import {
   deleteTrackedAnime,
   listAllTrackedAnime,
-  listTrackedAnime,
   setTrackedStatus,
   updateTrackedSourceSlug,
   formatScheduleTime,
