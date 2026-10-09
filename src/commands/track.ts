@@ -12,7 +12,6 @@ import {
   saveTrackedAnime,
   isInScheduleWindow,
   type SiteKey,
-  type TrackedAnimeRow,
 } from '../lib/cron/state';
 import { updateTrackedAnime } from '../lib/cron/state-extra';
 import { createLazyInit } from '../lib/lazy-init';
@@ -208,7 +207,7 @@ export async function showMainMenu(
 
   if (edit && ctx.callbackQuery?.message?.message_id) {
     await ctx
-      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
+      .api.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
       .catch(() => {});
     return;
   }
@@ -227,7 +226,7 @@ export async function showList(ctx: Context, env: Env, page = 0): Promise<void> 
       reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:h'),
     };
     if (ctx.callbackQuery?.message?.message_id) {
-      await ctx.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, '📭 Belum ada anime.', payload).catch(() => {});
+      await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, '📭 Belum ada anime.', payload).catch(() => {});
     } else {
       await ctx.reply('📭 Belum ada anime.', payload);
     }
@@ -268,7 +267,7 @@ export async function showList(ctx: Context, env: Env, page = 0): Promise<void> 
   };
 
   if (ctx.callbackQuery?.message?.message_id) {
-    await ctx.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload).catch(() => {});
+    await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload).catch(() => {});
     return;
   }
   await ctx.reply(lines.join('\n'), payload);
@@ -338,7 +337,7 @@ export async function showDetail(
 
   if (edit && ctx.callbackQuery?.message?.message_id) {
     await ctx
-      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
+      .api.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
       .catch(() => {});
     return;
   }
@@ -428,7 +427,7 @@ export async function promptEdit(
 
   await ctx.answerCallbackQuery().catch(() => {});
   await ctx
-    .editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, prompt, {
+    .api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, prompt, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
       reply_markup: kb,
@@ -462,7 +461,7 @@ export async function startAddFlow(
 
   if (ctx.callbackQuery?.message?.message_id) {
     await ctx
-      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, text, payload)
+      .api.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, text, payload)
       .catch(() => {});
     return;
   }
@@ -477,7 +476,7 @@ export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
     const candidates = active.filter(isInScheduleWindow);
 
     if (candidates.length === 0) {
-      await ctx.api.editMessageText(
+      await ctx.api.api.editMessageText(
         ctx.chat!.id, loading.message_id,
         `✅ <b>Semua anime up-to-date.</b>\n\n<i>Total aktif: ${active.length}.</i>`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true },
@@ -494,7 +493,7 @@ export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
 
     for (let i = 0; i < batch.length; i++) {
       const row = batch[i]!;
-      await ctx.api.editMessageText(
+      await ctx.api.api.editMessageText(
         ctx.chat!.id, loading.message_id,
         `🔄 <b>Catch-up</b> [${i + 1}/${batch.length}]\n\n🎬 <code>${escapeHtml(row.slug)}</code>`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
@@ -535,11 +534,11 @@ export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
     const kb = new InlineKeyboard();
     if (remaining > 0) kb.text('🔄 Lanjut', 'tr:c').row();
     kb.text('🏠 Menu', 'tr:h');
-    await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+    await ctx.api.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
       parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb,
     }).catch(() => {});
   } catch (err: any) {
-    await ctx.api.editMessageText(
+    await ctx.api.api.editMessageText(
       ctx.chat!.id, loading.message_id,
       `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
       { parse_mode: 'HTML' }
@@ -739,12 +738,12 @@ export const trackCommand: CommandDefinition = {
           lines.push('⚠️ <b>Error:</b>');
           for (const e of result.errors) lines.push(`• <code>${escapeHtml(e.slice(0, 200))}</code>`);
         }
-        await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+        await ctx.api.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
           parse_mode: 'HTML', link_preview_options: { is_disabled: true },
           reply_markup: new InlineKeyboard().text('🏠 Menu', 'tr:h'),
         }).catch(() => {});
       } catch (err: any) {
-        await ctx.api.editMessageText(
+        await ctx.api.api.editMessageText(
           ctx.chat!.id, loading.message_id,
           `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
           { parse_mode: 'HTML' }
@@ -834,12 +833,12 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
         lines.push('⚠️ <b>Error:</b>');
         for (const e of result.errors.slice(0, 3)) lines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
       }
-      await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+      await ctx.api.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
         parse_mode: 'HTML', link_preview_options: { is_disabled: true },
         reply_markup: new InlineKeyboard().text('◀️ Kembali', `tr:v:${slug}`),
       }).catch(() => {});
     } catch (err: any) {
-      await ctx.api.editMessageText(ctx.chat!.id, loading.message_id,
+      await ctx.api.api.editMessageText(ctx.chat!.id, loading.message_id,
         `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}</code>`,
         { parse_mode: 'HTML' }).catch(() => {});
     }
@@ -853,7 +852,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^tr:dv:(.+)$/, async (ctx) => {
     const slug = ctx.match[1] ?? '';
     await ctx.answerCallbackQuery({ text: '⚠️' });
-    await ctx.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
+    await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
       `⚠️ <b>Hapus anime?</b>\n\n<code>${escapeHtml(slug)}</code>`,
       {
         parse_mode: 'HTML', link_preview_options: { is_disabled: true },
@@ -927,7 +926,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     if (ctx.from?.id !== session.user_id) { await ctx.answerCallbackQuery({ text: '⛔' }); return; }
     await updateSession(env.DB, sessionId, { site, step: 'add_slug' });
     await ctx.answerCallbackQuery({ text: site });
-    await ctx.editMessageText(
+    await ctx.api.editMessageText(
       '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>',
       {
         parse_mode: 'HTML', link_preview_options: { is_disabled: true },
@@ -943,7 +942,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     if (ctx.from?.id !== session.user_id) { await ctx.answerCallbackQuery({ text: '⛔' }); return; }
     await updateSession(env.DB, sessionId, { schedule_day: day, step: 'add_hour' });
     await ctx.answerCallbackQuery({ text: day });
-    await ctx.editMessageText(
+    await ctx.api.editMessageText(
       `<b>Step 5/5</b> · Hari: <b>${day}</b>\n\nKirim <b>jam rilis</b> (WIB):\n\n• <code>18</code> → 18:00\n• <code>18:30</code> → 18:30\n• <code>18.15</code> → 18:15`,
       {
         parse_mode: 'HTML', link_preview_options: { is_disabled: true },
@@ -971,7 +970,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: '✅ Tersimpan' });
     const hh = String(session.schedule_hour).padStart(2, '0');
     const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
-    await ctx.editMessageText(
+    await ctx.api.editMessageText(
       `✅ <b>Anime di-track!</b>\n\n🆔 <code>${escapeHtml(session.slug)}</code>\n🎬 ${site}\n📅 ${session.schedule_day} ${hh}:${mm} WIB`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: undefined }
     ).catch(() => {});
@@ -980,7 +979,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     const sessionId = ctx.match[1] ?? '';
     await deleteSession(env.DB, sessionId);
     await ctx.answerCallbackQuery({ text: '🗑️' });
-    await ctx.editMessageText('❌ <b>Dibatalkan.</b>', { parse_mode: 'HTML', reply_markup: undefined }).catch(() => {});
+    await ctx.api.editMessageText('❌ <b>Dibatalkan.</b>', { parse_mode: 'HTML', reply_markup: undefined }).catch(() => {});
   });
 }
 
@@ -994,7 +993,7 @@ async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
   for (const r of all) { if (r.site in counts) counts[r.site]++; }
   const total = counts.lexanime + counts.animesub + counts.samehadaku;
   if (total === 0) {
-    await ctx.editMessageText('📭 Belum ada anime.', {
+    await ctx.api.editMessageText('📭 Belum ada anime.', {
       parse_mode: 'HTML', link_preview_options: { is_disabled: true },
       reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:h'),
     }).catch(() => {});
@@ -1005,7 +1004,7 @@ async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
   if (counts.animesub > 0) kb.text(`🎬 animesub (${counts.animesub})`, 'tr:ds:animesub').row();
   if (counts.samehadaku > 0) kb.text(`🎬 samehadaku (${counts.samehadaku})`, 'tr:ds:samehadaku').row();
   kb.text('◀️ Kembali', 'tr:h');
-  await ctx.editMessageText(
+  await ctx.api.editMessageText(
     `🗑️ <b>Hapus Anime</b>\n\nTotal: <b>${total}</b>\n\n<i>Pilih situs:</i>`,
     { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb }
   ).catch(() => {});
@@ -1015,7 +1014,7 @@ async function showDeleteSite(ctx: Context, env: Env, site: SiteKey): Promise<vo
   const all = await listAllTrackedAnime(env.DB);
   const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
   if (list.length === 0) {
-    await ctx.editMessageText(`📭 Tidak ada anime dari <b>${site}</b>.`, {
+    await ctx.api.editMessageText(`📭 Tidak ada anime dari <b>${site}</b>.`, {
       parse_mode: 'HTML', link_preview_options: { is_disabled: true },
       reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:dm'),
     }).catch(() => {});
@@ -1034,7 +1033,7 @@ async function showDeleteSite(ctx: Context, env: Env, site: SiteKey): Promise<vo
     .text('☑️ Pilih Satu-satu', `tr:dsel:${site}`)
     .row()
     .text('◀️ Kembali', 'tr:dm');
-  await ctx.editMessageText(lines.join('\n'), {
+  await ctx.api.editMessageText(lines.join('\n'), {
     parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb,
   }).catch(() => {});
 }
@@ -1051,7 +1050,7 @@ async function confirmDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<
   if (list.length > 10) lines.push(`<i>… dan ${list.length - 10} lainnya</i>`);
   lines.push('');
   lines.push('<b>⚠️ Tidak bisa dibatalkan.</b>');
-  await ctx.editMessageText(lines.join('\n'), {
+  await ctx.api.editMessageText(lines.join('\n'), {
     parse_mode: 'HTML', link_preview_options: { is_disabled: true },
     reply_markup: new InlineKeyboard()
       .text('✅ Ya, Hapus Semua', `tr:dally:${site}`)
@@ -1067,7 +1066,7 @@ async function execDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<voi
     const ok = await deleteTrackedAnime(env.DB, r.slug);
     if (ok) deleted++;
   }
-  await ctx.editMessageText(
+  await ctx.api.editMessageText(
     `✅ <b>Hapus selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${escapeHtml(site)}</b>`,
     {
       parse_mode: 'HTML', link_preview_options: { is_disabled: true },
@@ -1097,7 +1096,7 @@ async function showDeleteSelect(ctx: Context, env: Env, site: SiteKey, mask: num
   });
   kb.text(`🗑️ Hapus (${selected})`, `tr:dgo:${site}:${mask}`)
     .text('❌ Batal', `tr:ds:${site}`);
-  await ctx.editMessageText(
+  await ctx.api.editMessageText(
     `☑️ <b>Pilih — ${escapeHtml(site)}</b>\n\nTotal: <b>${list.length}</b> · Dipilih: <b>${selected}</b>\n\n<i>Tap untuk toggle.</i>`,
     { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb }
   ).catch(() => {});
@@ -1124,7 +1123,7 @@ async function confirmDeleteSelected(ctx: Context, env: Env, site: SiteKey, mask
   lines.push('');
   for (const r of selected.slice(0, 15)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
   await ctx.answerCallbackQuery({ text: '⚠️' });
-  await ctx.editMessageText(lines.join('\n'), {
+  await ctx.api.editMessageText(lines.join('\n'), {
     parse_mode: 'HTML', link_preview_options: { is_disabled: true },
     reply_markup: new InlineKeyboard()
       .text('✅ Ya, Hapus', `tr:dgy:${site}:${mask}`)
@@ -1143,7 +1142,7 @@ async function execDeleteSelected(ctx: Context, env: Env, site: SiteKey, mask: n
     const ok = await deleteTrackedAnime(env.DB, r.slug);
     if (ok) deleted++;
   }
-  await ctx.editMessageText(
+  await ctx.api.editMessageText(
     `✅ <b>Selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${escapeHtml(site)}</b>`,
     {
       parse_mode: 'HTML', link_preview_options: { is_disabled: true },

@@ -16,8 +16,7 @@ import { setupPostCallbacks } from './commands/post';
 import { setupKillCallbacks } from './commands/kill';
 import { setupEditCallbacks } from './commands/edit/callbacks';
 import { handleEditTextInput } from './commands/edit';
-import { handleTrackTextV2 } from './commands/track';
-import { setupTrackCmsCallbacks } from './commands/track-callbacks';
+import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';
 import { COMMANDS } from './commands/list';
 
 const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
@@ -46,7 +45,7 @@ function createBot(env: Env): Bot {
   setupPublishCallbacks(bot, env);
   setupPostCallbacks(bot, env);
   setupKillCallbacks(bot, env);
-  setupTrackCmsCallbacks(bot, env);
+  setupTrackCallbacks(bot, env);
   setupEditCallbacks(bot, env);
 
   bot.on('message:text', async (ctx) => {
