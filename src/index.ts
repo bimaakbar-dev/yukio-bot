@@ -30,9 +30,7 @@ function createBot(env: Env): Bot {
 
   bot.command('start', async (ctx) => {
     await ctx.reply(
-      '🤖 <b>Yukio Bot</b>\n' +
-        '<i>Personal assistant</i>\n\n' +
-        'Ketik /help untuk lihat command.',
+      '🤖 <b>Yukio Bot</b>\n<i>Personal assistant</i>\n\nKetik /help untuk lihat command.',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
   });
@@ -51,11 +49,9 @@ function createBot(env: Env): Bot {
   bot.on('message:text', async (ctx) => {
     if (!isAdmin(ctx.from?.id, env)) return;
     if (ctx.chat?.type !== 'private') return;
-
     try {
       const handledTrackV2 = await handleTrackTextV2(ctx, env);
       if (handledTrackV2) return;
-
       const handledEdit = await handleEditTextInput(ctx, env);
       if (handledEdit) return;
     } catch (err) {
@@ -68,10 +64,8 @@ function createBot(env: Env): Bot {
     if (caption.startsWith('/')) return;
     if (ctx.chat?.type !== 'private') return;
     if (!isAdmin(ctx.from?.id, env)) return;
-
     const name = ctx.message.document.file_name ?? '';
     if (!/\.(html?|txt)$/i.test(name)) return;
-
     try {
       await handleDocumentAuto(ctx, env);
     } catch (err) {
@@ -90,46 +84,29 @@ function createBot(env: Env): Bot {
 async function applyBotCommands(
   bot: Bot
 ): Promise<{ commands: { command: string; description: string }[]; skipped: string[] }> {
-  const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map(
-    (c) => ({
-      command: c.name,
-      description: (c.description || c.name).slice(0, 256),
-    })
-  );
-
-  const skipped = COMMANDS.filter(
-    (c) => !COMMAND_NAME_RE.test(c.name)
-  ).map((c) => c.name);
-
-  if (skipped.length > 0) {
-    console.warn(
-      `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
-    );
-  }
-
+  const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map((c) => ({
+    command: c.name,
+    description: (c.description || c.name).slice(0, 256),
+  }));
+  const skipped = COMMANDS.filter((c) => !COMMAND_NAME_RE.test(c.name)).map((c) => c.name);
+  if (skipped.length > 0) console.warn(`[Bot] Skipped: ${skipped.join(', ')}`);
   await bot.api.setMyCommands(commands);
-
   return { commands, skipped };
 }
 
 async function setupBotMenu(bot: Bot, token: string): Promise<void> {
   if (menuSetForToken === token) return;
-
   try {
     const { commands } = await applyBotCommands(bot);
     menuSetForToken = token;
-    console.log(`[Bot] setMyCommands: ${commands.length} commands registered`);
+    console.log(`[Bot] setMyCommands: ${commands.length} commands`);
   } catch (err) {
     console.error('[Bot] setMyCommands failed:', err);
   }
 }
 
 async function getBot(env: Env): Promise<Bot> {
-  if (!cachedBot) {
-    console.log('[Bot] creating new instance');
-    cachedBot = createBot(env);
-  }
-
+  if (!cachedBot) { cachedBot = createBot(env); }
   if (!initPromise) {
     const t0 = Date.now();
     initPromise = cachedBot
@@ -139,32 +116,23 @@ async function getBot(env: Env): Promise<Bot> {
         await setupBotMenu(cachedBot!, env.TELEGRAM_BOT_TOKEN);
       })
       .catch((err) => {
-        console.error(`[Bot] init FAILED in ${Date.now() - t0}ms:`, err);
+        console.error(`[Bot] init FAILED:`, err);
         initPromise = null;
         cachedBot = null;
         throw err;
       });
   }
-
   await initPromise;
   return cachedBot;
 }
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/health' || url.pathname === '/') {
       return new Response(
-        JSON.stringify({
-          status: 'ok',
-          bot: 'yukio-bot',
-          timestamp: new Date().toISOString(),
-        }),
+        JSON.stringify({ status: 'ok', bot: 'yukio-bot', timestamp: new Date().toISOString() }),
         { headers: { 'Content-Type': 'application/json' } }
       );
     }
@@ -172,67 +140,23 @@ export default {
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
-        const res = await fetch(
-          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`
-        );
+        const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`);
         const data = await res.json();
         return new Response(
-          JSON.stringify(
-            { ok: res.ok, status: res.status, elapsed: Date.now() - t0, data },
-            null,
-            2
-          ),
+          JSON.stringify({ ok: res.ok, status: res.status, elapsed: Date.now() - t0, data }, null, 2),
           { headers: { 'Content-Type': 'application/json' } }
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
         return new Response(
-          JSON.stringify({
-            ok: false,
-            elapsed: Date.now() - t0,
-            error: err?.message ?? String(err),
-          }),
+          JSON.stringify({ ok: false, elapsed: Date.now() - t0, error: msg }),
           { status: 500, headers: { 'Content-Type': 'application/json' } }
         );
       }
     }
 
-    if (url.pathname === '/debug/gh-app') {
-      try {
-        const { getInstallationToken } = await import('./lib/github-app');
-        const token = await getInstallationToken(env);
-
-        return new Response(
-          JSON.stringify(
-            {
-              ok: true,
-              tokenPreview: token.slice(0, 20) + '...',
-              tokenLength: token.length,
-              appId: env.GH_APP_ID,
-              installationId: env.GH_APP_INSTALLATION_ID,
-            },
-            null,
-            2
-          ),
-          { headers: { 'Content-Type': 'application/json' } }
-        );
-      } catch (err: any) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error: err?.message ?? String(err),
-          }),
-          { status: 500, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-
-    if (url.pathname === '/discord/register') {
-      return registerDiscordCommands(env);
-    }
-
-    if (url.pathname === '/discord') {
-      return handleDiscordRequest(request, env, ctx);
-    }
+    if (url.pathname === '/discord/register') return registerDiscordCommands(env);
+    if (url.pathname === '/discord') return handleDiscordRequest(request, env, ctx);
 
     if (url.pathname === '/webhook') {
       const t0 = Date.now();
@@ -245,84 +169,61 @@ export default {
         const res = await handler(request);
         console.log(`[Worker] webhook done in ${Date.now() - t0}ms`);
         return res;
-      } catch (err: any) {
-        console.error(
-          `[Worker] webhook error after ${Date.now() - t0}ms:`,
-          err?.message ?? err
-        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[Worker] webhook error after ${Date.now() - t0}ms:`, msg);
         return new Response('OK', { status: 200 });
       }
     }
     return new Response('Not Found', { status: 404 });
   },
 
-  async scheduled(
-    event: ScheduledEvent,
-    env: Env,
-    _ctx: ExecutionContext
-  ): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     const cron = event.cron;
     console.log(`[Cron] trigger: ${cron}`);
 
     if (cron === '0 3 * * *') {
       try {
         const cleaned = await cleanupCache(env.DB);
-        console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
+        console.log(`[Cron] Cleaned ${cleaned}`);
       } catch (err) {
         console.error('[Cron] cleanup error:', err);
       }
       return;
     }
+
     if (cron === '0 23 * * *' || cron === '0 11 * * *') {
       try {
         const { runCron } = await import('./lib/cron/runner');
         const result = await runCron(env);
-
         const summaryLines: string[] = [];
-        summaryLines.push(
-          `<b>📡 Cron Episode Report</b>\n` +
-            `🕐 <code>${cron}</code>\n`
-        );
-        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b> anime`);
-        summaryLines.push(
-          `📼 Push: <b>${result.episodesPushed}</b> episode baru`
-        );
-
+        summaryLines.push(`<b>📡 Cron Episode Report</b>\n🕐 <code>${cron}</code>\n`);
+        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
+        summaryLines.push(`📼 Push: <b>${result.episodesPushed}</b>`);
         if (result.errors.length > 0) {
           summaryLines.push('');
           summaryLines.push(`⚠️ <b>Error (${result.errors.length}):</b>`);
-          for (const e of result.errors.slice(0, 5)) {
+          for (const e of result.errors.slice(0, 5))
             summaryLines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
-          }
-          if (result.errors.length > 5) {
-            summaryLines.push(
-              `<i>…dan ${result.errors.length - 5} lainnya</i>`
-            );
-          }
+          if (result.errors.length > 5)
+            summaryLines.push(`<i>…dan ${result.errors.length - 5}</i>`);
         }
         try {
           const { Bot: BotCtor } = await import('grammy');
           const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
-          await bot.api.sendMessage(
-            env.ADMIN_USER_ID,
-            summaryLines.join('\n'),
-            {
-              parse_mode: 'HTML',
-              link_preview_options: { is_disabled: true },
-            }
-          );
+          await bot.api.sendMessage(env.ADMIN_USER_ID, summaryLines.join('\n'), {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          });
         } catch (notifErr) {
           console.error('[Cron] notif error:', notifErr);
         }
-
-        console.log(
-          `[Cron] episode check done — pushed ${result.episodesPushed}, errors ${result.errors.length}`
-        );
+        console.log(`[Cron] done — pushed ${result.episodesPushed}, errors ${result.errors.length}`);
       } catch (err) {
-        console.error('[Cron] episode check error:', err);
+        console.error('[Cron] error:', err);
       }
       return;
     }
-    console.warn(`[Cron] unknown trigger: ${cron}`);
+    console.warn(`[Cron] unknown: ${cron}`);
   },
 };
