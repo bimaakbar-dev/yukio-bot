@@ -1,4 +1,3 @@
-=== FILE: src/index.ts ===
 import { Bot, webhookCallback } from 'grammy';
 import type { Env } from './types/env';
 import { registerCommands } from './commands/registry';
@@ -328,4 +327,3 @@ export default {
     console.warn(`[Cron] unknown trigger: ${cron}`);
   },
 };
-=== END ===
