@@ -386,9 +386,11 @@ export function dayNameToIndex(day: string): number {
 }
 
 export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
+  const COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
   if (row.schedule_day === 'Random') {
     if (!row.last_check_at) return true;
-    return Date.now() - row.last_check_at > 6 * 60 * 60 * 1000;
+    return Date.now() - row.last_check_at > COOLDOWN_MS;
   }
 
   const targetDay = dayNameToIndex(row.schedule_day);
@@ -410,7 +412,6 @@ export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
   if (daysAgo === 0 && nowTotalMin < targetTotalMin) {
     daysAgo = 7;
   }
-
   const todayWibStartMs =
     Date.UTC(wib.getUTCFullYear(), wib.getUTCMonth(), wib.getUTCDate()) -
     7 * 3600 * 1000;
@@ -419,11 +420,11 @@ export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
     todayWibStartMs -
     daysAgo * 24 * 3600 * 1000 +
     targetTotalMin * 60 * 1000;
-
   if (now.getTime() < scheduleMs) return false;
   if (!row.last_check_at) return true;
+  if (row.last_check_at >= scheduleMs) return false;
 
-  return row.last_check_at < scheduleMs;
+  return true;
 }
 
 export function formatScheduleTime(row: TrackedAnimeRow): string {
