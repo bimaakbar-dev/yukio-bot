@@ -2,10 +2,6 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { createLazyInit } from '../lazy-init';
 
-/* ============================================================
-   TYPES
-   ============================================================ */
-
 export type SiteKey = 'lexanime' | 'animesub';
 
 export interface TrackedAnimeRow {
@@ -43,10 +39,6 @@ export interface CronLogRow {
   episodes_pushed: number;
   errors_json: string;
 }
-
-/* ============================================================
-   LAZY INIT
-   ============================================================ */
 
 export const ensureCronDb = createLazyInit('Cron', async (db) => {
   await db
@@ -113,10 +105,6 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
     )
     .run();
 });
-
-/* ============================================================
-   TRACKED ANIME CRUD
-   ============================================================ */
 
 export interface SaveTrackedAnimeInput {
   slug: string;
@@ -294,9 +282,16 @@ export async function setLastCheckAt(
     .run();
 }
 
-/* ============================================================
-   PUBLISHED EPISODES
-   ============================================================ */
+export async function clearLastCheckAt(
+  db: D1Database,
+  slug: string
+): Promise<void> {
+  await ensureCronDb(db);
+  await db
+    .prepare('UPDATE tracked_anime SET last_check_at = NULL WHERE slug = ?')
+    .bind(slug)
+    .run();
+}
 
 export async function markEpisodePublished(
   db: D1Database,
@@ -349,10 +344,6 @@ export async function countEpisodesLast24h(
   return row?.c ?? 0;
 }
 
-/* ============================================================
-   CRON LOG
-   ============================================================ */
-
 export async function writeCronLog(
   db: D1Database,
   data: {
@@ -379,10 +370,6 @@ export async function writeCronLog(
     .run();
 }
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
 export const DAY_NAMES_ID = [
   'Minggu',
   'Senin',
@@ -399,22 +386,44 @@ export function dayNameToIndex(day: string): number {
 }
 
 export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
-  if (row.schedule_day === 'Random') return true;
-
-  const now = new Date();
-  const wibHour = (now.getUTCHours() + 7) % 24;
-  const wibMinute = now.getUTCMinutes();
-  const wibDay = now.getUTCDay();
+  if (row.schedule_day === 'Random') {
+    if (!row.last_check_at) return true;
+    return Date.now() - row.last_check_at > 6 * 60 * 60 * 1000;
+  }
 
   const targetDay = dayNameToIndex(row.schedule_day);
   if (targetDay === -1) return false;
-  if (wibDay !== targetDay) return false;
 
-  const nowTotal = wibHour * 60 + wibMinute;
-  const targetTotal =
+  const now = new Date();
+  const wibMs = now.getTime() + 7 * 3600 * 1000;
+  const wib = new Date(wibMs);
+  const wibDayIdx = wib.getUTCDay();
+  const wibHour = wib.getUTCHours();
+  const wibMinute = wib.getUTCMinutes();
+
+  let daysAgo = (wibDayIdx - targetDay + 7) % 7;
+
+  const targetTotalMin =
     row.schedule_hour * 60 + row.schedule_minute + row.buffer_min;
+  const nowTotalMin = wibHour * 60 + wibMinute;
 
-  return nowTotal >= targetTotal;
+  if (daysAgo === 0 && nowTotalMin < targetTotalMin) {
+    daysAgo = 7;
+  }
+
+  const todayWibStartMs =
+    Date.UTC(wib.getUTCFullYear(), wib.getUTCMonth(), wib.getUTCDate()) -
+    7 * 3600 * 1000;
+
+  const scheduleMs =
+    todayWibStartMs -
+    daysAgo * 24 * 3600 * 1000 +
+    targetTotalMin * 60 * 1000;
+
+  if (now.getTime() < scheduleMs) return false;
+  if (!row.last_check_at) return true;
+
+  return row.last_check_at < scheduleMs;
 }
 
 export function formatScheduleTime(row: TrackedAnimeRow): string {
