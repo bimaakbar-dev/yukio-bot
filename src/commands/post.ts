@@ -59,7 +59,7 @@ async function collectPostItems(
   if (batch) {
     const batchSlug = batch.chosen_slug ?? batch.slug_hint;
     if (batchSlug === slug) {
-      const path = `src/data/anime/${slug}/episodes/${batch.min_ep}-${batch.max_ep}.json`;
+      const path = `src/data/anime/${slug}/episodes/streams/${batch.min_ep}-${batch.max_ep}.json`;
       items.push({
         type: 'eps',
         path,
