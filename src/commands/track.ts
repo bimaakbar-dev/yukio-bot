@@ -12,7 +12,6 @@ import {
   saveTrackedAnime,
   isInScheduleWindow,
   type SiteKey,
-  type TrackedAnimeRow,
 } from '../lib/cron/state';
 import { updateTrackedAnime } from '../lib/cron/state-extra';
 import { createLazyInit } from '../lib/lazy-init';
