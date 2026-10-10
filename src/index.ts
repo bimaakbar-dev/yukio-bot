@@ -22,7 +22,7 @@ import { setupEditCallbacks } from './commands/edit/callbacks';
 import { handleEditTextInput } from './commands/edit';
 import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';
 import { COMMANDS } from './commands/list';
-import { databaseCommand, handleCmsText, setupCmsCallbacks } from './commands/cms';
+import { handleCmsText, setupCmsCallbacks } from './commands/cms';
 
 const COMMAND_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 
