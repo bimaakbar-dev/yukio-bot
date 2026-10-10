@@ -22,7 +22,7 @@ export function resolveRepo(
       return { repo: env.YUKIO_DATA_REPO, branch: env.YUKIO_DATA_BRANCH };
     case 'qimochi':
     default:
-      return { repo: env.GITHUB_REPO, branch: env.GITHUB_BRANCH };
+      return { repo: env.YUKIO_DATA_REPO, branch: env.YUKIO_DATA_BRANCH };
   }
 }
 
