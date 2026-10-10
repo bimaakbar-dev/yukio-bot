@@ -3,6 +3,7 @@ import type { Env } from '../../types/env';
 import type { EpisodeObject } from '../../types/anime';
 import {
   githubCommitMultipleFiles,
+  githubCommitFile,
   githubGetFile,
   type FileToCommit,
 } from '../github';
@@ -77,6 +78,10 @@ async function buildNewChunk(
   };
 }
 
+/**
+ * Update `updatedAt` di MD qimochi. Support format dengan / tanpa quote.
+ * Support format date-only (2026-10-10) DAN full ISO (2026-10-10T...).
+ */
 async function updateQimochiMd(
   env: Env,
   slug: string
@@ -85,7 +90,10 @@ async function updateQimochiMd(
 
   try {
     const mdFile = await githubGetFile(env, mdPath, 'qimochi');
-    if (!mdFile) return null;
+    if (!mdFile) {
+      console.warn(`[Runner] MD tidak ditemukan: ${mdPath}`);
+      return null;
+    }
 
     const today = new Date().toISOString().split('T')[0] ?? '2026-01-01';
     let mdContent = mdFile.content;
@@ -93,27 +101,24 @@ async function updateQimochiMd(
     if (/^updatedAt:\s*.+$/m.test(mdContent)) {
       mdContent = mdContent.replace(
         /^updatedAt:\s*.+$/m,
-        `updatedAt: ${today}`
+        `updatedAt: "${today}"`
       );
     } else if (/^addedAt:\s*.+$/m.test(mdContent)) {
       mdContent = mdContent.replace(
         /^(addedAt:\s*.+)$/m,
-        `$1\nupdatedAt: ${today}`
+        `$1\nupdatedAt: "${today}"`
       );
     } else {
       mdContent = mdContent.replace(
         /^---\s*$/m,
-        `updatedAt: ${today}\n---`
+        `updatedAt: "${today}"\n---`
       );
     }
 
-    return {
-      path: mdPath,
-      content: mdContent,
-      target: 'qimochi',
-    };
+    console.log(`[Runner] MD updated: ${mdPath} → ${today}`);
+    return { path: mdPath, content: mdContent, target: 'qimochi' };
   } catch (err) {
-    console.warn('[Runner] update md updatedAt failed:', err);
+    console.warn(`[Runner] updateQimochiMd failed for ${slug}:`, err);
     return null;
   }
 }
@@ -194,7 +199,8 @@ async function processOneAnime(
       break;
     }
 
-    const files: FileToCommit[] = [
+    /* STEP 1: commit chunk episode dulu (sendiri) */
+    const chunkFiles: FileToCommit[] = [
       {
         path: chunk.newPath,
         content: chunk.newContent,
@@ -202,29 +208,41 @@ async function processOneAnime(
       },
     ];
     if (chunk.oldPath) {
-      files.push({
+      chunkFiles.push({
         path: chunk.oldPath,
         content: null,
         target: 'qimochi',
       });
     }
 
-    const mdFile = await updateQimochiMd(env, slug);
-    if (mdFile) {
-      files.push(mdFile);
-    }
-
-    const message = `feat(episode): add ep ${ep} for ${slug}`;
-    const result = await githubCommitMultipleFiles(
+    const chunkCommit = await githubCommitMultipleFiles(
       env,
-      files,
-      message,
+      chunkFiles,
+      `feat(episode): add ep ${ep} for ${slug}`,
       'qimochi'
     );
 
-    if (!result.ok) {
-      lastError = `Commit gagal untuk ep ${ep}: ${result.error ?? 'unknown'}`;
+    if (!chunkCommit.ok) {
+      lastError = `Commit chunk gagal untuk ep ${ep}: ${chunkCommit.error ?? 'unknown'}`;
       break;
+    }
+
+    /* STEP 2: commit MD terpisah — supaya error di sini tidak ganggu chunk */
+    const mdFile = await updateQimochiMd(env, slug);
+    if (mdFile) {
+      const mdCommit = await githubCommitFile(
+        env,
+        mdFile.path,
+        mdFile.content,
+        `chore: bump updatedAt for ${slug} (ep ${ep})`,
+        'qimochi'
+      );
+      if (!mdCommit.ok) {
+        console.warn(
+          `[Runner] MD commit gagal untuk ep ${ep}: ${mdCommit.error}`
+        );
+        // Jangan break — chunk sudah ke-commit, biarkan lanjut ep berikutnya
+      }
     }
 
     const { chunkStart, chunkEnd } = await updateTrackedChunkState(
@@ -237,7 +255,7 @@ async function processOneAnime(
       slug,
       ep,
       usedSite,
-      result.sha ?? null
+      chunkCommit.sha ?? null
     );
 
     currentChunkStart = chunkStart;
@@ -282,8 +300,8 @@ export async function runCron(env: Env): Promise<CronRunResult> {
       episodesPushed += result.pushed;
       episodesFound += result.pushed;
       if (result.error) errors.push(`[${row.slug}] ${result.error}`);
-    } catch (err: any) {
-      const msg = err?.message ?? 'unknown';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'unknown';
       console.error(`[Cron] ${row.slug} error:`, msg);
       errors.push(`[${row.slug}] ${msg}`);
     }
