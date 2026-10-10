@@ -60,9 +60,7 @@ const ensureCmsSessionDb = createLazyInit('CmsSess', async (db) => {
 
   for (const col of ['slug', 'active_field', 'edits_json']) {
     try {
-      await db
-        .prepare(`ALTER TABLE cms_sessions ADD COLUMN ${col} TEXT`)
-        .run();
+      await db.prepare(`ALTER TABLE cms_sessions ADD COLUMN ${col} TEXT`).run();
     } catch {}
   }
 });
@@ -461,10 +459,7 @@ async function showDetailFromContent(
    EPISODES MENU
    ============================================================ */
 
-async function listJsonFiles(
-  env: Env,
-  path: string
-): Promise<string[]> {
+async function listJsonFiles(env: Env, path: string): Promise<string[]> {
   try {
     const dir = await githubListDir(env, path, 'yukio-data');
     return dir
@@ -481,12 +476,9 @@ async function showEpisodesMenu(
   env: Env,
   slug: string
 ): Promise<void> {
-  const metaPath = `data/anime/${slug}/episodes`;
-  const streamPath = `data/anime/${slug}/episodes/streams`;
-
   const [metaFiles, streamFiles] = await Promise.all([
-    listJsonFiles(env, metaPath),
-    listJsonFiles(env, streamPath),
+    listJsonFiles(env, `data/anime/${slug}/episodes`),
+    listJsonFiles(env, `data/anime/${slug}/episodes/streams`),
   ]);
 
   const lines = [
@@ -495,40 +487,26 @@ async function showEpisodesMenu(
     `📄 <b>Metadata</b> (${metaFiles.length}):`,
   ];
 
-  if (metaFiles.length === 0) {
-    lines.push('  <i>(kosong)</i>');
-  } else {
-    for (const f of metaFiles) {
-      lines.push(`  • <code>${escapeHtml(f)}</code>`);
-    }
-  }
+  if (metaFiles.length === 0) lines.push('  <i>(kosong)</i>');
+  else for (const f of metaFiles) lines.push(`  • <code>${escapeHtml(f)}</code>`);
 
   lines.push('');
   lines.push(`📺 <b>Streams</b> (${streamFiles.length}):`);
 
-  if (streamFiles.length === 0) {
-    lines.push('  <i>(kosong)</i>');
-  } else {
-    for (const f of streamFiles) {
+  if (streamFiles.length === 0) lines.push('  <i>(kosong)</i>');
+  else
+    for (const f of streamFiles)
       lines.push(`  • <code>${escapeHtml(f)}</code>`);
-    }
-  }
 
   lines.push('');
   lines.push('<i>Tap file untuk preview / hapus:</i>');
 
   const kb = new InlineKeyboard();
-
-  for (const f of metaFiles) {
-    kb.text(`📄 ${f}`, `cms:epv:${slug}:meta:${f}`).row();
-  }
-  for (const f of streamFiles) {
+  for (const f of metaFiles) kb.text(`📄 ${f}`, `cms:epv:${slug}:meta:${f}`).row();
+  for (const f of streamFiles)
     kb.text(`📺 ${f}`, `cms:epv:${slug}:streams:${f}`).row();
-  }
 
-  if (streamFiles.length === 0) {
-    kb.text('➕ Batch Baru', `cms:epb:${slug}`).row();
-  }
+  if (streamFiles.length === 0) kb.text('➕ Batch Baru', `cms:epb:${slug}`).row();
 
   kb.text('🔍 Refresh', `cms:ep:${slug}`)
     .text('◀️ Detail', `cms:view:${slug}`);
@@ -568,9 +546,7 @@ async function showChunkPreview(
   }
 
   let preview = file.content;
-  if (preview.length > 3000) {
-    preview = preview.slice(0, 3000) + '\n\n… [truncated]';
-  }
+  if (preview.length > 3000) preview = preview.slice(0, 3000) + '\n\n… [truncated]';
 
   const sizeKb = Math.round(file.content.length / 1024);
   const typeLabel = type === 'meta' ? '📄 Metadata' : '📺 Streams';
@@ -682,10 +658,7 @@ async function execDeleteChunk(
         `❌ <b>Gagal hapus</b>\n\n<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
         {
           parse_mode: 'HTML',
-          reply_markup: new InlineKeyboard().text(
-            '◀️ Kembali',
-            `cms:ep:${slug}`
-          ),
+          reply_markup: new InlineKeyboard().text('◀️ Kembali', `cms:ep:${slug}`),
         }
       )
       .catch(() => {});
@@ -731,7 +704,7 @@ async function showBatchShortcut(
     `3. Step 2, kirim URL source`,
     `4. Step 3, kirim range episode`,
     '',
-    '<i>Setelah selesai, balik ke sini → 🔍 Refresh untuk lihat file baru.</i>',
+    '<i>Setelah selesai, balik ke sini → 🔍 Refresh.</i>',
   ];
 
   const kb = new InlineKeyboard()
@@ -739,6 +712,244 @@ async function showBatchShortcut(
     .text('◀️ Detail', `cms:view:${slug}`);
 
   await ctx.answerCallbackQuery({ text: '🚀' });
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      ctx.callbackQuery!.message!.message_id!,
+      lines.join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    )
+    .catch(() => {});
+}
+
+/* ============================================================
+   HARD DELETE ANIME
+   ============================================================ */
+
+async function collectFolderFiles(
+  env: Env,
+  path: string,
+  depth = 0
+): Promise<string[]> {
+  if (depth > 3) return [];
+  const files: string[] = [];
+  try {
+    const items = await githubListDir(env, path, 'yukio-data');
+    for (const item of items) {
+      const child = `${path}/${item.name}`;
+      if (item.type === 'file') {
+        files.push(child);
+      } else if (item.type === 'dir') {
+        const sub = await collectFolderFiles(env, child, depth + 1);
+        files.push(...sub);
+      }
+    }
+  } catch {}
+  return files;
+}
+
+async function showDeleteConfirm(
+  ctx: Context,
+  env: Env,
+  slug: string
+): Promise<void> {
+  await ctx.answerCallbackQuery({ text: '🔍 Scan file...' });
+
+  const mdPath = `src/content/anime/${slug}.md`;
+  const md = await githubGetFile(env, mdPath, 'yukio-data').catch(() => null);
+  const dataFiles = await collectFolderFiles(env, `data/anime/${slug}`, 0);
+
+  const total = (md ? 1 : 0) + dataFiles.length;
+
+  if (total === 0) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery!.message!.message_id!,
+        `ℹ️ <b>Tidak ada file untuk dihapus</b>\n\n🆔 <code>${escapeHtml(slug)}</code>`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard().text(
+            '◀️ Detail',
+            `cms:view:${slug}`
+          ),
+        }
+      )
+      .catch(() => {});
+    return;
+  }
+
+  const lines = [
+    `⚠️ <b>Konfirmasi Hapus</b>`,
+    '',
+    `🆔 <code>${escapeHtml(slug)}</code>`,
+    '',
+    `<b>${total} file akan dihapus:</b>`,
+  ];
+
+  if (md) lines.push(`  📄 <code>${escapeHtml(mdPath)}</code>`);
+  for (const f of dataFiles.slice(0, 10)) {
+    lines.push(`  📁 <code>${escapeHtml(f)}</code>`);
+  }
+  if (dataFiles.length > 10) {
+    lines.push(`  <i>… dan ${dataFiles.length - 10} file lain</i>`);
+  }
+
+  lines.push('');
+  lines.push('<b>⚠️ Tidak bisa dibatalkan.</b>');
+
+  const kb = new InlineKeyboard()
+    .text(`✅ Hapus ${total} file`, `cms:dely:${slug}`)
+    .row()
+    .text('❌ Batal', `cms:view:${slug}`);
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      ctx.callbackQuery!.message!.message_id!,
+      lines.join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    )
+    .catch(() => {});
+}
+
+async function execDeleteAnime(
+  ctx: Context,
+  env: Env,
+  slug: string
+): Promise<void> {
+  await ctx.answerCallbackQuery({ text: '🗑️ Deleting...' });
+
+  const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      loadingMsgId,
+      `🗑️ <b>Menghapus semua file...</b>\n\n🆔 <code>${escapeHtml(slug)}</code>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    )
+    .catch(() => {});
+
+  try {
+    const mdPath = `src/content/anime/${slug}.md`;
+    const md = await githubGetFile(env, mdPath, 'yukio-data').catch(() => null);
+    const dataFiles = await collectFolderFiles(env, `data/anime/${slug}`, 0);
+    const paths = [...(md ? [mdPath] : []), ...dataFiles];
+
+    if (paths.length === 0) throw new Error('Tidak ada file');
+
+    let deleted = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < paths.length; i++) {
+      const p = paths[i]!;
+      try {
+        await ctx.api
+          .editMessageText(
+            ctx.chat!.id,
+            loadingMsgId,
+            `🗑️ <b>[${i + 1}/${paths.length}]</b>\n\n<code>${escapeHtml(p)}</code>`,
+            { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+          )
+          .catch(() => {});
+
+        const r = await githubDeleteFile(
+          env,
+          p,
+          `chore(cms): delete ${slug} (${i + 1}/${paths.length})`,
+          'yukio-data'
+        );
+        if (r.ok) deleted++;
+        else errors.push(`${p}: ${r.error ?? 'unknown'}`);
+      } catch (err) {
+        errors.push(`${p}: ${err instanceof Error ? err.message : 'unknown'}`);
+      }
+    }
+
+    await invalidateCmsIndex(env);
+
+    const lines = [
+      `✅ <b>Hapus selesai</b>`,
+      '',
+      `🆔 <code>${escapeHtml(slug)}</code>`,
+      `🗑️ Dihapus: <b>${deleted}</b> / ${paths.length} file`,
+    ];
+
+    if (errors.length > 0) {
+      lines.push('');
+      lines.push(`⚠️ <b>Error (${errors.length}):</b>`);
+      for (const e of errors.slice(0, 3)) {
+        lines.push(`• <code>${escapeHtml(e.slice(0, 120))}</code>`);
+      }
+    }
+
+    const kb = new InlineKeyboard()
+      .text('🔍 Cari Lagi', 'cms:search')
+      .text('🏠 Menu', 'cms:home');
+
+    await ctx.api
+      .editMessageText(ctx.chat!.id, loadingMsgId, lines.join('\n'), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      })
+      .catch(() => {});
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'unknown';
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loadingMsgId,
+        `❌ <b>Gagal hapus</b>\n\n<code>${escapeHtml(msg.slice(0, 300))}</code>`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard().text(
+            '◀️ Detail',
+            `cms:view:${slug}`
+          ),
+        }
+      )
+      .catch(() => {});
+  }
+}
+
+/* ============================================================
+   TAMBAH BARU
+   ============================================================ */
+
+async function showAddNewInstructions(
+  ctx: Context,
+  env: Env,
+  slug: string
+): Promise<void> {
+  void env;
+
+  const lines = [
+    `➕ <b>Tambah Anime Baru</b>`,
+    '',
+    `🆔 Target slug: <code>${escapeHtml(slug)}</code>`,
+    '',
+    '<b>Alur:</b>',
+    `1️⃣ Ketik <code>/dba ${escapeHtml(slug.replace(/-/g, ' '))}</code>`,
+    `2️⃣ Cari metadata + klik section (Metadata, Characters, Episodes)`,
+    `3️⃣ Ketik <code>/publish</code> → centang → 📤 Push`,
+    '',
+    `<i>Setelah selesai, balik ke sini → 🔍 Cari Slug untuk cek.</i>`,
+  ];
+
+  const kb = new InlineKeyboard()
+    .text('🔍 Cari Slug', 'cms:search')
+    .text('🏠 Menu', 'cms:home');
+
+  await ctx.answerCallbackQuery({ text: '➕' });
   await ctx.api
     .editMessageText(
       ctx.chat!.id,
@@ -983,9 +1194,7 @@ async function showFieldPrompt(
     else if (field.type === 'body')
       lines.push('<i>Kirim sinopsis baru (bisa multi-baris)</i>');
     else if (field.type === 'csv')
-      lines.push(
-        '<i>Pisah pakai koma. Contoh: <code>action, comedy</code></i>'
-      );
+      lines.push('<i>Pisah pakai koma. Contoh: <code>action, comedy</code></i>');
     else lines.push('<i>Kirim nilai baru:</i>');
   }
 
@@ -1308,10 +1517,18 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
   });
 
   bot.callbackQuery(/^cms:add:(.+)$/, async (ctx) => {
-    await ctx.answerCallbackQuery({
-      text: '➕ Tambah — coming next',
-      show_alert: true,
-    });
+    const slug = ctx.match[1] ?? '';
+    await showAddNewInstructions(ctx, env, slug);
+  });
+
+  bot.callbackQuery(/^cms:del:(.+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    await showDeleteConfirm(ctx, env, slug);
+  });
+
+  bot.callbackQuery(/^cms:dely:(.+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    await execDeleteAnime(ctx, env, slug);
   });
 
   /* EPISODES */
@@ -1321,36 +1538,27 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
     await showEpisodesMenu(ctx, env, slug);
   });
 
-  bot.callbackQuery(
-    /^cms:epv:([^:]+):(meta|streams):([^:]+)$/,
-    async (ctx) => {
-      const slug = ctx.match[1] ?? '';
-      const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
-      const fileName = ctx.match[3] ?? '';
-      await ctx.answerCallbackQuery().catch(() => {});
-      await showChunkPreview(ctx, env, slug, type, fileName);
-    }
-  );
+  bot.callbackQuery(/^cms:epv:([^:]+):(meta|streams):([^:]+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
+    const fileName = ctx.match[3] ?? '';
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showChunkPreview(ctx, env, slug, type, fileName);
+  });
 
-  bot.callbackQuery(
-    /^cms:epd:([^:]+):(meta|streams):([^:]+)$/,
-    async (ctx) => {
-      const slug = ctx.match[1] ?? '';
-      const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
-      const fileName = ctx.match[3] ?? '';
-      await confirmDeleteChunk(ctx, env, slug, type, fileName);
-    }
-  );
+  bot.callbackQuery(/^cms:epd:([^:]+):(meta|streams):([^:]+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
+    const fileName = ctx.match[3] ?? '';
+    await confirmDeleteChunk(ctx, env, slug, type, fileName);
+  });
 
-  bot.callbackQuery(
-    /^cms:epdy:([^:]+):(meta|streams):([^:]+)$/,
-    async (ctx) => {
-      const slug = ctx.match[1] ?? '';
-      const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
-      const fileName = ctx.match[3] ?? '';
-      await execDeleteChunk(ctx, env, slug, type, fileName);
-    }
-  );
+  bot.callbackQuery(/^cms:epdy:([^:]+):(meta|streams):([^:]+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
+    const fileName = ctx.match[3] ?? '';
+    await execDeleteChunk(ctx, env, slug, type, fileName);
+  });
 
   bot.callbackQuery(/^cms:epb:(.+)$/, async (ctx) => {
     const slug = ctx.match[1] ?? '';
@@ -1435,14 +1643,6 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
       return;
     }
     await saveEdits(ctx, env, userId, session.slug, session.edits);
-  });
-
-  /* TAHAP 3 */
-  bot.callbackQuery(/^cms:del:(.+)$/, async (ctx) => {
-    await ctx.answerCallbackQuery({
-      text: '🗑️ Delete — coming next (Tahap 3)',
-      show_alert: true,
-    });
   });
 
   bot.callbackQuery(/^cms:sec:(.+):(chars|fr)$/, async (ctx) => {
