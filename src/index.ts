@@ -178,52 +178,103 @@ export default {
     return new Response('Not Found', { status: 404 });
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async scheduled(
+    event: ScheduledEvent,
+    env: Env,
+    _ctx: ExecutionContext
+  ): Promise<void> {
     const cron = event.cron;
     console.log(`[Cron] trigger: ${cron}`);
-
+  
+    // === CLEANUP CACHE ===
     if (cron === '0 3 * * *') {
       try {
         const cleaned = await cleanupCache(env.DB);
-        console.log(`[Cron] Cleaned ${cleaned}`);
+        console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
       } catch (err) {
         console.error('[Cron] cleanup error:', err);
       }
       return;
     }
-
-    if (cron === '0 23 * * *' || cron === '0 11 * * *') {
+  
+    // === EPISODE CHECK ===
+    const EPISODE_CRONS = ['0 6 * * *', '0 14 * * *', '0 22 * * *'];
+    if (EPISODE_CRONS.includes(cron)) {
+      const t0 = Date.now();
+  
+      const wibTime = new Date(Date.now() + 7 * 3600 * 1000)
+        .toISOString()
+        .slice(0, 16)
+        .replace('T', ' ');
+  
+      // === NOTIF START ===
+      try {
+        const { Bot: BotCtor } = await import('grammy');
+        const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
+        await bot.api.sendMessage(
+          env.ADMIN_USER_ID,
+          `🚀 <b>Cron started</b>\n` +
+            `🕐 <code>${cron}</code>\n` +
+            `🇮🇩 ${wibTime} WIB`,
+          { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+        );
+      } catch (err) {
+        console.error('[Cron] start notif failed:', err);
+      }
+  
+      // === RUN CRON ===
       try {
         const { runCron } = await import('./lib/cron/runner');
         const result = await runCron(env);
-        const summaryLines: string[] = [];
-        summaryLines.push(`<b>📡 Cron Episode Report</b>\n🕐 <code>${cron}</code>\n`);
-        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
-        summaryLines.push(`📼 Push: <b>${result.episodesPushed}</b>`);
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  
+        const lines: string[] = [];
+        lines.push(`<b>📡 Cron Report</b>`);
+        lines.push(`🕐 <code>${cron}</code> · ⏱️ ${elapsed}s`);
+        lines.push('');
+        lines.push(`🔍 Dicek: <b>${result.animeChecked}</b> anime`);
+        lines.push(`📼 Push: <b>${result.episodesPushed}</b> episode baru`);
+  
         if (result.errors.length > 0) {
-          summaryLines.push('');
-          summaryLines.push(`⚠️ <b>Error (${result.errors.length}):</b>`);
-          for (const e of result.errors.slice(0, 5))
-            summaryLines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
-          if (result.errors.length > 5)
-            summaryLines.push(`<i>…dan ${result.errors.length - 5}</i>`);
+          lines.push('');
+          lines.push(`⚠️ <b>Error (${result.errors.length}):</b>`);
+          for (const e of result.errors.slice(0, 5)) {
+            lines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
+          }
+          if (result.errors.length > 5) {
+            lines.push(`<i>…dan ${result.errors.length - 5} lainnya</i>`);
+          }
         }
+  
         try {
           const { Bot: BotCtor } = await import('grammy');
           const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
-          await bot.api.sendMessage(env.ADMIN_USER_ID, summaryLines.join('\n'), {
+          await bot.api.sendMessage(env.ADMIN_USER_ID, lines.join('\n'), {
             parse_mode: 'HTML',
             link_preview_options: { is_disabled: true },
           });
         } catch (notifErr) {
-          console.error('[Cron] notif error:', notifErr);
+          console.error('[Cron] done notif failed:', notifErr);
         }
-        console.log(`[Cron] done — pushed ${result.episodesPushed}, errors ${result.errors.length}`);
+  
+        console.log(
+          `[Cron] done — pushed ${result.episodesPushed}, errors ${result.errors.length}, elapsed ${elapsed}s`
+        );
       } catch (err) {
         console.error('[Cron] error:', err);
+        try {
+          const { Bot: BotCtor } = await import('grammy');
+          const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
+          const msg = err instanceof Error ? err.message : 'unknown';
+          await bot.api.sendMessage(
+            env.ADMIN_USER_ID,
+            `❌ <b>Cron error</b>\n🕐 <code>${cron}</code>\n\n<code>${escapeHtml(msg.slice(0, 300))}</code>`,
+            { parse_mode: 'HTML' }
+          );
+        } catch {}
       }
       return;
     }
-    console.warn(`[Cron] unknown: ${cron}`);
+    console.warn(`[Cron] unknown trigger: ${cron}`);
   },
 };
