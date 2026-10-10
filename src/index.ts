@@ -22,6 +22,7 @@ import { setupEditCallbacks } from './commands/edit/callbacks';
 import { handleEditTextInput } from './commands/edit';
 import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';
 import { COMMANDS } from './commands/list';
+import { databaseCommand, handleCmsText, setupCmsCallbacks } from './commands/cms';
 
 const COMMAND_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 
@@ -50,6 +51,7 @@ function createBot(env: Env): Bot {
   setupTrackCallbacks(bot, env);
   setupBatchWizardCallbacks(bot, env);
   setupEditCallbacks(bot, env);
+  setupCmsCallbacks(bot, env);
 
   bot.on('message:text', async (ctx) => {
     if (!isAdmin(ctx.from?.id, env)) return;
@@ -60,9 +62,13 @@ function createBot(env: Env): Bot {
 
       const handledBatchWizard = await handleBatchWizardText(ctx, env);
       if (handledBatchWizard) return;
+      
+      const handledCms = await handleCmsText(ctx, env);
+      if (handledCms) return;
 
       const handledEdit = await handleEditTextInput(ctx, env);
       if (handledEdit) return;
+      
     } catch (err) {
       console.error('[Text] handler error:', err);
     }
