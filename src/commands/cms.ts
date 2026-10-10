@@ -6,7 +6,12 @@ import type { Env } from '../types/env';
 import type { D1Database } from '@cloudflare/workers-types';
 import { escapeHtml } from '../lib/utils';
 import { createLazyInit } from '../lib/lazy-init';
-import { githubGetFile, githubCommitFile } from '../lib/github';
+import {
+  githubGetFile,
+  githubCommitFile,
+  githubDeleteFile,
+  githubListDir,
+} from '../lib/github';
 import {
   getCmsIndex,
   invalidateCmsIndex,
@@ -14,25 +19,21 @@ import {
 } from '../lib/cms-cache';
 import {
   splitContent,
-  joinContent,
   getFrontmatterField,
   applyEdits,
 } from './edit/content';
 
-const PER_PAGE = 8;
-const SEARCH_LIMIT = 20;
 const SESSION_TTL_MS = 15 * 60 * 1000;
 
 type CmsStep =
   | 'idle'
-  | 'awaiting_search'
+  | 'awaiting_slug'
   | 'edit_menu'
   | 'awaiting_value'
   | 'awaiting_body';
 
 interface CmsSession {
   step: CmsStep;
-  page?: number;
   slug?: string;
   activeField?: string;
   edits: Record<string, string>;
@@ -48,7 +49,6 @@ const ensureCmsSessionDb = createLazyInit('CmsSess', async (db) => {
       `CREATE TABLE IF NOT EXISTS cms_sessions (
         user_id      INTEGER PRIMARY KEY,
         step         TEXT NOT NULL,
-        page         INTEGER,
         slug         TEXT,
         active_field TEXT,
         edits_json   TEXT NOT NULL DEFAULT '{}',
@@ -72,7 +72,6 @@ async function setSession(
   userId: number,
   data: {
     step: CmsStep;
-    page?: number;
     slug?: string;
     activeField?: string;
     edits?: Record<string, string>;
@@ -83,11 +82,10 @@ async function setSession(
   await db
     .prepare(
       `INSERT INTO cms_sessions
-         (user_id, step, page, slug, active_field, edits_json, updated_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         (user_id, step, slug, active_field, edits_json, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          step = excluded.step,
-         page = excluded.page,
          slug = excluded.slug,
          active_field = excluded.active_field,
          edits_json = excluded.edits_json,
@@ -97,7 +95,6 @@ async function setSession(
     .bind(
       userId,
       data.step,
-      data.page ?? null,
       data.slug ?? null,
       data.activeField ?? null,
       JSON.stringify(data.edits ?? {}),
@@ -107,30 +104,6 @@ async function setSession(
     .run();
 }
 
-async function patchSession(
-  db: D1Database,
-  userId: number,
-  patch: Partial<{
-    step: CmsStep;
-    slug: string | null;
-    activeField: string | null;
-    edits: Record<string, string>;
-  }>
-): Promise<void> {
-  const current = await getSession(db, userId);
-  if (!current) return;
-  await setSession(db, userId, {
-    step: patch.step ?? current.step,
-    page: current.page,
-    slug: patch.slug !== undefined ? patch.slug ?? undefined : current.slug,
-    activeField:
-      patch.activeField !== undefined
-        ? patch.activeField ?? undefined
-        : current.activeField,
-    edits: patch.edits ?? current.edits,
-  });
-}
-
 async function getSession(
   db: D1Database,
   userId: number
@@ -138,13 +111,12 @@ async function getSession(
   await ensureCmsSessionDb(db);
   const row = await db
     .prepare(
-      `SELECT step, page, slug, active_field, edits_json, expires_at
+      `SELECT step, slug, active_field, edits_json, expires_at
        FROM cms_sessions WHERE user_id = ?`
     )
     .bind(userId)
     .first<{
       step: CmsStep;
-      page: number | null;
       slug: string | null;
       active_field: string | null;
       edits_json: string;
@@ -161,7 +133,6 @@ async function getSession(
 
   return {
     step: row.step,
-    page: row.page ?? undefined,
     slug: row.slug ?? undefined,
     activeField: row.active_field ?? undefined,
     edits,
@@ -278,11 +249,11 @@ async function showMainMenu(
     `🎤 Actor files: <b>${index.actorLetters.length}</b>`,
     ageStr,
     '',
-    '<i>Pilih menu:</i>',
+    '<i>Shortcut: <code>/database {slug}</code> langsung ke detail</i>',
   ];
 
   const kb = new InlineKeyboard()
-    .text('📚 Anime', 'cms:anime')
+    .text('🔍 Cari Slug', 'cms:search')
     .text('📊 Stats', 'cms:stats')
     .row()
     .text('🔄 Sync', 'cms:sync');
@@ -308,170 +279,81 @@ async function showMainMenu(
 }
 
 /* ============================================================
-   ANIME MENU
+   SEARCH BY SLUG
    ============================================================ */
 
-async function showAnimeMenu(ctx: Context, env: Env): Promise<void> {
-  const { index } = await getCmsIndex(env);
-
-  const lines = [
-    '📚 <b>Anime</b>',
-    '',
-    `Total: <b>${index.animeSlugs.length}</b>`,
-    '',
-    '<i>Pilih aksi:</i>',
-  ];
-
-  const kb = new InlineKeyboard()
-    .text('📋 Browse', 'cms:browse:0')
-    .text('🔍 Search', 'cms:search')
-    .row()
-    .text('◀️ Kembali', 'cms:home');
-
-  await ctx.api
-    .editMessageText(
-      ctx.chat!.id,
-      ctx.callbackQuery!.message!.message_id!,
-      lines.join('\n'),
-      {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: kb,
-      }
-    )
-    .catch(() => {});
-}
-
-/* ============================================================
-   BROWSE
-   ============================================================ */
-
-async function showBrowse(
-  ctx: Context,
-  env: Env,
-  page: number
-): Promise<void> {
-  const { index } = await getCmsIndex(env);
-  const all = index.animeSlugs;
-  const totalPages = Math.max(1, Math.ceil(all.length / PER_PAGE));
-  const p = Math.min(Math.max(0, page), totalPages - 1);
-  const items = all.slice(p * PER_PAGE, (p + 1) * PER_PAGE);
-
-  const lines = [
-    '📋 <b>Browse Anime</b>',
-    `<i>Halaman ${p + 1}/${totalPages} · ${all.length} total</i>`,
-    '',
-    '<i>Tap untuk lihat detail:</i>',
-  ];
-
-  const kb = new InlineKeyboard();
-  for (const slug of items) {
-    const f = index.animeFolders[slug];
-    const badges: string[] = [];
-    if (f?.characters) badges.push('👥');
-    if (f?.episodes || f?.episodeStreams) badges.push('🎬');
-    if (f?.franchises) badges.push('🔗');
-
-    const label = `${slug}${badges.length ? '  ' + badges.join('') : ''}`;
-    const short = label.length > 50 ? label.slice(0, 48) + '…' : label;
-    kb.text(short, `cms:view:${slug}`).row();
-  }
-
-  if (totalPages > 1) {
-    if (p > 0) kb.text('◀️', `cms:browse:${p - 1}`);
-    if (p < totalPages - 1) kb.text('▶️', `cms:browse:${p + 1}`);
-    kb.row();
-  }
-  kb.text('◀️ Kembali', 'cms:anime');
-
-  await ctx.api
-    .editMessageText(
-      ctx.chat!.id,
-      ctx.callbackQuery!.message!.message_id!,
-      lines.join('\n'),
-      {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: kb,
-      }
-    )
-    .catch(() => {});
-}
-
-/* ============================================================
-   SEARCH
-   ============================================================ */
-
-async function showSearchPrompt(
+async function showSlugPrompt(
   ctx: Context,
   env: Env,
   userId: number
 ): Promise<void> {
-  await setSession(env.DB, userId, { step: 'awaiting_search' });
+  await setSession(env.DB, userId, { step: 'awaiting_slug' });
   await ctx.api
     .editMessageText(
       ctx.chat!.id,
       ctx.callbackQuery!.message!.message_id!,
-      '🔍 <b>Search Anime</b>\n\n' +
-        'Kirim kata kunci (bisa sebagian slug).\n' +
-        '<i>Contoh: <code>jujutsu</code></i>',
+      '🔍 <b>Cari Anime</b>\n\n' +
+        'Kirim <b>slug</b> anime.\n' +
+        '<i>Contoh: <code>jujutsu-kaisen</code></i>',
       {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
-        reply_markup: new InlineKeyboard().text('❌ Batal', 'cms:anime'),
+        reply_markup: new InlineKeyboard().text('❌ Batal', 'cms:home'),
       }
     )
     .catch(() => {});
 }
 
-async function handleSearchResult(
+async function handleSlugInput(
   ctx: Context,
   env: Env,
   userId: number,
-  query: string
+  rawSlug: string
 ): Promise<void> {
-  await clearSession(env.DB, userId);
-  const { index } = await getCmsIndex(env);
-  const q = query.toLowerCase().trim();
+  const slug = rawSlug.toLowerCase().trim();
 
-  const matches = index.animeSlugs
-    .filter((s) => s.toLowerCase().includes(q))
-    .slice(0, SEARCH_LIMIT);
-
-  if (matches.length === 0) {
+  if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug)) {
     await ctx.reply(
-      `❌ Tidak ada anime yang cocok dengan "<b>${escapeHtml(query)}</b>".`,
+      '❌ Slug invalid. Format: <code>lowercase-with-dash</code>\n\nCoba lagi:',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  await clearSession(env.DB, userId);
+
+  const loading = await ctx.reply(
+    `🔍 Cek <code>${escapeHtml(slug)}</code>...`,
+    { parse_mode: 'HTML' }
+  );
+
+  const file = await githubGetFile(
+    env,
+    `src/content/anime/${slug}.md`,
+    'yukio-data'
+  );
+
+  await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
+  if (!file) {
+    await ctx.reply(
+      `❌ <b>Slug tidak ditemukan</b>\n\n` +
+        `<code>${escapeHtml(slug)}</code> belum ada di yukio-data.\n\n` +
+        `<i>Mau tambah baru?</i>`,
       {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         reply_markup: new InlineKeyboard()
-          .text('🔍 Search lagi', 'cms:search')
+          .text('➕ Tambah Baru', `cms:add:${slug}`)
+          .text('🔍 Coba Lagi', 'cms:search')
           .row()
-          .text('◀️ Kembali', 'cms:anime'),
+          .text('◀️ Kembali', 'cms:home'),
       }
     );
     return;
   }
 
-  const lines = [
-    `🔍 <b>Hasil search: "${escapeHtml(query)}"</b>`,
-    `Ditemukan: <b>${matches.length}</b>${matches.length === SEARCH_LIMIT ? '+' : ''}`,
-    '',
-  ];
-
-  const kb = new InlineKeyboard();
-  for (const slug of matches) {
-    const short = slug.length > 50 ? slug.slice(0, 48) + '…' : slug;
-    kb.text(short, `cms:view:${slug}`).row();
-  }
-  kb.text('🔍 Search lagi', 'cms:search').row();
-  kb.text('◀️ Kembali', 'cms:anime');
-
-  await ctx.reply(lines.join('\n'), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: kb,
-  });
+  await showDetailFromContent(ctx, env, slug, file.content, false);
 }
 
 /* ============================================================
@@ -496,7 +378,17 @@ async function showDetail(
     return;
   }
 
-  const fmMatch = file.content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  await showDetailFromContent(ctx, env, slug, file.content, true);
+}
+
+async function showDetailFromContent(
+  ctx: Context,
+  env: Env,
+  slug: string,
+  content: string,
+  edit: boolean
+): Promise<void> {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   const fmText = fmMatch?.[1] ?? '';
   const get = (key: string): string | null => {
     const m = fmText.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'));
@@ -514,7 +406,8 @@ async function showDetail(
   const { index } = await getCmsIndex(env);
   const folder = index.animeFolders[slug];
   const hasChars = folder?.characters ?? false;
-  const hasEps = folder?.episodes || folder?.episodeStreams;
+  const hasEps = folder?.episodes ?? false;
+  const hasStreams = folder?.episodeStreams ?? false;
   const hasFr = folder?.franchises ?? false;
 
   const lines = [
@@ -527,7 +420,8 @@ async function showDetail(
     '',
     `<i>Data folder:</i>`,
     `  ${hasChars ? '✅' : '⬜'} Characters`,
-    `  ${hasEps ? '✅' : '⬜'} Episodes`,
+    `  ${hasEps ? '✅' : '⬜'} Episodes (metadata)`,
+    `  ${hasStreams ? '✅' : '⬜'} Episodes (streams)`,
     `  ${hasFr ? '✅' : '⬜'} Franchises`,
   ];
 
@@ -536,11 +430,315 @@ async function showDetail(
     .text('🗑️ Hapus', `cms:del:${slug}`)
     .row()
     .text('👥 Characters', `cms:sec:${slug}:chars`)
-    .text('🎬 Episodes', `cms:sec:${slug}:eps`)
+    .text('🎬 Episodes', `cms:ep:${slug}`)
     .row()
     .text('🔗 Franchises', `cms:sec:${slug}:fr`)
-    .text('◀️ Kembali', 'cms:browse:0');
+    .row()
+    .text('🔍 Cari Lagi', 'cms:search')
+    .text('◀️ Menu', 'cms:home');
 
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
+
+  if (edit && ctx.callbackQuery?.message?.message_id) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery.message.message_id,
+        lines.join('\n'),
+        payload
+      )
+      .catch(() => {});
+  } else {
+    await ctx.reply(lines.join('\n'), payload);
+  }
+}
+
+/* ============================================================
+   EPISODES MENU
+   ============================================================ */
+
+async function listJsonFiles(
+  env: Env,
+  path: string
+): Promise<string[]> {
+  try {
+    const dir = await githubListDir(env, path, 'yukio-data');
+    return dir
+      .filter((d) => d.type === 'file' && d.name.endsWith('.json'))
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+async function showEpisodesMenu(
+  ctx: Context,
+  env: Env,
+  slug: string
+): Promise<void> {
+  const metaPath = `data/anime/${slug}/episodes`;
+  const streamPath = `data/anime/${slug}/episodes/streams`;
+
+  const [metaFiles, streamFiles] = await Promise.all([
+    listJsonFiles(env, metaPath),
+    listJsonFiles(env, streamPath),
+  ]);
+
+  const lines = [
+    `🎬 <b>Episodes — ${escapeHtml(slug)}</b>`,
+    '',
+    `📄 <b>Metadata</b> (${metaFiles.length}):`,
+  ];
+
+  if (metaFiles.length === 0) {
+    lines.push('  <i>(kosong)</i>');
+  } else {
+    for (const f of metaFiles) {
+      lines.push(`  • <code>${escapeHtml(f)}</code>`);
+    }
+  }
+
+  lines.push('');
+  lines.push(`📺 <b>Streams</b> (${streamFiles.length}):`);
+
+  if (streamFiles.length === 0) {
+    lines.push('  <i>(kosong)</i>');
+  } else {
+    for (const f of streamFiles) {
+      lines.push(`  • <code>${escapeHtml(f)}</code>`);
+    }
+  }
+
+  lines.push('');
+  lines.push('<i>Tap file untuk preview / hapus:</i>');
+
+  const kb = new InlineKeyboard();
+
+  for (const f of metaFiles) {
+    kb.text(`📄 ${f}`, `cms:epv:${slug}:meta:${f}`).row();
+  }
+  for (const f of streamFiles) {
+    kb.text(`📺 ${f}`, `cms:epv:${slug}:streams:${f}`).row();
+  }
+
+  if (streamFiles.length === 0) {
+    kb.text('➕ Batch Baru', `cms:epb:${slug}`).row();
+  }
+
+  kb.text('🔍 Refresh', `cms:ep:${slug}`)
+    .text('◀️ Detail', `cms:view:${slug}`);
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      ctx.callbackQuery!.message!.message_id!,
+      lines.join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    )
+    .catch(() => {});
+}
+
+async function showChunkPreview(
+  ctx: Context,
+  env: Env,
+  slug: string,
+  type: 'meta' | 'streams',
+  fileName: string
+): Promise<void> {
+  const path =
+    type === 'meta'
+      ? `data/anime/${slug}/episodes/${fileName}`
+      : `data/anime/${slug}/episodes/streams/${fileName}`;
+
+  const file = await githubGetFile(env, path, 'yukio-data');
+  if (!file) {
+    await ctx
+      .answerCallbackQuery({ text: '❌ File hilang', show_alert: true })
+      .catch(() => {});
+    return;
+  }
+
+  let preview = file.content;
+  if (preview.length > 3000) {
+    preview = preview.slice(0, 3000) + '\n\n… [truncated]';
+  }
+
+  const sizeKb = Math.round(file.content.length / 1024);
+  const typeLabel = type === 'meta' ? '📄 Metadata' : '📺 Streams';
+
+  const lines = [
+    `${typeLabel} — <code>${escapeHtml(fileName)}</code>`,
+    '',
+    `📏 ${sizeKb} KB`,
+    '',
+    `<pre>${escapeHtml(preview)}</pre>`,
+  ];
+
+  const kb = new InlineKeyboard()
+    .text('🗑️ Hapus', `cms:epd:${slug}:${type}:${fileName}`)
+    .row()
+    .text('◀️ Kembali', `cms:ep:${slug}`);
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      ctx.callbackQuery!.message!.message_id!,
+      lines.join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    )
+    .catch(() => {});
+}
+
+async function confirmDeleteChunk(
+  ctx: Context,
+  env: Env,
+  slug: string,
+  type: 'meta' | 'streams',
+  fileName: string
+): Promise<void> {
+  void env;
+  const path =
+    type === 'meta'
+      ? `data/anime/${slug}/episodes/${fileName}`
+      : `data/anime/${slug}/episodes/streams/${fileName}`;
+
+  const lines = [
+    '⚠️ <b>Konfirmasi Hapus</b>',
+    '',
+    `🆔 <code>${escapeHtml(slug)}</code>`,
+    `📁 <code>${escapeHtml(path)}</code>`,
+    '',
+    '<i>Tidak bisa dibatalkan.</i>',
+  ];
+
+  const kb = new InlineKeyboard()
+    .text('✅ Hapus', `cms:epdy:${slug}:${type}:${fileName}`)
+    .text('❌ Batal', `cms:epv:${slug}:${type}:${fileName}`);
+
+  await ctx.answerCallbackQuery({ text: '⚠️' });
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      ctx.callbackQuery!.message!.message_id!,
+      lines.join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    )
+    .catch(() => {});
+}
+
+async function execDeleteChunk(
+  ctx: Context,
+  env: Env,
+  slug: string,
+  type: 'meta' | 'streams',
+  fileName: string
+): Promise<void> {
+  const path =
+    type === 'meta'
+      ? `data/anime/${slug}/episodes/${fileName}`
+      : `data/anime/${slug}/episodes/streams/${fileName}`;
+
+  await ctx.answerCallbackQuery({ text: '🗑️ Deleting...' });
+
+  const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      loadingMsgId,
+      `🗑️ Menghapus <code>${escapeHtml(path)}</code>...`,
+      { parse_mode: 'HTML' }
+    )
+    .catch(() => {});
+
+  const result = await githubDeleteFile(
+    env,
+    path,
+    `chore(cms): delete ${fileName} from ${slug}`,
+    'yukio-data'
+  );
+
+  if (!result.ok) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loadingMsgId,
+        `❌ <b>Gagal hapus</b>\n\n<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: new InlineKeyboard().text(
+            '◀️ Kembali',
+            `cms:ep:${slug}`
+          ),
+        }
+      )
+      .catch(() => {});
+    return;
+  }
+
+  await invalidateCmsIndex(env);
+
+  const lines = [
+    '✅ <b>File dihapus</b>',
+    '',
+    `📁 <code>${escapeHtml(path)}</code>`,
+    `🔗 Commit: <code>${result.sha?.slice(0, 7) ?? '?'}</code>`,
+  ];
+
+  const kb = new InlineKeyboard()
+    .text('🔙 Episodes', `cms:ep:${slug}`)
+    .text('📄 Detail', `cms:view:${slug}`);
+
+  await ctx.api
+    .editMessageText(ctx.chat!.id, loadingMsgId, lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    })
+    .catch(() => {});
+}
+
+async function showBatchShortcut(
+  ctx: Context,
+  env: Env,
+  slug: string
+): Promise<void> {
+  void env;
+  const lines = [
+    '🚀 <b>Batch Streams</b>',
+    '',
+    `Slug: <code>${escapeHtml(slug)}</code>`,
+    '',
+    '<b>Langkah:</b>',
+    `1. Ketik <code>/batch</code>`,
+    `2. Step 1, kirim: <code>${escapeHtml(slug)}</code>`,
+    `3. Step 2, kirim URL source`,
+    `4. Step 3, kirim range episode`,
+    '',
+    '<i>Setelah selesai, balik ke sini → 🔍 Refresh untuk lihat file baru.</i>',
+  ];
+
+  const kb = new InlineKeyboard()
+    .text('🔍 Refresh', `cms:ep:${slug}`)
+    .text('◀️ Detail', `cms:view:${slug}`);
+
+  await ctx.answerCallbackQuery({ text: '🚀' });
   await ctx.api
     .editMessageText(
       ctx.chat!.id,
@@ -564,12 +762,14 @@ async function showStats(ctx: Context, env: Env): Promise<void> {
 
   let withChars = 0;
   let withEps = 0;
+  let withStreams = 0;
   let withFr = 0;
 
   for (const slug of index.animeSlugs) {
     const f = index.animeFolders[slug];
     if (f?.characters) withChars++;
-    if (f?.episodes || f?.episodeStreams) withEps++;
+    if (f?.episodes) withEps++;
+    if (f?.episodeStreams) withStreams++;
     if (f?.franchises) withFr++;
   }
 
@@ -584,12 +784,14 @@ async function showStats(ctx: Context, env: Env): Promise<void> {
     '',
     '<b>Kelengkapan data:</b>',
     `  👥 Characters: <b>${withChars}</b> (${pct(withChars)}%)`,
-    `  🎬 Episodes: <b>${withEps}</b> (${pct(withEps)}%)`,
+    `  📄 Episodes meta: <b>${withEps}</b> (${pct(withEps)}%)`,
+    `  📺 Episodes streams: <b>${withStreams}</b> (${pct(withStreams)}%)`,
     `  🔗 Franchises: <b>${withFr}</b> (${pct(withFr)}%)`,
     '',
     '<b>⚠️ Belum lengkap:</b>',
     `  Tanpa characters: <b>${total - withChars}</b>`,
-    `  Tanpa episodes: <b>${total - withEps}</b>`,
+    `  Tanpa episodes meta: <b>${total - withEps}</b>`,
+    `  Tanpa streams: <b>${total - withStreams}</b>`,
     `  Tanpa franchises: <b>${total - withFr}</b>`,
   ];
 
@@ -746,7 +948,8 @@ async function showFieldPrompt(
   const { frontmatter } = splitContent(file.content);
   const current = getFrontmatterField(frontmatter, fieldKey);
 
-  const step: CmsStep = field.type === 'body' ? 'awaiting_body' : 'awaiting_value';
+  const step: CmsStep =
+    field.type === 'body' ? 'awaiting_body' : 'awaiting_value';
   await setSession(env.DB, userId, {
     step,
     slug,
@@ -757,11 +960,13 @@ async function showFieldPrompt(
   const lines = [
     `✏️ <b>${escapeHtml(field.label)}</b>`,
     '',
-    current ? `📌 Sekarang: <code>${escapeHtml(current.slice(0, 100))}</code>` : '📌 Sekarang: <i>(kosong)</i>',
+    current
+      ? `📌 Sekarang: <code>${escapeHtml(current.slice(0, 100))}</code>`
+      : '📌 Sekarang: <i>(kosong)</i>',
     '',
   ];
 
-  let kb = new InlineKeyboard();
+  const kb = new InlineKeyboard();
 
   if (field.type === 'choice' && field.choices) {
     lines.push('<i>Pilih nilai baru:</i>');
@@ -771,10 +976,16 @@ async function showFieldPrompt(
     });
     if (field.choices.length % 3 !== 0) kb.row();
   } else {
-    if (field.hint) lines.push(`<i>Kirim nilai baru. ${escapeHtml(field.hint)}</i>`);
-    else if (field.type === 'url') lines.push('<i>Kirim URL baru (https://...)</i>');
-    else if (field.type === 'body') lines.push('<i>Kirim sinopsis baru (bisa multi-baris)</i>');
-    else if (field.type === 'csv') lines.push('<i>Pisah pakai koma. Contoh: <code>action, comedy</code></i>');
+    if (field.hint)
+      lines.push(`<i>Kirim nilai baru. ${escapeHtml(field.hint)}</i>`);
+    else if (field.type === 'url')
+      lines.push('<i>Kirim URL baru (https://...)</i>');
+    else if (field.type === 'body')
+      lines.push('<i>Kirim sinopsis baru (bisa multi-baris)</i>');
+    else if (field.type === 'csv')
+      lines.push(
+        '<i>Pisah pakai koma. Contoh: <code>action, comedy</code></i>'
+      );
     else lines.push('<i>Kirim nilai baru:</i>');
   }
 
@@ -829,9 +1040,7 @@ async function saveEdits(
       `src/content/anime/${slug}.md`,
       'yukio-data'
     );
-    if (!file) {
-      throw new Error('File MD tidak ditemukan di repo');
-    }
+    if (!file) throw new Error('File MD tidak ditemukan di repo');
 
     const newContent = applyEdits(file.content, edits);
 
@@ -843,9 +1052,7 @@ async function saveEdits(
       'yukio-data'
     );
 
-    if (!result.ok) {
-      throw new Error(result.error ?? 'push failed');
-    }
+    if (!result.ok) throw new Error(result.error ?? 'push failed');
 
     await clearSession(env.DB, userId);
     await invalidateCmsIndex(env);
@@ -880,7 +1087,10 @@ async function saveEdits(
         `❌ <b>Gagal save</b>\n\n<code>${escapeHtml(msg.slice(0, 300))}</code>`,
         {
           parse_mode: 'HTML',
-          reply_markup: new InlineKeyboard().text('◀️ Balik', `cms:edit:${slug}`),
+          reply_markup: new InlineKeyboard().text(
+            '◀️ Balik',
+            `cms:edit:${slug}`
+          ),
         }
       )
       .catch(() => {});
@@ -888,10 +1098,13 @@ async function saveEdits(
 }
 
 /* ============================================================
-   EDIT — INPUT VALIDATION
+   EDIT — VALIDATION
    ============================================================ */
 
-function validateValue(field: FieldDef, raw: string): { ok: true; value: string } | { ok: false; error: string } {
+function validateValue(
+  field: FieldDef,
+  raw: string
+): { ok: true; value: string } | { ok: false; error: string } {
   const v = raw.trim();
   if (!v) return { ok: false, error: 'Nilai kosong tidak diizinkan' };
 
@@ -925,11 +1138,20 @@ function validateValue(field: FieldDef, raw: string): { ok: true; value: string 
 
 export const databaseCommand: CommandDefinition = {
   name: 'database',
-  description: 'CMS untuk yukio-data — browse, search, edit',
-  usage: '/database',
+  description: 'CMS yukio-data — cek slug, edit, hapus',
+  usage: '/database [slug]',
   adminOnly: true,
 
   handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    if (arg) {
+      await handleSlugInput(ctx, env, userId, arg);
+      return;
+    }
+
     await showMainMenu(ctx, env);
   },
 };
@@ -952,8 +1174,8 @@ export async function handleCmsText(
   const session = await getSession(env.DB, userId);
   if (!session) return false;
 
-  if (session.step === 'awaiting_search') {
-    await handleSearchResult(ctx, env, userId, text.trim());
+  if (session.step === 'awaiting_slug') {
+    await handleSlugInput(ctx, env, userId, text);
     return true;
   }
 
@@ -1000,14 +1222,11 @@ async function handleFieldValue(
 
   const newEdits = { ...edits, [activeField]: raw };
 
-  // Kirim konfirmasi via chat, lalu tampilkan menu baru
   await ctx.reply(
-    `✅ <b>${escapeHtml(field.label)}</b> di-set.\n\n` +
-      `<i>Kembali ke menu edit...</i>`,
+    `✅ <b>${escapeHtml(field.label)}</b> di-set.\n\n<i>Kembali ke menu edit...</i>`,
     { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
   );
 
-  // Kirim pesan menu baru
   const count = Object.keys(newEdits).length;
   const lines = [
     `✏️ <b>Edit — ${escapeHtml(slug)}</b>`,
@@ -1066,22 +1285,11 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
     await showMainMenu(ctx, env, true);
   });
 
-  bot.callbackQuery(/^cms:anime$/, async (ctx) => {
-    await ctx.answerCallbackQuery().catch(() => {});
-    await showAnimeMenu(ctx, env);
-  });
-
-  bot.callbackQuery(/^cms:browse:(\d+)$/, async (ctx) => {
-    const page = parseInt(ctx.match[1] ?? '0', 10);
-    await ctx.answerCallbackQuery().catch(() => {});
-    await showBrowse(ctx, env, page);
-  });
-
   bot.callbackQuery(/^cms:search$/, async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;
     await ctx.answerCallbackQuery().catch(() => {});
-    await showSearchPrompt(ctx, env, userId);
+    await showSlugPrompt(ctx, env, userId);
   });
 
   bot.callbackQuery(/^cms:view:(.+)$/, async (ctx) => {
@@ -1099,10 +1307,57 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
     await doSync(ctx, env);
   });
 
-  /* ============================================================
-     EDIT — CALLBACKS
-     ============================================================ */
+  bot.callbackQuery(/^cms:add:(.+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery({
+      text: '➕ Tambah — coming next',
+      show_alert: true,
+    });
+  });
 
+  /* EPISODES */
+  bot.callbackQuery(/^cms:ep:(.+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showEpisodesMenu(ctx, env, slug);
+  });
+
+  bot.callbackQuery(
+    /^cms:epv:([^:]+):(meta|streams):([^:]+)$/,
+    async (ctx) => {
+      const slug = ctx.match[1] ?? '';
+      const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
+      const fileName = ctx.match[3] ?? '';
+      await ctx.answerCallbackQuery().catch(() => {});
+      await showChunkPreview(ctx, env, slug, type, fileName);
+    }
+  );
+
+  bot.callbackQuery(
+    /^cms:epd:([^:]+):(meta|streams):([^:]+)$/,
+    async (ctx) => {
+      const slug = ctx.match[1] ?? '';
+      const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
+      const fileName = ctx.match[3] ?? '';
+      await confirmDeleteChunk(ctx, env, slug, type, fileName);
+    }
+  );
+
+  bot.callbackQuery(
+    /^cms:epdy:([^:]+):(meta|streams):([^:]+)$/,
+    async (ctx) => {
+      const slug = ctx.match[1] ?? '';
+      const type = (ctx.match[2] ?? 'meta') as 'meta' | 'streams';
+      const fileName = ctx.match[3] ?? '';
+      await execDeleteChunk(ctx, env, slug, type, fileName);
+    }
+  );
+
+  bot.callbackQuery(/^cms:epb:(.+)$/, async (ctx) => {
+    const slug = ctx.match[1] ?? '';
+    await showBatchShortcut(ctx, env, slug);
+  });
+
+  /* EDIT */
   bot.callbackQuery(/^cms:edit:(.+)$/, async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;
@@ -1182,10 +1437,7 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
     await saveEdits(ctx, env, userId, session.slug, session.edits);
   });
 
-  /* ============================================================
-     TAHAP 3 — belum diimplement
-     ============================================================ */
-
+  /* TAHAP 3 */
   bot.callbackQuery(/^cms:del:(.+)$/, async (ctx) => {
     await ctx.answerCallbackQuery({
       text: '🗑️ Delete — coming next (Tahap 3)',
@@ -1193,7 +1445,7 @@ export function setupCmsCallbacks(bot: Bot, env: Env): void {
     });
   });
 
-  bot.callbackQuery(/^cms:sec:(.+):(chars|eps|fr)$/, async (ctx) => {
+  bot.callbackQuery(/^cms:sec:(.+):(chars|fr)$/, async (ctx) => {
     await ctx.answerCallbackQuery({
       text: '🚧 Section detail — coming next',
       show_alert: true,
