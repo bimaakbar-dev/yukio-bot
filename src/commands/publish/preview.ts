@@ -19,6 +19,8 @@ export function buildPreviewLines(
   lines.push(`🎬 <code>${escapeHtml(title)}</code>`);
   lines.push(`🆔 <code>${slug}</code>`);
   lines.push('');
+  lines.push('<i>Target: yukio-data</i>');
+  lines.push('');
 
   const hasMeta = summary.yukionime.metadata;
   const d = summary.yukioData;
@@ -26,15 +28,13 @@ export function buildPreviewLines(
   const hasEps = d.episodes.count > 0;
   const hasFr = d.franchises.count > 0;
   const hasVa = d.actors.count > 0;
-  const hasQFr = summary.qimochi.franchises.count > 0;
 
   const totalReady =
     (hasMeta ? 1 : 0) +
     (hasChars ? 1 : 0) +
     (hasEps ? 1 : 0) +
     (hasFr ? 1 : 0) +
-    (hasVa ? 1 : 0) +
-    (hasQFr ? 1 : 0);
+    (hasVa ? 1 : 0);
 
   if (totalReady === 0) {
     lines.push('<i>Tidak ada data siap di-publish.</i>');
@@ -44,32 +44,27 @@ export function buildPreviewLines(
   const check = (k: SectionKey) => (selected.has(k) ? '✅' : '⬜');
 
   if (hasMeta) {
-    lines.push(
-      `${check('meta')} ${SECTION_LABEL.meta} → yukionime + qimochi`
-    );
+    lines.push(`${check('meta')} ${SECTION_LABEL.meta} → <b>yukio-data</b>`);
   }
   if (hasChars) {
     lines.push(
-      `${check('chars')} ${SECTION_LABEL.chars} (${d.characters.count}) → yukio-data (${d.characters.files} file)`
+      `${check('chars')} ${SECTION_LABEL.chars} (${d.characters.count}) → <b>yukio-data</b> (${d.characters.files} file)`
     );
   }
   if (hasEps) {
     lines.push(
-      `${check('eps')} ${SECTION_LABEL.eps} (${d.episodes.count}) → yukio-data (${d.episodes.files} file)`
+      `${check('eps')} ${SECTION_LABEL.eps} (${d.episodes.count}) → <b>yukio-data</b> (${d.episodes.files} file)`
     );
   }
   if (hasFr) {
     lines.push(
-      `${check('fr')} ${SECTION_LABEL.fr} (${d.franchises.count}) → yukio-data`
+      `${check('fr')} ${SECTION_LABEL.fr} (${d.franchises.count}) → <b>yukio-data</b>`
     );
   }
   if (hasVa) {
     lines.push(
-      `${check('va')} ${SECTION_LABEL.va} (${d.actors.count}) → yukio-data (${d.actors.files} file)`
+      `${check('va')} ${SECTION_LABEL.va} (${d.actors.count}) → <b>yukio-data</b> (${d.actors.files} file)`
     );
-  }
-  if (hasQFr) {
-    lines.push(`${check('fr')} ${SECTION_LABEL.fr} → qimochi`);
   }
 
   lines.push('');
@@ -91,7 +86,7 @@ export function buildPreviewKeyboard(
   const hasMeta = summary.yukionime.metadata;
   const hasChars = d.characters.count > 0;
   const hasEps = d.episodes.count > 0;
-  const hasFr = d.franchises.count > 0 || summary.qimochi.franchises.count > 0;
+  const hasFr = d.franchises.count > 0;
   const hasVa = d.actors.count > 0;
 
   const mark = (k: SectionKey) => (selected.has(k) ? '✅' : '⬜');
