@@ -126,3 +126,13 @@ export async function getCmsIndex(
   await setCache(env.DB, CACHE_KEY, index, TREE_TTL_MS);
   return { index, fromCache: false };
 }
+
+export async function invalidateCmsIndex(env: Env): Promise<void> {
+  try {
+    await env.DB.prepare('DELETE FROM cache WHERE key = ?')
+      .bind('cms:index')
+      .run();
+  } catch (err) {
+    console.warn('[CmsCache] invalidate failed:', err);
+  }
+}
