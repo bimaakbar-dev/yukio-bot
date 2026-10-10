@@ -8,7 +8,6 @@ import { escapeHtml, slugify } from '../../lib/utils';
 import { getLatestSessionByUser } from '../../lib/dba-session';
 import {
   buildMetadataFile,
-  buildQimochiMarkdownFromDba,
   buildCharacterFiles,
   buildEpisodeFiles,
   buildFranchiseFiles,
@@ -48,7 +47,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
     const files: FileToCommit[] = [];
     const summary = emptySummary();
 
-    /* ── Metadata → yukionime + qimochi ──────── */
+    /* ── Metadata → yukio-data ──────────────── */
     let media: AniListMedia | null = null;
     if (session.metadata) {
       try {
@@ -57,15 +56,10 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
     }
 
     if (media) {
-      // Resolve sinopsis SEKALI (share ke yukionime + qimochi)
       const body = await resolveSessionBody(env, session, media);
-
       const metaFile = buildMetadataFile(session, slug, media, body);
       files.push(metaFile);
       summary.yukionime.metadata = true;
-
-      const qimochiMd = buildQimochiMarkdownFromDba(slug, media, body);
-      files.push(qimochiMd);
     }
 
     /* ── Characters ──────────────────────────── */
@@ -99,21 +93,9 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
       const frFiles = await buildFranchiseFiles(session, slug);
       if (frFiles.length > 0) {
         files.push(...frFiles);
-
-        const yukioFr = frFiles.find((f) => f.target === 'yukio-data');
-        if (yukioFr) {
-          summary.yukioData.franchises = {
-            count: yukioFr.itemCount ?? 0,
-            files: 1,
-          };
-        }
-        const qFr = frFiles.find((f) => f.target === 'qimochi');
-        if (qFr) {
-          summary.qimochi.franchises = {
-            count: qFr.itemCount ?? 0,
-            files: 1,
-          };
-        }
+        let total = 0;
+        for (const ff of frFiles) total += ff.itemCount ?? 0;
+        summary.yukioData.franchises = { count: total, files: frFiles.length };
       }
     } catch (err) {
       console.warn('[Publish] buildFranchiseFiles error:', err);
@@ -190,7 +172,7 @@ export async function doPublishNew(ctx: Context, env: Env): Promise<void> {
 
 export const publishCommand: CommandDefinition = {
   name: 'publish',
-  description: 'Push semua data ke yukionime + yukio-data',
+  description: 'Push semua data ke yukio-data',
   usage: '/publish',
   adminOnly: true,
 
