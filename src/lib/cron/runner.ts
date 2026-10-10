@@ -78,7 +78,7 @@ async function buildNewChunk(
 async function updateYukioDataMd(
   env: Env,
   slug: string
-): Promise<FileToCommit | null> {
+): Promise<{ path: string; content: string; target: 'yukio-data' } | null> {
   const mdPath = `src/content/anime/${slug}.md`;
 
   try {
