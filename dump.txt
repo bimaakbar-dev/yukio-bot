@@ -1,6 +1,6 @@
 === REPO DUMP ===
-Generated: Fri Oct  9 18:28:45 UTC 2026
-Commit: 1a7ddf2
+Generated: Sat Oct 10 04:30:44 UTC 2026
+Commit: 7ef2254
 
 === STRUCTURE ===
 .
@@ -9,7 +9,6 @@ Commit: 1a7ddf2
 ./src/commands
 ./src/commands/edit
 ./src/commands/publish
-./src/commands/track
 ./src/discord
 ./src/discord/commands
 ./src/lib
@@ -25,6 +24,7 @@ Commit: 1a7ddf2
 ./.gitignore
 ./README.md
 ./package.json
+./payload.txt
 ./src/business/autoReply.ts
 ./src/commands/ai.ts
 ./src/commands/anime.ts
@@ -55,13 +55,8 @@ Commit: 1a7ddf2
 ./src/commands/publish/types.ts
 ./src/commands/registry.ts
 ./src/commands/status.ts
-./src/commands/track-callbacks.ts
 ./src/commands/track-delete.ts
-./src/commands/track-helpers.ts
 ./src/commands/track.ts
-./src/commands/track/flow.ts
-./src/commands/track/state.ts
-./src/commands/track/ui.ts
 ./src/commands/va.ts
 ./src/discord/commands/anime.ts
 ./src/discord/commands/decode.ts
@@ -455,6 +450,1451 @@ pnpm-debug.log*
     "wrangler": "^3.99.0"
   }
 }
+===== END FILE =====
+
+===== FILE: ./payload.txt =====
+=== FILE: src/commands/track.ts ===
+// src/commands/track.ts
+import type { CommandDefinition } from './registry';
+import type { Context } from 'grammy';
+import { InlineKeyboard } from 'grammy';
+import type { Env } from '../types/env';
+import type { D1Database } from '@cloudflare/workers-types';
+import { escapeHtml } from '../lib/utils';
+import { githubGetFile } from '../lib/github';
+import {
+  deleteTrackedAnime,
+  listAllTrackedAnime,
+  saveTrackedAnime,
+  isInScheduleWindow,
+  type SiteKey,
+  type TrackedAnimeRow,
+} from '../lib/cron/state';
+import { updateTrackedAnime } from '../lib/cron/state-extra';
+import { createLazyInit } from '../lib/lazy-init';
+
+/* ============================================================
+   CONSTANTS
+   ============================================================ */
+
+const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku'];
+const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
+const PER_PAGE = 8;
+const SESSION_TTL_MS = 15 * 60 * 1000;
+
+const SITE_LABEL: Record<SiteKey, string> = {
+  lexanime: '🎬 lexanime',
+  animesub: '🎬 animesub',
+  samehadaku: '🎬 samehadaku',
+};
+
+const DAYS = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
+const DAYS_SHORT = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
+
+/* ============================================================
+   SESSION STATE
+   ============================================================ */
+
+export type EditStep =
+  | 'add_site'
+  | 'add_slug'
+  | 'add_source'
+  | 'add_day'
+  | 'add_hour'
+  | 'add_confirm'
+  | 'edit_value';
+
+export interface TrackSessionRow {
+  session_id: string;
+  user_id: number;
+  step: EditStep;
+  site: string | null;
+  slug: string | null;
+  source_slug: string | null;
+  schedule_day: string | null;
+  schedule_hour: number | null;
+  schedule_minute: number | null;
+  buffer_min: number;
+  edit_field: string | null;
+  created_at: number;
+  expires_at: number;
+}
+
+const ensureSessionDb = createLazyInit('TrackSessV2', async (db) => {
+  await db
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS track_sessions_v2 (
+        session_id       TEXT PRIMARY KEY,
+        user_id          INTEGER NOT NULL,
+        step             TEXT NOT NULL,
+        site             TEXT,
+        slug             TEXT,
+        source_slug      TEXT,
+        schedule_day     TEXT,
+        schedule_hour    INTEGER,
+        schedule_minute  INTEGER,
+        buffer_min       INTEGER NOT NULL DEFAULT 60,
+        edit_field       TEXT,
+        created_at       INTEGER NOT NULL,
+        expires_at       INTEGER NOT NULL
+      )`
+    )
+    .run();
+});
+
+export async function createSession(
+  db: D1Database,
+  userId: number,
+  step: EditStep,
+  initial: Partial<TrackSessionRow> = {}
+): Promise<string> {
+  await ensureSessionDb(db);
+  const sessionId = 'ts_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
+  const now = Date.now();
+
+  await db
+    .prepare(
+      `INSERT INTO track_sessions_v2
+        (session_id, user_id, step, site, slug, source_slug, schedule_day,
+         schedule_hour, schedule_minute, buffer_min, edit_field, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      sessionId,
+      userId,
+      step,
+      initial.site ?? null,
+      initial.slug ?? null,
+      initial.source_slug ?? null,
+      initial.schedule_day ?? null,
+      initial.schedule_hour ?? null,
+      initial.schedule_minute ?? null,
+      initial.buffer_min ?? 60,
+      initial.edit_field ?? null,
+      now,
+      now + SESSION_TTL_MS
+    )
+    .run();
+
+  return sessionId;
+}
+
+export async function getSession(
+  db: D1Database,
+  sessionId: string
+): Promise<TrackSessionRow | null> {
+  await ensureSessionDb(db);
+  const row = await db
+    .prepare('SELECT * FROM track_sessions_v2 WHERE session_id = ?')
+    .bind(sessionId)
+    .first<TrackSessionRow>();
+
+  if (!row) return null;
+  if (row.expires_at < Date.now()) {
+    await db
+      .prepare('DELETE FROM track_sessions_v2 WHERE session_id = ?')
+      .bind(sessionId)
+      .run()
+      .catch(() => {});
+    return null;
+  }
+  return row;
+}
+
+export async function getLatestSession(
+  db: D1Database,
+  userId: number
+): Promise<TrackSessionRow | null> {
+  await ensureSessionDb(db);
+  return db
+    .prepare(
+      `SELECT * FROM track_sessions_v2
+       WHERE user_id = ? AND expires_at > ?
+       ORDER BY created_at DESC LIMIT 1`
+    )
+    .bind(userId, Date.now())
+    .first<TrackSessionRow>();
+}
+
+export async function updateSession(
+  db: D1Database,
+  sessionId: string,
+  patch: Partial<TrackSessionRow>
+): Promise<void> {
+  await ensureSessionDb(db);
+  const sets: string[] = [];
+  const values: unknown[] = [];
+
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    if (k === 'session_id' || k === 'user_id' || k === 'created_at') continue;
+    sets.push(`${k} = ?`);
+    values.push(v);
+  }
+  if (sets.length === 0) return;
+  values.push(sessionId);
+
+  await db
+    .prepare(`UPDATE track_sessions_v2 SET ${sets.join(', ')} WHERE session_id = ?`)
+    .bind(...values)
+    .run();
+}
+
+export async function deleteSession(
+  db: D1Database,
+  sessionId: string
+): Promise<void> {
+  try {
+    await ensureSessionDb(db);
+    await db
+      .prepare('DELETE FROM track_sessions_v2 WHERE session_id = ?')
+      .bind(sessionId)
+      .run();
+  } catch {}
+}
+
+/* ============================================================
+   UTILS
+   ============================================================ */
+
+function isValidSite(s: string): s is SiteKey {
+  return ALL_SITES.includes(s as SiteKey);
+}
+
+function countBits(n: number): number {
+  let c = 0, x = n;
+  while (x > 0) {
+    c += x & 1;
+    x >>>= 1;
+  }
+  return c;
+}
+
+export function parseTime(input: string): { hour: number; minute: number } | null {
+  const cleaned = input.trim().replace(/[.,]/g, ':');
+  const parts = cleaned.split(':');
+
+  if (parts.length === 1) {
+    const h = parseInt(parts[0] ?? '', 10);
+    if (isNaN(h) || h < 0 || h > 23) return null;
+    return { hour: h, minute: 0 };
+  }
+  if (parts.length === 2) {
+    const h = parseInt(parts[0] ?? '', 10);
+    const m = parseInt(parts[1] ?? '', 10);
+    if (isNaN(h) || isNaN(m)) return null;
+    if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+    return { hour: h, minute: m };
+  }
+  return null;
+}
+
+function extractSamehadakuSlug(url: string): string | null {
+  const t = url.trim();
+  const m1 = t.match(/\/anime\/([a-z0-9-]+)\/?/i);
+  if (m1?.[1]) return m1[1].toLowerCase();
+  const m2 = t.match(/\/([a-z0-9-]+?)-episode-\d+-subtitle-indonesia\/?/i);
+  if (m2?.[1]) return m2[1].toLowerCase();
+  return null;
+}
+
+/* ============================================================
+   MENU RENDER
+   ============================================================ */
+
+export async function showMainMenu(
+  ctx: Context,
+  env: Env,
+  edit = false
+): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const total = all.length;
+  const active = all.filter((r) => r.status === 'active').length;
+  const paused = all.filter((r) => r.status === 'paused').length;
+  const pending = all.filter((r) => r.status === 'active' && isInScheduleWindow(r)).length;
+
+  const lines: string[] = [];
+  lines.push('📡 <b>Track Anime</b>');
+  lines.push('');
+  lines.push(`📊 Total: <b>${total}</b>`);
+  if (active > 0) lines.push(`🟢 Active: ${active}`);
+  if (paused > 0) lines.push(`⏸️ Paused: ${paused}`);
+  if (pending > 0) {
+    lines.push('');
+    lines.push(`⚠️ <b>${pending} tertinggal!</b>`);
+  }
+  lines.push('');
+  lines.push('<i>Pilih action:</i>');
+
+  const kb = new InlineKeyboard()
+    .text('➕ Tambah Baru', 'tr:a')
+    .text('📋 Daftar', 'tr:l')
+    .row()
+    .text('🗑️ Hapus', 'tr:dm')
+    .text('🔄 Catch-up', 'tr:c');
+
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
+
+  if (edit && ctx.callbackQuery?.message?.message_id) {
+    await ctx
+      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
+      .catch(() => {});
+    return;
+  }
+
+  await ctx.reply(lines.join('\n'), payload);
+}
+
+export async function showList(
+  ctx: Context,
+  env: Env,
+  page = 0
+): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  all.sort((a, b) => a.slug.localeCompare(b.slug));
+
+  if (all.length === 0) {
+    const payload = {
+      parse_mode: 'HTML' as const,
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:h'),
+    };
+    if (ctx.callbackQuery?.message?.message_id) {
+      await ctx.editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, '📭 Belum ada anime.', payload).catch(() => {});
+    } else {
+      await ctx.reply('📭 Belum ada anime.', payload);
+    }
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(all.length / PER_PAGE));
+  const p = Math.min(Math.max(0, page), totalPages - 1);
+  const start = p * PER_PAGE;
+  const items = all.slice(start, start + PER_PAGE);
+
+  const lines: string[] = [];
+  lines.push(`📋 <b>Tracked (${all.length})</b>`);
+  lines.push(`<i>Halaman ${p + 1}/${totalPages}</i>`);
+  lines.push('');
+  lines.push('<i>Tap anime untuk detail & edit:</i>');
+
+  const kb = new InlineKeyboard();
+  for (const r of items) {
+    const icon = r.status === 'active' ? '🟢' : r.status === 'paused' ? '⏸️' : '✅';
+    const pending = isInScheduleWindow(r) ? ' ⚠️' : '';
+    const label = `${icon} ${r.slug}${pending}`;
+    const short = label.length > 50 ? label.slice(0, 48) + '…' : label;
+    kb.text(short, `tr:v:${r.slug}`).row();
+  }
+
+  if (totalPages > 1) {
+    if (p > 0) kb.text('◀️', `tr:lp:${p - 1}`);
+    if (p < totalPages - 1) kb.text('▶️', `tr:lp:${p + 1}`);
+    kb.row();
+  }
+  kb.text('◀️ Kembali', 'tr:h');
+
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
+
+  if (ctx.callbackQuery?.message?.message_id) {
+    await ctx
+      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
+      .catch(() => {});
+    return;
+  }
+
+  await ctx.reply(lines.join('\n'), payload);
+}
+
+export async function showDetail(
+  ctx: Context,
+  env: Env,
+  slug: string,
+  edit = false
+): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const row = all.find((r) => r.slug === slug);
+
+  if (!row) {
+    await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }).catch(() => {});
+    return;
+  }
+
+  const statusIcon = row.status === 'active' ? '🟢' : row.status === 'paused' ? '⏸️' : '✅';
+  const hh = String(row.schedule_hour).padStart(2, '0');
+  const mm = String(row.schedule_minute ?? 0).padStart(2, '0');
+  const pending = isInScheduleWindow(row) ? ' ⚠️' : '';
+
+  const lines: string[] = [];
+  lines.push(`📄 <code>${escapeHtml(row.slug)}</code>${pending}`);
+  lines.push('');
+  lines.push(`🎬 Site: <b>${row.site}</b>`);
+  lines.push(`🔗 Source: <code>${escapeHtml(row.source_slug)}</code>`);
+  lines.push(`📅 ${row.schedule_day} ${hh}:${mm} WIB`);
+  lines.push(`${statusIcon} Status: <b>${row.status}</b>`);
+  lines.push(`📼 Last ep: <b>${row.last_ep}</b>`);
+  lines.push(`📦 Chunk: <b>${row.chunk_start}-${row.chunk_end}</b>`);
+  lines.push(`⏱️ Buffer: <b>${row.buffer_min}</b> menit`);
+  if (row.last_check_at) {
+    const ago = Math.round((Date.now() - row.last_check_at) / 60000);
+    const agoStr = ago < 60 ? `${ago}m lalu` : `${Math.round(ago / 60)}j lalu`;
+    lines.push(`🕐 Last check: ${agoStr}`);
+  }
+  lines.push('');
+  lines.push('<i>Pilih field untuk edit:</i>');
+
+  const kb = new InlineKeyboard()
+    .text('🎬 Site', `tr:e:${slug}:site`)
+    .text('🔗 Source', `tr:e:${slug}:source_slug`)
+    .row()
+    .text('📅 Hari', `tr:e:${slug}:schedule_day`)
+    .text('⏰ Jam', `tr:e:${slug}:schedule_hour`)
+    .row()
+    .text('📼 Last Ep', `tr:e:${slug}:last_ep`)
+    .text('📦 Chunk', `tr:e:${slug}:chunk`)
+    .row()
+    .text('⏱️ Buffer', `tr:e:${slug}:buffer_min`)
+    .text('🔀 Status', `tr:e:${slug}:status`)
+    .row()
+    .text('🔄 Check', `tr:cx:${slug}`)
+    .text('♻️ Reset', `tr:rs:${slug}`)
+    .row()
+    .text('🗑️ Hapus', `tr:dv:${slug}`)
+    .text('◀️ Kembali', 'tr:l');
+
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
+
+  if (edit && ctx.callbackQuery?.message?.message_id) {
+    await ctx
+      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
+      .catch(() => {});
+    return;
+  }
+
+  await ctx.reply(lines.join('\n'), payload);
+}
+
+/* ============================================================
+   EDIT PROMPT
+   ============================================================ */
+
+export async function promptEdit(
+  ctx: Context,
+  env: Env,
+  userId: number,
+  slug: string,
+  field: string
+): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const row = all.find((r) => r.slug === slug);
+
+  if (!row) {
+    await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan' }).catch(() => {});
+    return;
+  }
+
+  const sessionId = await createSession(env.DB, userId, 'edit_value', {
+    slug,
+    edit_field: field,
+  });
+
+  let prompt = '';
+  let kb: InlineKeyboard | undefined;
+
+  switch (field) {
+    case 'site':
+      prompt =
+        `🎬 <b>Edit Site</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Site sekarang: <b>${row.site}</b>\n\n` +
+        `Pilih site baru:`;
+      kb = new InlineKeyboard()
+        .text('🎬 lexanime', `tr:set:${sessionId}:lexanime`)
+        .text('🎬 animesub', `tr:set:${sessionId}:animesub`)
+        .row()
+        .text('🎬 samehadaku', `tr:set:${sessionId}:samehadaku`)
+        .row()
+        .text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    case 'status':
+      prompt =
+        `🔀 <b>Edit Status</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Status sekarang: <b>${row.status}</b>\n\n` +
+        `Pilih status baru:`;
+      kb = new InlineKeyboard()
+        .text('🟢 Active', `tr:set:${sessionId}:active`)
+        .text('⏸️ Paused', `tr:set:${sessionId}:paused`)
+        .row()
+        .text('✅ Finished', `tr:set:${sessionId}:finished`)
+        .row()
+        .text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    case 'schedule_day':
+      prompt =
+        `📅 <b>Edit Hari</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Sekarang: <b>${row.schedule_day}</b>\n\n` +
+        `Pilih hari baru:`;
+      {
+        const kbd = new InlineKeyboard();
+        for (let i = 0; i < 7; i++) {
+          kbd.text(DAYS_SHORT[i]!, `tr:set:${sessionId}:${DAYS[i]}`);
+          if ((i + 1) % 4 === 0) kbd.row();
+        }
+        kbd.text('🎲 Random', `tr:set:${sessionId}:Random`).row();
+        kbd.text('❌ Batal', `tr:v:${slug}`);
+        kb = kbd;
+      }
+      break;
+
+    case 'schedule_hour':
+      prompt =
+        `⏰ <b>Edit Jam</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Sekarang: <b>${String(row.schedule_hour).padStart(2, '0')}:${String(row.schedule_minute ?? 0).padStart(2, '0')} WIB</b>\n\n` +
+        `Kirim jam baru (WIB, 24 jam):\n` +
+        `<code>18</code> / <code>18:30</code> / <code>18.15</code>`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    case 'last_ep':
+      prompt =
+        `📼 <b>Edit Last Episode</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Sekarang: <b>${row.last_ep}</b>\n\n` +
+        `Kirim angka last_ep baru (0 untuk reset):\n` +
+        `<i>Set 0 → bot akan re-detect dari awal</i>`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    case 'chunk':
+      prompt =
+        `📦 <b>Edit Chunk</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Sekarang: <b>${row.chunk_start}-${row.chunk_end}</b>\n\n` +
+        `Kirim range chunk baru:\n` +
+        `Format: <code>2-6</code> (start-end)`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    case 'buffer_min':
+      prompt =
+        `⏱️ <b>Edit Buffer</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Sekarang: <b>${row.buffer_min}</b> menit\n\n` +
+        `Kirim buffer baru (menit):\n` +
+        `<i>Minimal 5, maksimal 480</i>`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    case 'source_slug':
+      prompt =
+        `🔗 <b>Edit Source Slug</b>\n\n` +
+        `Anime: <code>${escapeHtml(slug)}</code>\n` +
+        `Sekarang: <code>${escapeHtml(row.source_slug)}</code>\n\n` +
+        `Kirim slug baru:\n` +
+        `• Slug langsung: <code>tensei-goblin-shitsumon-sub-indo</code>\n` +
+        `• Atau URL Samehadaku: <code>https://samehadaku.li/anime/...</code>`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      break;
+
+    default:
+      await ctx.answerCallbackQuery({ text: '❌ Field tidak dikenal' }).catch(() => {});
+      return;
+  }
+
+  await ctx.answerCallbackQuery().catch(() => {});
+  await ctx
+    .editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, prompt, {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    })
+    .catch(() => {});
+}
+
+/* ============================================================
+   ADD FLOW
+   ============================================================ */
+
+export async function startAddFlow(
+  ctx: Context,
+  env: Env,
+  userId: number
+): Promise<void> {
+  const sessionId = await createSession(env.DB, userId, 'add_site');
+
+  const text =
+    '<b>➕ Track Anime Baru</b>\n\n' +
+    '<b>Step 1/5</b> · Pilih situs sumber:\n\n' +
+    '<i>Bot akan cek situs ini setiap hari untuk episode baru.</i>';
+
+  const kb = new InlineKeyboard()
+    .text('🎬 lexanime', `tr:site:${sessionId}:lexanime`)
+    .text('🎬 animesub', `tr:site:${sessionId}:animesub`)
+    .row()
+    .text('🎬 samehadaku', `tr:site:${sessionId}:samehadaku`)
+    .row()
+    .text('❌ Batal', `tr:x:${sessionId}`);
+
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
+
+  if (ctx.callbackQuery?.message?.message_id) {
+    await ctx
+      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, text, payload)
+      .catch(() => {});
+    return;
+  }
+
+  await ctx.reply(text, payload);
+}
+
+/* ============================================================
+   CATCHUP
+   ============================================================ */
+
+export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
+  const loading = await ctx.reply('🔍 Mencari anime yang tertinggal...');
+
+  try {
+    const all = await listAllTrackedAnime(env.DB);
+    const active = all.filter((r) => r.status === 'active');
+    const candidates = active.filter(isInScheduleWindow);
+
+    if (candidates.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `✅ <b>Semua anime up-to-date.</b>\n\n` +
+          `<i>Total aktif: ${active.length} anime, tidak ada yang tertinggal.</i>`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard().text('🏠 Menu', 'tr:h'),
+        }
+      );
+      return;
+    }
+
+    const MAX_PER_RUN = 3;
+    const batch = candidates.slice(0, MAX_PER_RUN);
+    const remaining = candidates.length - batch.length;
+
+    const results: { slug: string; pushed: number; error?: string }[] = [];
+    let totalPushed = 0;
+
+    for (let i = 0; i < batch.length; i++) {
+      const row = batch[i]!;
+
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          loading.message_id,
+          `🔄 <b>Catch-up</b> [${i + 1}/${batch.length}]\n\n` +
+            `🎬 <code>${escapeHtml(row.slug)}</code>\n` +
+            `📅 ${row.schedule_day} ${String(row.schedule_hour).padStart(2, '0')}:${String(row.schedule_minute ?? 0).padStart(2, '0')}`,
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          }
+        )
+        .catch(() => {});
+
+      try {
+        const { runManualCheck } = await import('../lib/cron/runner');
+        const res = await runManualCheck(env, row.slug);
+        totalPushed += res.episodesPushed;
+        results.push({
+          slug: row.slug,
+          pushed: res.episodesPushed,
+          error: res.errors.length > 0 ? res.errors[0] : undefined,
+        });
+      } catch (err: any) {
+        results.push({
+          slug: row.slug,
+          pushed: 0,
+          error: err?.message ?? 'unknown',
+        });
+      }
+    }
+
+    const lines: string[] = [];
+    lines.push(`✅ <b>Catch-up selesai</b>`);
+    lines.push('');
+    lines.push(`📼 Total episode di-push: <b>${totalPushed}</b>`);
+    lines.push(`🔍 Dicek: <b>${batch.length}</b> anime`);
+
+    const success = results.filter((r) => !r.error);
+    const failed = results.filter((r) => r.error);
+
+    if (success.length > 0) {
+      lines.push('');
+      lines.push(`<b>✅ Sukses (${success.length}):</b>`);
+      for (const r of success.slice(0, 10)) {
+        lines.push(`• <code>${escapeHtml(r.slug)}</code> — ${r.pushed} ep`);
+      }
+    }
+
+    if (failed.length > 0) {
+      lines.push('');
+      lines.push(`<b>⚠️ Gagal (${failed.length}):</b>`);
+      for (const r of failed.slice(0, 5)) {
+        lines.push(
+          `• <code>${escapeHtml(r.slug)}</code> — <i>${escapeHtml((r.error ?? '').slice(0, 80))}</i>`
+        );
+      }
+    }
+
+    if (remaining > 0) {
+      lines.push('');
+      lines.push(
+        `<i>⏭️ ${remaining} anime lain masih tertinggal. Klik 🔄 lagi.</i>`
+      );
+    }
+
+    const kb = new InlineKeyboard();
+    if (remaining > 0) {
+      kb.text('🔄 Lanjut Catch-up', 'tr:c').row();
+    }
+    kb.text('🏠 Menu Utama', 'tr:h');
+
+    await ctx.api
+      .editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      })
+      .catch(() => {});
+  } catch (err: any) {
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        loading.message_id,
+        `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+        { parse_mode: 'HTML' }
+      )
+      .catch(() => {});
+  }
+}
+
+/* ============================================================
+   TEXT INPUT HANDLER
+   ============================================================ */
+
+export async function handleTrackTextV2(
+  ctx: Context,
+  env: Env
+): Promise<boolean> {
+  const userId = ctx.from?.id;
+  if (!userId) return false;
+
+  const text = ctx.message?.text?.trim() ?? '';
+  if (!text || text.startsWith('/')) return false;
+
+  const session = await getLatestSession(env.DB, userId);
+  if (!session) return false;
+
+  switch (session.step) {
+    case 'add_slug':
+      return await handleAddSlug(ctx, env, session, text);
+    case 'add_source':
+      return await handleAddSource(ctx, env, session, text);
+    case 'add_hour':
+      return await handleAddHour(ctx, env, session, text);
+    case 'edit_value':
+      return await handleEditValue(ctx, env, session, text);
+    default:
+      return false;
+  }
+}
+
+async function handleAddSlug(
+  ctx: Context,
+  env: Env,
+  session: TrackSessionRow,
+  slug: string
+): Promise<boolean> {
+  if (!SLUG_RE.test(slug)) {
+    await ctx.reply('❌ Slug invalid. Coba lagi:');
+    return true;
+  }
+
+  const path = `src/content/anime/${slug}.md`;
+  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
+  try {
+    file = await githubGetFile(env, path, 'qimochi');
+  } catch {}
+
+  if (!file) {
+    await ctx.reply(
+      `❌ <b>Markdown belum ada di qimochi.</b>\n\n` +
+        `Path: <code>${escapeHtml(path)}</code>\n\n` +
+        `<i>Push dulu via /anime → Post ke qimochi.</i>\n` +
+        `<i>Kirim slug lagi kalau salah ketik.</i>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return true;
+  }
+
+  await updateSession(env.DB, session.session_id, {
+    slug,
+    source_slug: slug,
+    step: 'add_source',
+  });
+
+  const isSamehadaku = session.site === 'samehadaku';
+  const prompt = isSamehadaku
+    ? `<b>Step 3/5</b> · Slug di <b>samehadaku</b>\n\n` +
+      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
+      `<b>Opsi input:</b>\n` +
+      `• URL anime Samehadaku\n` +
+      `• Slug langsung\n` +
+      `• Kirim <code>-</code> kalau sama dengan qimochi`
+    : `<b>Step 3/5</b> · Slug di <b>${session.site}</b>\n\n` +
+      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
+      `<b>Kalau sama:</b> kirim <code>-</code>\n` +
+      `<b>Kalau beda:</b> kirim slug situs`;
+
+  await ctx.reply(prompt, {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
+  return true;
+}
+
+async function handleAddSource(
+  ctx: Context,
+  env: Env,
+  session: TrackSessionRow,
+  input: string
+): Promise<boolean> {
+  let sourceSlug: string;
+
+  if (input === '-') {
+    sourceSlug = session.slug ?? '';
+  } else if (session.site === 'samehadaku' && /^https?:\/\//i.test(input)) {
+    const extracted = extractSamehadakuSlug(input);
+    if (!extracted) {
+      await ctx.reply(
+        '❌ URL Samehadaku invalid. Format:\n' +
+          '• <code>https://samehadaku.li/anime/{slug}/</code>\n' +
+          '• <code>https://samehadaku.li/{slug}-episode-N-subtitle-indonesia/</code>',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return true;
+    }
+    sourceSlug = extracted;
+    await ctx.reply(`✅ Slug: <code>${escapeHtml(sourceSlug)}</code>`, {
+      parse_mode: 'HTML',
+    });
+  } else {
+    sourceSlug = input.trim();
+  }
+
+  if (!SLUG_RE.test(sourceSlug)) {
+    await ctx.reply('❌ Slug invalid. Kirim ulang:');
+    return true;
+  }
+
+  await updateSession(env.DB, session.session_id, {
+    source_slug: sourceSlug,
+    step: 'add_day',
+  });
+
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < 7; i++) {
+    kb.text(DAYS_SHORT[i]!, `tr:day:${session.session_id}:${DAYS[i]}`);
+    if ((i + 1) % 4 === 0) kb.row();
+  }
+  kb.text('🎲 Random', `tr:day:${session.session_id}:Random`).row();
+  kb.text('❌ Batal', `tr:x:${session.session_id}`);
+
+  await ctx.reply('<b>Step 4/5</b> · Pilih hari rilis:', {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  });
+  return true;
+}
+
+async function handleAddHour(
+  ctx: Context,
+  env: Env,
+  session: TrackSessionRow,
+  input: string
+): Promise<boolean> {
+  const parsed = parseTime(input);
+
+  if (!parsed) {
+    await ctx.reply(
+      '❌ Format jam invalid.\n\nContoh: <code>18</code> / <code>18:30</code> / <code>18.15</code>',
+      { parse_mode: 'HTML' }
+    );
+    return true;
+  }
+
+  await updateSession(env.DB, session.session_id, {
+    schedule_hour: parsed.hour,
+    schedule_minute: parsed.minute,
+    step: 'add_confirm',
+  });
+
+  const hh = String(parsed.hour).padStart(2, '0');
+  const mm = String(parsed.minute).padStart(2, '0');
+
+  await ctx.reply(
+    `📋 <b>Konfirmasi</b>\n\n` +
+      `🎬 Site: <b>${session.site}</b>\n` +
+      `🆔 Slug: <code>${escapeHtml(session.slug ?? '-')}</code>\n` +
+      `🔗 Source: <code>${escapeHtml(session.source_slug ?? '-')}</code>\n` +
+      `📅 ${session.schedule_day} ${hh}:${mm} WIB\n\n` +
+      `<i>Klik Simpan untuk konfirmasi.</i>`,
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('✅ Simpan', `tr:save:${session.session_id}`)
+        .text('❌ Batal', `tr:x:${session.session_id}`),
+    }
+  );
+  return true;
+}
+
+async function handleEditValue(
+  ctx: Context,
+  env: Env,
+  session: TrackSessionRow,
+  input: string
+): Promise<boolean> {
+  const slug = session.slug;
+  const field = session.edit_field;
+
+  if (!slug || !field) {
+    await deleteSession(env.DB, session.session_id);
+    return false;
+  }
+
+  const patch: Record<string, unknown> = {};
+  let error: string | null = null;
+
+  if (field === 'schedule_hour') {
+    const parsed = parseTime(input);
+    if (parsed) {
+      patch.schedule_hour = parsed.hour;
+      patch.schedule_minute = parsed.minute;
+    } else {
+      error = 'Format jam invalid. Contoh: 18 atau 18:30';
+    }
+  } else if (field === 'last_ep') {
+    const n = parseInt(input.trim(), 10);
+    if (!isNaN(n) && n >= 0 && n <= 9999) {
+      patch.last_ep = n;
+    } else error = 'Angka 0-9999';
+  } else if (field === 'chunk') {
+    const m = input.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) {
+      patch.chunk_start = parseInt(m[1] ?? '0', 10);
+      patch.chunk_end = parseInt(m[2] ?? '0', 10);
+    } else error = 'Format: 2-6';
+  } else if (field === 'buffer_min') {
+    const n = parseInt(input.trim(), 10);
+    if (!isNaN(n) && n >= 5 && n <= 480) {
+      patch.buffer_min = n;
+    } else error = 'Angka 5-480';
+  } else if (field === 'source_slug') {
+    let s = input.trim();
+    if (session.site === 'samehadaku' && /^https?:\/\//i.test(s)) {
+      const extracted = extractSamehadakuSlug(s);
+      if (extracted) s = extracted;
+    }
+    if (SLUG_RE.test(s)) {
+      patch.source_slug = s;
+    } else error = 'Slug invalid';
+  }
+
+  if (error) {
+    await ctx.reply(`❌ ${error}\n\nCoba lagi:`);
+    return true;
+  }
+
+  await updateTrackedAnime(env.DB, slug, patch);
+  await deleteSession(env.DB, session.session_id);
+
+  await ctx.reply(`✅ <b>Updated:</b> <code>${escapeHtml(slug)}</code>`, {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
+
+  await showDetail(ctx, env, slug, false);
+  return true;
+}
+
+/* ============================================================
+   COMMAND
+   ============================================================ */
+
+export const trackCommand: CommandDefinition = {
+  name: 'track',
+  description: 'Track anime + episode auto-fetch',
+  usage: '/track',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const parts = arg.split(/\s+/).filter(Boolean);
+    const sub = (parts[0] ?? '').toLowerCase();
+
+    if (!sub) {
+      await showMainMenu(ctx, env);
+      return;
+    }
+
+    if (sub === 'add') {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+      await startAddFlow(ctx, env, userId);
+      return;
+    }
+
+    if (sub === 'list') {
+      await showList(ctx, env, 0);
+      return;
+    }
+
+    if (sub === 'catchup') {
+      await handleCatchup(ctx, env);
+      return;
+    }
+
+    if (sub === 'remove') {
+      const slug = parts[1];
+      if (!slug) {
+        await ctx.reply('Usage: <code>/track remove &lt;slug&gt;</code>', {
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+      const ok = await deleteTrackedAnime(env.DB, slug);
+      await ctx.reply(
+        ok
+          ? `✅ <code>${escapeHtml(slug)}</code> dihapus.`
+          : `❌ Tidak ada: <code>${escapeHtml(slug)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    if (sub === 'check') {
+      const slug = parts[1];
+      if (!slug) {
+        await ctx.reply('Usage: <code>/track check &lt;slug&gt;</code>', {
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+      const loading = await ctx.reply(
+        `🔍 Cek <code>${escapeHtml(slug)}</code>...`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      try {
+        const { runManualCheck } = await import('../lib/cron/runner');
+        const result = await runManualCheck(env, slug);
+        const lines: string[] = [];
+        lines.push(`📡 <b>Manual Check: ${escapeHtml(slug)}</b>`);
+        lines.push('');
+        lines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
+        lines.push(`📼 Push: <b>${result.episodesPushed}</b> episode baru`);
+        if (result.errors.length > 0) {
+          lines.push('');
+          lines.push(`⚠️ <b>Error:</b>`);
+          for (const e of result.errors) {
+            lines.push(`• <code>${escapeHtml(e.slice(0, 200))}</code>`);
+          }
+        }
+        await ctx.api
+          .editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: new InlineKeyboard().text('🏠 Menu', 'tr:h'),
+          })
+          .catch(() => {});
+      } catch (err: any) {
+        await ctx.api
+          .editMessageText(
+            ctx.chat!.id,
+            loading.message_id,
+            `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+            { parse_mode: 'HTML' }
+          )
+          .catch(() => {});
+      }
+      return;
+    }
+
+    await ctx.reply(
+      '❌ Subcommand tidak dikenal.\n\n<i>Ketik <code>/track</code> untuk menu.</i>',
+      { parse_mode: 'HTML' }
+    );
+  },
+};
+
+void countBits;
+void SITE_LABEL;
+void saveTrackedAnime;
+void updateTrackedAnime;
+void isValidSite;
+=== END ===
+
+=== FILE: src/index.ts ===
+import { Bot, webhookCallback } from 'grammy';
+import type { Env } from './types/env';
+import { registerCommands } from './commands/registry';
+import { setupBusinessHandler } from './business/autoReply';
+import { cleanupCache } from './lib/cache';
+import { isAdmin } from './lib/permissions';
+import { escapeHtml } from './lib/utils';
+import { handleDocumentAuto } from './commands/decode';
+import { setupAnimeCallbacks } from './commands/anime';
+import { setupVaCallbacks } from './commands/va';
+import { handleDiscordRequest } from './discord/handler';
+import { registerDiscordCommands } from './discord/register';
+import { setupDatabaseAnimeCallbacks } from './commands/database-anime';
+import { setupPublishCallbacks } from './commands/publish';
+import { setupPostCallbacks } from './commands/post';
+import { setupKillCallbacks } from './commands/kill';
+import { setupEditCallbacks } from './commands/edit/callbacks';
+import { handleEditTextInput } from './commands/edit';
+import { handleTrackTextV2 } from './commands/track';
+import { setupTrackCmsCallbacks } from './commands/track-callbacks';
+import { COMMANDS } from './commands/list';
+
+const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+
+let cachedBot: Bot | null = null;
+let initPromise: Promise<void> | null = null;
+let menuSetForToken: string | null = null;
+
+function createBot(env: Env): Bot {
+  const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
+
+  bot.command('start', async (ctx) => {
+    await ctx.reply(
+      '🤖 <b>Yukio Bot</b>\n' +
+        '<i>Personal assistant</i>\n\n' +
+        'Ketik /help untuk lihat command.',
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+  });
+
+  registerCommands(bot, env);
+  setupBusinessHandler(bot, env);
+  setupAnimeCallbacks(bot, env);
+  setupDatabaseAnimeCallbacks(bot, env);
+  setupVaCallbacks(bot, env);
+  setupPublishCallbacks(bot, env);
+  setupPostCallbacks(bot, env);
+  setupKillCallbacks(bot, env);
+  setupTrackCmsCallbacks(bot, env);
+  setupEditCallbacks(bot, env);
+
+  bot.on('message:text', async (ctx) => {
+    if (!isAdmin(ctx.from?.id, env)) return;
+    if (ctx.chat?.type !== 'private') return;
+
+    try {
+      const handledTrackV2 = await handleTrackTextV2(ctx, env);
+      if (handledTrackV2) return;
+
+      const handledEdit = await handleEditTextInput(ctx, env);
+      if (handledEdit) return;
+    } catch (err) {
+      console.error('[Text] handler error:', err);
+    }
+  });
+
+  bot.on('message:document', async (ctx) => {
+    const caption = ctx.message.caption ?? '';
+    if (caption.startsWith('/')) return;
+    if (ctx.chat?.type !== 'private') return;
+    if (!isAdmin(ctx.from?.id, env)) return;
+
+    const name = ctx.message.document.file_name ?? '';
+    if (!/\.(html?|txt)$/i.test(name)) return;
+
+    try {
+      await handleDocumentAuto(ctx, env);
+    } catch (err) {
+      console.error('[AutoDecode] error:', err);
+      await ctx.reply('❌ Auto-decode gagal. Coba /decode.').catch(() => {});
+    }
+  });
+
+  bot.catch((err) => {
+    console.error('[Bot] error:', err.error);
+  });
+
+  return bot;
+}
+
+async function applyBotCommands(
+  bot: Bot
+): Promise<{ commands: { command: string; description: string }[]; skipped: string[] }> {
+  const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map(
+    (c) => ({
+      command: c.name,
+      description: (c.description || c.name).slice(0, 256),
+    })
+  );
+
+  const skipped = COMMANDS.filter(
+    (c) => !COMMAND_NAME_RE.test(c.name)
+  ).map((c) => c.name);
+
+  if (skipped.length > 0) {
+    console.warn(
+      `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
+    );
+  }
+
+  await bot.api.setMyCommands(commands);
+
+  return { commands, skipped };
+}
+
+async function setupBotMenu(bot: Bot, token: string): Promise<void> {
+  if (menuSetForToken === token) return;
+
+  try {
+    const { commands } = await applyBotCommands(bot);
+    menuSetForToken = token;
+    console.log(`[Bot] setMyCommands: ${commands.length} commands registered`);
+  } catch (err) {
+    console.error('[Bot] setMyCommands failed:', err);
+  }
+}
+
+async function getBot(env: Env): Promise<Bot> {
+  if (!cachedBot) {
+    console.log('[Bot] creating new instance');
+    cachedBot = createBot(env);
+  }
+
+  if (!initPromise) {
+    const t0 = Date.now();
+    initPromise = cachedBot
+      .init()
+      .then(async () => {
+        console.log(`[Bot] init OK in ${Date.now() - t0}ms`);
+        await setupBotMenu(cachedBot!, env.TELEGRAM_BOT_TOKEN);
+      })
+      .catch((err) => {
+        console.error(`[Bot] init FAILED in ${Date.now() - t0}ms:`, err);
+        initPromise = null;
+        cachedBot = null;
+        throw err;
+      });
+  }
+
+  await initPromise;
+  return cachedBot;
+}
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/health' || url.pathname === '/') {
+      return new Response(
+        JSON.stringify({
+          status: 'ok',
+          bot: 'yukio-bot',
+          timestamp: new Date().toISOString(),
+        }),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (url.pathname === '/debug') {
+      const t0 = Date.now();
+      try {
+        const res = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`
+        );
+        const data = await res.json();
+        return new Response(
+          JSON.stringify(
+            { ok: res.ok, status: res.status, elapsed: Date.now() - t0, data },
+            null,
+            2
+          ),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            elapsed: Date.now() - t0,
+            error: err?.message ?? String(err),
+          }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    if (url.pathname === '/debug/gh-app') {
+      try {
+        const { getInstallationToken } = await import('./lib/github-app');
+        const token = await getInstallationToken(env);
+
+        return new Response(
+          JSON.stringify(
+            {
+              ok: true,
+              tokenPreview: token.slice(0, 20) + '...',
+              tokenLength: token.length,
+              appId: env.GH_APP_ID,
+              installationId: env.GH_APP_INSTALLATION_ID,
+            },
+            null,
+            2
+          ),
+          { headers: { 'Content-Type': 'application/json' } }
+        );
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error: err?.message ?? String(err),
+          }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    if (url.pathname === '/discord/register') {
+      return registerDiscordCommands(env);
+    }
+
+    if (url.pathname === '/discord') {
+      return handleDiscordRequest(request, env, ctx);
+    }
+
+    if (url.pathname === '/webhook') {
+      const t0 = Date.now();
+      try {
+        const bot = await getBot(env);
+        const handler = webhookCallback(bot, 'cloudflare-mod', {
+          timeoutMilliseconds: 15000,
+          onTimeout: 'return',
+        });
+        const res = await handler(request);
+        console.log(`[Worker] webhook done in ${Date.now() - t0}ms`);
+        return res;
+      } catch (err: any) {
+        console.error(
+          `[Worker] webhook error after ${Date.now() - t0}ms:`,
+          err?.message ?? err
+        );
+        return new Response('OK', { status: 200 });
+      }
+    }
+    return new Response('Not Found', { status: 404 });
+  },
+
+  async scheduled(
+    event: ScheduledEvent,
+    env: Env,
+    _ctx: ExecutionContext
+  ): Promise<void> {
+    const cron = event.cron;
+    console.log(`[Cron] trigger: ${cron}`);
+
+    if (cron === '0 3 * * *') {
+      try {
+        const cleaned = await cleanupCache(env.DB);
+        console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
+      } catch (err) {
+        console.error('[Cron] cleanup error:', err);
+      }
+      return;
+    }
+    if (cron === '0 23 * * *' || cron === '0 11 * * *') {
+      try {
+        const { runCron } = await import('./lib/cron/runner');
+        const result = await runCron(env);
+
+        const summaryLines: string[] = [];
+        summaryLines.push(
+          `<b>📡 Cron Episode Report</b>\n` +
+            `🕐 <code>${cron}</code>\n`
+        );
+        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b> anime`);
+        summaryLines.push(
+          `📼 Push: <b>${result.episodesPushed}</b> episode baru`
+        );
+
+        if (result.errors.length > 0) {
+          summaryLines.push('');
+          summaryLines.push(`⚠️ <b>Error (${result.errors.length}):</b>`);
+          for (const e of result.errors.slice(0, 5)) {
+            summaryLines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
+          }
+          if (result.errors.length > 5) {
+            summaryLines.push(
+              `<i>…dan ${result.errors.length - 5} lainnya</i>`
+            );
+          }
+        }
+        try {
+          const { Bot: BotCtor } = await import('grammy');
+          const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
+          await bot.api.sendMessage(
+            ,
+            summaryLines.join('\n'),
+            {
+              parse_mode: 'HTML',
+              link_preview_options: { is_disabled: true },
+            }
+          );
+        } catch (notifErr) {
+          console.error('[Cron] notif error:', notifErr);
+        }
+
+        console.log(
+          `[Cron] episode check done — pushed ${result.episodesPushed}, errors ${result.errors.length}`
+        );
+      } catch (err) {
+        console.error('[Cron] episode check error:', err);
+      }
+      return;
+    }
+    console.warn(`[Cron] unknown trigger: ${cron}`);
+  },
+};
+=== END ===
 ===== END FILE =====
 
 ===== FILE: ./src/business/autoReply.ts =====
@@ -7505,769 +8945,6 @@ export const statusCommand: CommandDefinition = {
 };
 ===== END FILE =====
 
-===== FILE: ./src/commands/track-callbacks.ts =====
-// src/commands/track-callbacks.ts
-import type { Bot, Context } from 'grammy';
-import type { Env } from '../types/env';
-import { escapeHtml } from '../lib/utils';
-import {
-  deleteTrackedAnime,
-  listAllTrackedAnime,
-  isInScheduleWindow,
-  type SiteKey,
-  type TrackedAnimeRow,
-} from '../lib/cron/state';
-import { updateTrackedAnime } from '../lib/cron/state-extra';
-import {
-  createSession,
-  getSession,
-  getLatestSession,
-  updateSession,
-  deleteSession,
-  type TrackSessionRow,
-} from './track';
-import { githubGetFile } from '../lib/github';
-
-const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku'];
-const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
-
-function isValidSite(s: string): s is SiteKey {
-  return ALL_SITES.includes(s as SiteKey);
-}
-
-function countBits(n: number): number {
-  let c = 0, x = n;
-  while (x > 0) {
-    c += x & 1;
-    x >>>= 1;
-  }
-  return c;
-}
-
-function extractSamehadakuSlug(url: string): string | null {
-  const t = url.trim();
-  const m1 = t.match(/\/anime\/([a-z0-9-]+)\/?/i);
-  if (m1?.[1]) return m1[1].toLowerCase();
-  const m2 = t.match(/\/([a-z0-9-]+?)-episode-\d+-subtitle-indonesia\/?/i);
-  if (m2?.[1]) return m2[1].toLowerCase();
-  return null;
-}
-
-async function fetchBySite(env: Env, site: SiteKey): Promise<TrackedAnimeRow[]> {
-  const all = await listAllTrackedAnime(env.DB);
-  return all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
-}
-
-export function setupTrackCmsCallbacks(bot: Bot, env: Env): void {
-  bot.callbackQuery(/^tr:v:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
-    await ctx.answerCallbackQuery().catch(() => {});
-    await import('./track').then((m) => m.showDetailPublic(ctx, env, slug, true));
-  });
-
-  bot.callbackQuery(/^tr:e:(.+):(\w+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
-    const field = ctx.match[2] ?? '';
-    const userId = ctx.from?.id;
-    if (!userId) return;
-
-    await import('./track').then((m) =>
-      m.promptEditPublic(ctx, env, userId, slug, field)
-    );
-  });
-
-  bot.callbackQuery(/^tr:set:(ts_[a-z0-9]+):(.+)$/, async (ctx) => {
-    const sessionId = ctx.match[1] ?? '';
-    const value = ctx.match[2] ?? '';
-
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({
-        text: '⏱️ Session kadaluarsa',
-        show_alert: true,
-      });
-      return;
-    }
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔ Bukan sesi Anda' });
-      return;
-    }
-    if (!session.slug || !session.edit_field) {
-      await ctx.answerCallbackQuery({ text: '❌ Data tidak lengkap' });
-      return;
-    }
-
-    const patch: Record<string, unknown> = {};
-    const field = session.edit_field;
-
-    if (field === 'site') {
-      if (!isValidSite(value)) {
-        await ctx.answerCallbackQuery({ text: '❌ Site invalid' });
-        return;
-      }
-      patch.site = value;
-    } else if (field === 'status') {
-      if (!['active', 'paused', 'finished'].includes(value)) {
-        await ctx.answerCallbackQuery({ text: '❌ Status invalid' });
-        return;
-      }
-      patch.status = value;
-    } else if (field === 'schedule_day') {
-      patch.schedule_day = value;
-    } else {
-      await ctx.answerCallbackQuery({ text: '❌ Field butuh input teks' });
-      return;
-    }
-
-    await updateTrackedAnime(env.DB, session.slug, patch);
-    await deleteSession(env.DB, sessionId);
-
-    await ctx.answerCallbackQuery({ text: '✅ Tersimpan' });
-
-    await import('./track').then((m) =>
-      m.showDetailPublic(ctx, env, session.slug!, true)
-    );
-  });
-
-  bot.callbackQuery(/^tr:cx:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
-    await ctx.answerCallbackQuery({ text: '🔄 Cek...' });
-
-    const loading = await ctx.reply(
-      `🔍 Cek <code>${escapeHtml(slug)}</code>...`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-
-    try {
-      const { runManualCheck } = await import('../lib/cron/runner');
-      const result = await runManualCheck(env, slug);
-
-      const lines: string[] = [];
-      lines.push(`📡 <b>Check: ${escapeHtml(slug)}</b>`);
-      lines.push('');
-      lines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
-      lines.push(`📼 Push: <b>${result.episodesPushed}</b> episode`);
-
-      if (result.errors.length > 0) {
-        lines.push('');
-        lines.push('⚠️ <b>Error:</b>');
-        for (const e of result.errors.slice(0, 3)) {
-          lines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
-        }
-      }
-
-      await ctx.api
-        .editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          reply_markup: new (require('grammy').InlineKeyboard)()
-            .text('◀️ Kembali', `tr:v:${slug}`),
-        })
-        .catch(() => {});
-    } catch (err: any) {
-      await ctx.api
-        .editMessageText(
-          ctx.chat!.id,
-          loading.message_id,
-          `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 200))}</code>`,
-          { parse_mode: 'HTML' }
-        )
-        .catch(() => {});
-    }
-  });
-
-  bot.callbackQuery(/^tr:rs:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
-
-    await updateTrackedAnime(env.DB, slug, {
-      last_ep: 0,
-      chunk_start: 0,
-      chunk_end: 0,
-    });
-
-    await ctx.answerCallbackQuery({ text: '♻️ Progress di-reset' });
-
-    await import('./track').then((m) =>
-      m.showDetailPublic(ctx, env, slug, true)
-    );
-  });
-
-  bot.callbackQuery(/^tr:dv:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
-    const { InlineKeyboard } = await import('grammy');
-
-    await ctx.answerCallbackQuery({ text: '⚠️ Konfirmasi' });
-    await ctx
-      .editMessageText(
-        ctx.chat!.id,
-        ctx.callbackQuery!.message!.message_id!,
-        `⚠️ <b>Hapus anime?</b>\n\n` +
-          `<code>${escapeHtml(slug)}</code>\n\n` +
-          `<i>Anime bisa di-add ulang lewat ➕ Tambah Baru.</i>`,
-        {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          reply_markup: new InlineKeyboard()
-            .text('✅ Ya, Hapus', `tr:dvy:${slug}`)
-            .text('❌ Batal', `tr:v:${slug}`),
-        }
-      )
-      .catch(() => {});
-  });
-
-  bot.callbackQuery(/^tr:dvy:(.+)$/, async (ctx) => {
-    const slug = ctx.match[1] ?? '';
-    await deleteTrackedAnime(env.DB, slug);
-    await ctx.answerCallbackQuery({ text: '🗑️ Terhapus' });
-    await import('./track').then((m) => m.showListPublic(ctx, env, 0));
-  });
-
-  bot.callbackQuery(/^tr:lp:(\d+)$/, async (ctx) => {
-    const page = parseInt(ctx.match[1] ?? '0', 10);
-    await ctx.answerCallbackQuery().catch(() => {});
-    await import('./track').then((m) => m.showListPublic(ctx, env, page));
-  });
-
-  bot.callbackQuery(/^tr:h$/, async (ctx) => {
-    await ctx.answerCallbackQuery({ text: '🏠' });
-    await import('./track').then((m) => m.showMainMenuPublic(ctx, env, true));
-  });
-
-  bot.callbackQuery(/^tr:l$/, async (ctx) => {
-    await ctx.answerCallbackQuery().catch(() => {});
-    await import('./track').then((m) => m.showListPublic(ctx, env, 0));
-  });
-
-  bot.callbackQuery(/^tr:a$/, async (ctx) => {
-    const userId = ctx.from?.id;
-    if (!userId) return;
-    await ctx.answerCallbackQuery({ text: '➕' });
-    await import('./track').then((m) => m.startAddFlowPublic(ctx, env, userId));
-  });
-
-  bot.callbackQuery(/^tr:c$/, async (ctx) => {
-    await ctx.answerCallbackQuery({ text: '🔄' });
-    await import('./track').then((m) => m.handleCatchupPublic(ctx, env));
-  });
-
-  bot.callbackQuery(/^tr:dm$/, async (ctx) => {
-    await ctx.answerCallbackQuery().catch(() => {});
-    await import('./track-delete').then((m) => m.showDeleteMenuPublic(ctx, env));
-  });
-
-  bot.callbackQuery(/^tr:ds:(\w+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await ctx.answerCallbackQuery().catch(() => {});
-    await import('./track-delete').then((m) => m.showDeleteSitePublic(ctx, env, site));
-  });
-
-  bot.callbackQuery(/^tr:dall:(\w+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await ctx.answerCallbackQuery({ text: '⚠️' });
-    await import('./track-delete').then((m) => m.confirmDeleteAllPublic(ctx, env, site));
-  });
-
-  bot.callbackQuery(/^tr:dally:(\w+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await ctx.answerCallbackQuery({ text: '🗑️' });
-    await import('./track-delete').then((m) => m.execDeleteAllPublic(ctx, env, site));
-  });
-
-  bot.callbackQuery(/^tr:dsel:(\w+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await ctx.answerCallbackQuery().catch(() => {});
-    await import('./track-delete').then((m) => m.showDeleteSelectPublic(ctx, env, site, 0));
-  });
-
-  bot.callbackQuery(/^tr:dt:(\w+):(\d+):(\d+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    const mask = parseInt(ctx.match[2] ?? '0', 10);
-    const idx = parseInt(ctx.match[3] ?? '0', 10);
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await import('./track-delete').then((m) =>
-      m.toggleDeleteSelectPublic(ctx, env, site, mask, idx)
-    );
-  });
-
-  bot.callbackQuery(/^tr:dgo:(\w+):(\d+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    const mask = parseInt(ctx.match[2] ?? '0', 10);
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await import('./track-delete').then((m) =>
-      m.confirmDeleteSelectedPublic(ctx, env, site, mask)
-    );
-  });
-
-  bot.callbackQuery(/^tr:dgy:(\w+):(\d+)$/, async (ctx) => {
-    const site = ctx.match[1] ?? '';
-    const mask = parseInt(ctx.match[2] ?? '0', 10);
-    if (!isValidSite(site)) {
-      await ctx.answerCallbackQuery({ text: '❌' });
-      return;
-    }
-    await import('./track-delete').then((m) =>
-      m.execDeleteSelectedPublic(ctx, env, site, mask)
-    );
-  });
-
-  /* ADD flow existing */
-  bot.callbackQuery(
-    /^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku)$/,
-    async (ctx) => {
-      const sessionId = ctx.match[1] ?? '';
-      const site = (ctx.match[2] ?? '') as SiteKey;
-
-      const session = await getSession(env.DB, sessionId);
-      if (!session) {
-        await ctx.answerCallbackQuery({ text: '⏱️ Kadaluarsa', show_alert: true });
-        return;
-      }
-      if (ctx.from?.id !== session.user_id) {
-        await ctx.answerCallbackQuery({ text: '⛔' });
-        return;
-      }
-
-      await updateSession(env.DB, sessionId, { site, step: 'add_slug' });
-      await ctx.answerCallbackQuery({ text: site });
-
-      const { InlineKeyboard } = await import('grammy');
-      await ctx
-        .editMessageText(
-          '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n' +
-            '<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>\n\n' +
-            '<i>Markdown harus sudah ada di repo qimochi.</i>',
-          {
-            parse_mode: 'HTML',
-            link_preview_options: { is_disabled: true },
-            reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
-          }
-        )
-        .catch(() => {});
-    }
-  );
-
-  bot.callbackQuery(/^tr:day:(ts_[a-z0-9]+):([A-Za-z]+)$/, async (ctx) => {
-    const sessionId = ctx.match[1] ?? '';
-    const day = ctx.match[2] ?? '';
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
-      return;
-    }
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔' });
-      return;
-    }
-
-    await updateSession(env.DB, sessionId, { schedule_day: day, step: 'add_hour' });
-    await ctx.answerCallbackQuery({ text: day });
-
-    const { InlineKeyboard } = await import('grammy');
-    await ctx
-      .editMessageText(
-        `<b>Step 5/5</b> · Hari: <b>${day}</b>\n\n` +
-          `Kirim <b>jam rilis</b> (WIB, format 24 jam):\n\n` +
-          `• <code>18</code> → 18:00 WIB\n` +
-          `• <code>18:30</code> → 18:30 WIB\n` +
-          `• <code>18.15</code> → 18:15 WIB\n\n` +
-          `<i>Bot akan cek mulai jam + buffer 60 menit.</i>`,
-        {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
-        }
-      )
-      .catch(() => {});
-  });
-
-  bot.callbackQuery(/^tr:save:(ts_[a-z0-9]+)$/, async (ctx) => {
-    const sessionId = ctx.match[1] ?? '';
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
-      return;
-    }
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔' });
-      return;
-    }
-
-    if (
-      !session.site ||
-      !session.slug ||
-      !session.source_slug ||
-      !session.schedule_day ||
-      session.schedule_hour === null
-    ) {
-      await ctx.answerCallbackQuery({ text: '❌ Data kurang', show_alert: true });
-      return;
-    }
-
-    const { saveTrackedAnime } = await import('../lib/cron/state');
-    const site = session.site as SiteKey;
-    const fallbackSite: SiteKey | null =
-      site === 'lexanime' ? 'animesub' : site === 'animesub' ? 'lexanime' : null;
-
-    await saveTrackedAnime(env.DB, {
-      slug: session.slug,
-      site,
-      sourceSlug: session.source_slug,
-      fallbackSite,
-      scheduleDay: session.schedule_day,
-      scheduleHour: session.schedule_hour,
-      scheduleMinute: session.schedule_minute ?? 0,
-      bufferMin: session.buffer_min,
-    });
-
-    await deleteSession(env.DB, sessionId);
-    await ctx.answerCallbackQuery({ text: '✅ Tersimpan' });
-
-    const hh = String(session.schedule_hour).padStart(2, '0');
-    const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
-
-    await ctx
-      .editMessageText(
-        `✅ <b>Anime di-track!</b>\n\n` +
-          `🆔 <code>${escapeHtml(session.slug)}</code>\n` +
-          `🎬 ${site}\n` +
-          `📅 ${session.schedule_day} ${hh}:${mm} WIB`,
-        {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          reply_markup: undefined,
-        }
-      )
-      .catch(() => {});
-  });
-
-  bot.callbackQuery(/^tr:x:(ts_[a-z0-9]+)$/, async (ctx) => {
-    const sessionId = ctx.match[1] ?? '';
-    await deleteSession(env.DB, sessionId);
-    await ctx.answerCallbackQuery({ text: '🗑️' });
-    await ctx
-      .editMessageText('❌ <b>Dibatalkan.</b>', {
-        parse_mode: 'HTML',
-        reply_markup: undefined,
-      })
-      .catch(() => {});
-  });
-}
-
-/* ============================================================
-   TEXT INPUT HANDLER
-   ============================================================ */
-
-export async function handleTrackTextV2(
-  ctx: Context,
-  env: Env
-): Promise<boolean> {
-  const userId = ctx.from?.id;
-  if (!userId) return false;
-
-  const text = ctx.message?.text?.trim() ?? '';
-  if (!text || text.startsWith('/')) return false;
-
-  const session = await getLatestSession(env.DB, userId);
-  if (!session) return false;
-
-  switch (session.step) {
-    case 'add_slug':
-      return await handleAddSlug(ctx, env, session, text);
-    case 'add_source':
-      return await handleAddSource(ctx, env, session, text);
-    case 'add_hour':
-      return await handleAddHour(ctx, env, session, text);
-    case 'edit_value':
-      return await handleEditValue(ctx, env, session, text);
-    default:
-      return false;
-  }
-}
-
-async function handleAddSlug(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  slug: string
-): Promise<boolean> {
-  if (!SLUG_RE.test(slug)) {
-    await ctx.reply('❌ Slug invalid. Coba lagi:');
-    return true;
-  }
-
-  const path = `src/content/anime/${slug}.md`;
-  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
-  try {
-    file = await githubGetFile(env, path, 'qimochi');
-  } catch {}
-
-  if (!file) {
-    await ctx.reply(
-      `❌ <b>Markdown belum ada di qimochi.</b>\n\n` +
-        `Path: <code>${escapeHtml(path)}</code>\n\n` +
-        `<i>Push dulu via /anime → Post ke qimochi.</i>\n` +
-        `<i>Kirim slug lagi kalau salah ketik.</i>`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-    return true;
-  }
-
-  await updateSession(env.DB, session.session_id, {
-    slug,
-    source_slug: slug,
-    step: 'add_source',
-  });
-
-  const isSamehadaku = session.site === 'samehadaku';
-  const prompt = isSamehadaku
-    ? `<b>Step 3/5</b> · Slug di <b>samehadaku</b>\n\n` +
-      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
-      `<b>Opsi input:</b>\n` +
-      `• URL anime Samehadaku\n` +
-      `• Slug langsung\n` +
-      `• Kirim <code>-</code> kalau sama dengan qimochi`
-    : `<b>Step 3/5</b> · Slug di <b>${session.site}</b>\n\n` +
-      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
-      `<b>Kalau sama:</b> kirim <code>-</code>\n` +
-      `<b>Kalau beda:</b> kirim slug situs`;
-
-  await ctx.reply(prompt, {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
-  return true;
-}
-
-async function handleAddSource(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  input: string
-): Promise<boolean> {
-  let sourceSlug: string;
-
-  if (input === '-') {
-    sourceSlug = session.slug ?? '';
-  } else if (session.site === 'samehadaku' && /^https?:\/\//i.test(input)) {
-    const extracted = extractSamehadakuSlug(input);
-    if (!extracted) {
-      await ctx.reply(
-        '❌ URL Samehadaku invalid. Format:\n' +
-          '• <code>https://samehadaku.li/anime/{slug}/</code>\n' +
-          '• <code>https://samehadaku.li/{slug}-episode-N-subtitle-indonesia/</code>',
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      );
-      return true;
-    }
-    sourceSlug = extracted;
-    await ctx.reply(`✅ Slug: <code>${escapeHtml(sourceSlug)}</code>`, {
-      parse_mode: 'HTML',
-    });
-  } else {
-    sourceSlug = input.trim();
-  }
-
-  if (!SLUG_RE.test(sourceSlug)) {
-    await ctx.reply('❌ Slug invalid. Kirim ulang:');
-    return true;
-  }
-
-  await updateSession(env.DB, session.session_id, {
-    source_slug: sourceSlug,
-    step: 'add_day',
-  });
-
-  const { InlineKeyboard } = await import('grammy');
-  const DAYS_ORDER = [
-    'Senin',
-    'Selasa',
-    'Rabu',
-    'Kamis',
-    'Jumat',
-    'Sabtu',
-    'Minggu',
-  ];
-  const DAYS_SHORT = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
-
-  const kb = new InlineKeyboard();
-  for (let i = 0; i < 7; i++) {
-    kb.text(DAYS_SHORT[i]!, `tr:day:${session.session_id}:${DAYS_ORDER[i]}`);
-    if ((i + 1) % 4 === 0) kb.row();
-  }
-  kb.text('🎲 Random', `tr:day:${session.session_id}:Random`).row();
-  kb.text('❌ Batal', `tr:x:${session.session_id}`);
-
-  await ctx.reply('<b>Step 4/5</b> · Pilih hari rilis:', {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: kb,
-  });
-  return true;
-}
-
-async function handleAddHour(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  input: string
-): Promise<boolean> {
-  const cleaned = input.trim().replace(/[.,]/g, ':');
-  const parts = cleaned.split(':');
-  let hour: number | null = null;
-  let minute = 0;
-
-  if (parts.length === 1) {
-    const h = parseInt(parts[0] ?? '', 10);
-    if (!isNaN(h) && h >= 0 && h <= 23) hour = h;
-  } else if (parts.length === 2) {
-    const h = parseInt(parts[0] ?? '', 10);
-    const m = parseInt(parts[1] ?? '', 10);
-    if (!isNaN(h) && !isNaN(m) && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
-      hour = h;
-      minute = m;
-    }
-  }
-
-  if (hour === null) {
-    await ctx.reply(
-      '❌ Format jam invalid.\n\nContoh: <code>18</code> / <code>18:30</code> / <code>18.15</code>',
-      { parse_mode: 'HTML' }
-    );
-    return true;
-  }
-
-  await updateSession(env.DB, session.session_id, {
-    schedule_hour: hour,
-    schedule_minute: minute,
-    step: 'add_confirm',
-  });
-
-  const hh = String(hour).padStart(2, '0');
-  const mm = String(minute).padStart(2, '0');
-
-  const { InlineKeyboard } = await import('grammy');
-  await ctx.reply(
-    `📋 <b>Konfirmasi</b>\n\n` +
-      `🎬 Site: <b>${session.site}</b>\n` +
-      `🆔 Slug: <code>${escapeHtml(session.slug ?? '-')}</code>\n` +
-      `🔗 Source: <code>${escapeHtml(session.source_slug ?? '-')}</code>\n` +
-      `📅 ${session.schedule_day} ${hh}:${mm} WIB\n\n` +
-      `<i>Klik Simpan untuk konfirmasi.</i>`,
-    {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      reply_markup: new InlineKeyboard()
-        .text('✅ Simpan', `tr:save:${session.session_id}`)
-        .text('❌ Batal', `tr:x:${session.session_id}`),
-    }
-  );
-  return true;
-}
-
-async function handleEditValue(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  input: string
-): Promise<boolean> {
-  const slug = session.slug;
-  const field = session.edit_field;
-
-  if (!slug || !field) {
-    await deleteSession(env.DB, session.session_id);
-    return false;
-  }
-
-  const patch: Record<string, unknown> = {};
-  let error: string | null = null;
-
-  if (field === 'schedule_hour') {
-    const cleaned = input.trim().replace(/[.,]/g, ':');
-    const parts = cleaned.split(':');
-    if (parts.length === 1) {
-      const h = parseInt(parts[0] ?? '', 10);
-      if (!isNaN(h) && h >= 0 && h <= 23) {
-        patch.schedule_hour = h;
-        patch.schedule_minute = 0;
-      } else error = 'Jam harus 0-23';
-    } else if (parts.length === 2) {
-      const h = parseInt(parts[0] ?? '', 10);
-      const m = parseInt(parts[1] ?? '', 10);
-      if (!isNaN(h) && !isNaN(m) && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
-        patch.schedule_hour = h;
-        patch.schedule_minute = m;
-      } else error = 'Format jam invalid';
-    } else {
-      error = 'Format invalid. Contoh: 18 atau 18:30';
-    }
-  } else if (field === 'last_ep') {
-    const n = parseInt(input.trim(), 10);
-    if (!isNaN(n) && n >= 0 && n <= 9999) {
-      patch.last_ep = n;
-    } else error = 'Angka 0-9999';
-  } else if (field === 'chunk') {
-    const m = input.match(/^(\d+)\s*-\s*(\d+)$/);
-    if (m) {
-      patch.chunk_start = parseInt(m[1] ?? '0', 10);
-      patch.chunk_end = parseInt(m[2] ?? '0', 10);
-    } else error = 'Format: 2-6';
-  } else if (field === 'buffer_min') {
-    const n = parseInt(input.trim(), 10);
-    if (!isNaN(n) && n >= 5 && n <= 480) {
-      patch.buffer_min = n;
-    } else error = 'Angka 5-480';
-  } else if (field === 'source_slug') {
-    let s = input.trim();
-    if (session.site === 'samehadaku' && /^https?:\/\//i.test(s)) {
-      const extracted = extractSamehadakuSlug(s);
-      if (extracted) s = extracted;
-    }
-    if (SLUG_RE.test(s)) {
-      patch.source_slug = s;
-    } else error = 'Slug invalid';
-  }
-
-  if (error) {
-    await ctx.reply(`❌ ${error}\n\nCoba lagi:`);
-    return true;
-  }
-
-  await updateTrackedAnime(env.DB, slug, patch);
-  await deleteSession(env.DB, session.session_id);
-
-  await ctx.reply(`✅ <b>Updated:</b> <code>${escapeHtml(slug)}</code>`, {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
-
-  const mod = await import('./track');
-  await mod.showDetailPublic(ctx, env, slug, false);
-  return true;
-}
-===== END FILE =====
-
 ===== FILE: ./src/commands/track-delete.ts =====
 // src/commands/track-delete.ts
 import type { Context } from 'grammy';
@@ -8571,62 +9248,6 @@ function countBits(n: number): number {
 }
 ===== END FILE =====
 
-===== FILE: ./src/commands/track-helpers.ts =====
-// src/commands/track-helpers.ts
-export async function showMainMenuPublic(
-  ctx: any,
-  env: any,
-  edit: boolean
-): Promise<void> {
-  const mod = await import('./track');
-  await (mod as any).showMainMenuPublicImpl?.(ctx, env, edit);
-}
-
-export async function showListPublic(
-  ctx: any,
-  env: any,
-  page: number
-): Promise<void> {
-  const mod = await import('./track');
-  await (mod as any).showListPublicImpl?.(ctx, env, page);
-}
-
-export async function showDetailPublic(
-  ctx: any,
-  env: any,
-  slug: string,
-  edit: boolean
-): Promise<void> {
-  const mod = await import('./track');
-  await (mod as any).showDetailPublicImpl?.(ctx, env, slug, edit);
-}
-
-export async function promptEditPublic(
-  ctx: any,
-  env: any,
-  userId: number,
-  slug: string,
-  field: string
-): Promise<void> {
-  const mod = await import('./track');
-  await (mod as any).promptEditPublicImpl?.(ctx, env, userId, slug, field);
-}
-
-export async function startAddFlowPublic(
-  ctx: any,
-  env: any,
-  userId: number
-): Promise<void> {
-  const mod = await import('./track');
-  await (mod as any).startAddFlowPublicImpl?.(ctx, env, userId);
-}
-
-export async function handleCatchupPublic(ctx: any, env: any): Promise<void> {
-  const mod = await import('./track');
-  await (mod as any).handleCatchupPublicImpl?.(ctx, env);
-}
-===== END FILE =====
-
 ===== FILE: ./src/commands/track.ts =====
 // src/commands/track.ts
 import type { CommandDefinition } from './registry';
@@ -8640,55 +9261,22 @@ import {
   deleteTrackedAnime,
   listAllTrackedAnime,
   saveTrackedAnime,
-  setTrackedStatus,
-  formatScheduleTime,
   isInScheduleWindow,
   type SiteKey,
-  type TrackedAnimeRow,
 } from '../lib/cron/state';
 import { updateTrackedAnime } from '../lib/cron/state-extra';
 import { createLazyInit } from '../lib/lazy-init';
-
-/* ============================================================
-   CONSTANTS
-   ============================================================ */
 
 const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku'];
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
 const PER_PAGE = 8;
 const SESSION_TTL_MS = 15 * 60 * 1000;
-
-const SITE_LABEL: Record<SiteKey, string> = {
-  lexanime: '🎬 lexanime',
-  animesub: '🎬 animesub',
-  samehadaku: '🎬 samehadaku',
-};
-
-const DAYS = [
-  'Senin',
-  'Selasa',
-  'Rabu',
-  'Kamis',
-  'Jumat',
-  'Sabtu',
-  'Minggu',
-  'Random',
-];
-
+const DAYS = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
 const DAYS_SHORT = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
 
-/* ============================================================
-   INLINE STATE — EDIT SESSIONS
-   ============================================================ */
-
 export type EditStep =
-  | 'add_site'
-  | 'add_slug'
-  | 'add_source'
-  | 'add_day'
-  | 'add_hour'
-  | 'add_confirm'
-  | 'edit_value';
+  | 'add_site' | 'add_slug' | 'add_source' | 'add_day' | 'add_hour'
+  | 'add_confirm' | 'edit_value';
 
 export interface TrackSessionRow {
   session_id: string;
@@ -8706,26 +9294,17 @@ export interface TrackSessionRow {
   expires_at: number;
 }
 
-export const ensureSessionDb = createLazyInit('TrackSessV2', async (db) => {
-  await db
-    .prepare(
-      `CREATE TABLE IF NOT EXISTS track_sessions_v2 (
-        session_id       TEXT PRIMARY KEY,
-        user_id          INTEGER NOT NULL,
-        step             TEXT NOT NULL,
-        site             TEXT,
-        slug             TEXT,
-        source_slug      TEXT,
-        schedule_day     TEXT,
-        schedule_hour    INTEGER,
-        schedule_minute  INTEGER,
-        buffer_min       INTEGER NOT NULL DEFAULT 60,
-        edit_field       TEXT,
-        created_at       INTEGER NOT NULL,
-        expires_at       INTEGER NOT NULL
-      )`
-    )
-    .run();
+const ensureSessionDb = createLazyInit('TrackSessV2', async (db) => {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS track_sessions_v2 (
+    session_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    step TEXT NOT NULL,
+    site TEXT, slug TEXT, source_slug TEXT,
+    schedule_day TEXT, schedule_hour INTEGER, schedule_minute INTEGER,
+    buffer_min INTEGER NOT NULL DEFAULT 60,
+    edit_field TEXT,
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+  )`).run();
 });
 
 export async function createSession(
@@ -8737,31 +9316,16 @@ export async function createSession(
   await ensureSessionDb(db);
   const sessionId = 'ts_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
   const now = Date.now();
-
-  await db
-    .prepare(
-      `INSERT INTO track_sessions_v2
-        (session_id, user_id, step, site, slug, source_slug, schedule_day,
-         schedule_hour, schedule_minute, buffer_min, edit_field, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      sessionId,
-      userId,
-      step,
-      initial.site ?? null,
-      initial.slug ?? null,
-      initial.source_slug ?? null,
-      initial.schedule_day ?? null,
-      initial.schedule_hour ?? null,
-      initial.schedule_minute ?? null,
-      initial.buffer_min ?? 60,
-      initial.edit_field ?? null,
-      now,
-      now + SESSION_TTL_MS
-    )
+  await db.prepare(`INSERT INTO track_sessions_v2
+    (session_id, user_id, step, site, slug, source_slug, schedule_day,
+     schedule_hour, schedule_minute, buffer_min, edit_field, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(sessionId, userId, step,
+      initial.site ?? null, initial.slug ?? null, initial.source_slug ?? null,
+      initial.schedule_day ?? null, initial.schedule_hour ?? null,
+      initial.schedule_minute ?? null, initial.buffer_min ?? 60,
+      initial.edit_field ?? null, now, now + SESSION_TTL_MS)
     .run();
-
   return sessionId;
 }
 
@@ -8770,18 +9334,12 @@ export async function getSession(
   sessionId: string
 ): Promise<TrackSessionRow | null> {
   await ensureSessionDb(db);
-  const row = await db
-    .prepare('SELECT * FROM track_sessions_v2 WHERE session_id = ?')
-    .bind(sessionId)
-    .first<TrackSessionRow>();
-
+  const row = await db.prepare('SELECT * FROM track_sessions_v2 WHERE session_id = ?')
+    .bind(sessionId).first<TrackSessionRow>();
   if (!row) return null;
   if (row.expires_at < Date.now()) {
-    await db
-      .prepare('DELETE FROM track_sessions_v2 WHERE session_id = ?')
-      .bind(sessionId)
-      .run()
-      .catch(() => {});
+    await db.prepare('DELETE FROM track_sessions_v2 WHERE session_id = ?')
+      .bind(sessionId).run().catch(() => {});
     return null;
   }
   return row;
@@ -8792,14 +9350,10 @@ export async function getLatestSession(
   userId: number
 ): Promise<TrackSessionRow | null> {
   await ensureSessionDb(db);
-  return db
-    .prepare(
-      `SELECT * FROM track_sessions_v2
-       WHERE user_id = ? AND expires_at > ?
-       ORDER BY created_at DESC LIMIT 1`
-    )
-    .bind(userId, Date.now())
-    .first<TrackSessionRow>();
+  return db.prepare(`SELECT * FROM track_sessions_v2
+    WHERE user_id = ? AND expires_at > ?
+    ORDER BY created_at DESC LIMIT 1`)
+    .bind(userId, Date.now()).first<TrackSessionRow>();
 }
 
 export async function updateSession(
@@ -8810,7 +9364,6 @@ export async function updateSession(
   await ensureSessionDb(db);
   const sets: string[] = [];
   const values: unknown[] = [];
-
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) continue;
     if (k === 'session_id' || k === 'user_id' || k === 'created_at') continue;
@@ -8819,29 +9372,17 @@ export async function updateSession(
   }
   if (sets.length === 0) return;
   values.push(sessionId);
-
-  await db
-    .prepare(`UPDATE track_sessions_v2 SET ${sets.join(', ')} WHERE session_id = ?`)
-    .bind(...values)
-    .run();
+  await db.prepare(`UPDATE track_sessions_v2 SET ${sets.join(', ')} WHERE session_id = ?`)
+    .bind(...values).run();
 }
 
-export async function deleteSession(
-  db: D1Database,
-  sessionId: string
-): Promise<void> {
+export async function deleteSession(db: D1Database, sessionId: string): Promise<void> {
   try {
     await ensureSessionDb(db);
-    await db
-      .prepare('DELETE FROM track_sessions_v2 WHERE session_id = ?')
-      .bind(sessionId)
-      .run();
+    await db.prepare('DELETE FROM track_sessions_v2 WHERE session_id = ?')
+      .bind(sessionId).run();
   } catch {}
 }
-
-/* ============================================================
-   UTILS
-   ============================================================ */
 
 function isValidSite(s: string): s is SiteKey {
   return ALL_SITES.includes(s as SiteKey);
@@ -8849,17 +9390,29 @@ function isValidSite(s: string): s is SiteKey {
 
 function countBits(n: number): number {
   let c = 0, x = n;
-  while (x > 0) {
-    c += x & 1;
-    x >>>= 1;
-  }
+  while (x > 0) { c += x & 1; x >>>= 1; }
   return c;
+}
+
+function hashSlug(slug: string): string {
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) {
+    h = ((h << 5) - h + slug.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36).padStart(7, '0').slice(0, 8);
+}
+
+async function findSlugByHash(env: Env, hash: string): Promise<string | null> {
+  const all = await listAllTrackedAnime(env.DB);
+  for (const r of all) {
+    if (hashSlug(r.slug) === hash) return r.slug;
+  }
+  return null;
 }
 
 function parseTime(input: string): { hour: number; minute: number } | null {
   const cleaned = input.trim().replace(/[.,]/g, ':');
   const parts = cleaned.split(':');
-
   if (parts.length === 1) {
     const h = parseInt(parts[0] ?? '', 10);
     if (isNaN(h) || h < 0 || h > 23) return null;
@@ -8884,25 +9437,15 @@ function extractSamehadakuSlug(url: string): string | null {
   return null;
 }
 
-async function fetchBySite(env: Env, site: SiteKey): Promise<TrackedAnimeRow[]> {
-  const all = await listAllTrackedAnime(env.DB);
-  return all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
-}
-
-async function countBySite(env: Env): Promise<Record<SiteKey, number>> {
-  const all = await listAllTrackedAnime(env.DB);
-  const result: Record<SiteKey, number> = { lexanime: 0, animesub: 0, samehadaku: 0 };
-  for (const r of all) {
-    if (r.site in result) result[r.site]++;
-  }
-  return result;
-}
-
 /* ============================================================
    MENU
    ============================================================ */
 
-async function showMainMenu(ctx: Context, env: Env, edit = false): Promise<void> {
+export async function showMainMenu(
+  ctx: Context,
+  env: Env,
+  edit = false
+): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
   const total = all.length;
   const active = all.filter((r) => r.status === 'active').length;
@@ -8929,38 +9472,38 @@ async function showMainMenu(ctx: Context, env: Env, edit = false): Promise<void>
     .text('🗑️ Hapus', 'tr:dm')
     .text('🔄 Catch-up', 'tr:c');
 
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
+
   if (edit && ctx.callbackQuery?.message?.message_id) {
-    await ctx
-      .editMessageText(lines.join('\n'), {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: kb,
-      })
+    await ctx.api
+      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
       .catch(() => {});
     return;
   }
-
-  await ctx.reply(lines.join('\n'), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: kb,
-  });
+  await ctx.reply(lines.join('\n'), payload);
 }
 
-/* ============================================================
-   LIST
-   ============================================================ */
-
-async function showList(ctx: Context, env: Env, page = 0): Promise<void> {
+export async function showList(ctx: Context, env: Env, page = 0): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
   all.sort((a, b) => a.slug.localeCompare(b.slug));
 
+  const hasCb = !!ctx.callbackQuery?.message?.message_id;
+
   if (all.length === 0) {
-    await ctx.reply('📭 Belum ada anime.\n\n<i>Klik ➕ Tambah Baru.</i>', {
-      parse_mode: 'HTML',
+    const payload = {
+      parse_mode: 'HTML' as const,
       link_preview_options: { is_disabled: true },
       reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:h'),
-    });
+    };
+    if (hasCb) {
+      await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, '📭 Belum ada anime.', payload).catch(() => {});
+    } else {
+      await ctx.reply('📭 Belum ada anime.', payload);
+    }
     return;
   }
 
@@ -8981,12 +9524,11 @@ async function showList(ctx: Context, env: Env, page = 0): Promise<void> {
     const pending = isInScheduleWindow(r) ? ' ⚠️' : '';
     const label = `${icon} ${r.slug}${pending}`;
     const short = label.length > 50 ? label.slice(0, 48) + '…' : label;
-    kb.text(short, `tr:v:${r.slug}`).row();
+    kb.text(short, `tr:v:${hashSlug(r.slug)}`).row();
   }
-
   if (totalPages > 1) {
-    if (p > 0) kb.text('◀️', `tr:lp:${p - 1}`);
-    if (p < totalPages - 1) kb.text('▶️', `tr:lp:${p + 1}`);
+    if (p > 0) kb.text('◀️ Prev', `tr:lp:${p - 1}`);
+    if (p < totalPages - 1) kb.text('Next ▶️', `tr:lp:${p + 1}`);
     kb.row();
   }
   kb.text('◀️ Kembali', 'tr:h');
@@ -8997,21 +9539,18 @@ async function showList(ctx: Context, env: Env, page = 0): Promise<void> {
     reply_markup: kb,
   };
 
-  if (ctx.callbackQuery?.message?.message_id) {
-    await ctx
-      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
-      .catch(() => {});
-    return;
+  if (hasCb) {
+    try {
+      await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, lines.join('\n'), payload);
+      return;
+    } catch (err) {
+      console.error('[Track] edit list failed:', err);
+    }
   }
-
   await ctx.reply(lines.join('\n'), payload);
 }
 
-/* ============================================================
-   DETAIL VIEW
-   ============================================================ */
-
-async function showDetail(
+export async function showDetail(
   ctx: Context,
   env: Env,
   slug: string,
@@ -9021,10 +9560,7 @@ async function showDetail(
   const row = all.find((r) => r.slug === slug);
 
   if (!row) {
-    await ctx.answerCallbackQuery({
-      text: '❌ Tidak ditemukan',
-      show_alert: true,
-    }).catch(() => {});
+    await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }).catch(() => {});
     return;
   }
 
@@ -9032,6 +9568,7 @@ async function showDetail(
   const hh = String(row.schedule_hour).padStart(2, '0');
   const mm = String(row.schedule_minute ?? 0).padStart(2, '0');
   const pending = isInScheduleWindow(row) ? ' ⚠️' : '';
+  const sh = hashSlug(slug);
 
   const lines: string[] = [];
   lines.push(`📄 <code>${escapeHtml(row.slug)}</code>${pending}`);
@@ -9052,22 +9589,22 @@ async function showDetail(
   lines.push('<i>Pilih field untuk edit:</i>');
 
   const kb = new InlineKeyboard()
-    .text('🎬 Site', `tr:e:${slug}:site`)
-    .text('🔗 Source', `tr:e:${slug}:source_slug`)
+    .text('🎬 Site', `tr:e:${sh}:site`)
+    .text('🔗 Source', `tr:e:${sh}:source_slug`)
     .row()
-    .text('📅 Hari', `tr:e:${slug}:schedule_day`)
-    .text('⏰ Jam', `tr:e:${slug}:schedule_hour`)
+    .text('📅 Hari', `tr:e:${sh}:schedule_day`)
+    .text('⏰ Jam', `tr:e:${sh}:schedule_hour`)
     .row()
-    .text('📼 Last Ep', `tr:e:${slug}:last_ep`)
-    .text('📦 Chunk', `tr:e:${slug}:chunk`)
+    .text('📼 Last Ep', `tr:e:${sh}:last_ep`)
+    .text('📦 Chunk', `tr:e:${sh}:chunk`)
     .row()
-    .text('⏱️ Buffer', `tr:e:${slug}:buffer_min`)
-    .text('🔀 Status', `tr:e:${slug}:status`)
+    .text('⏱️ Buffer', `tr:e:${sh}:buffer_min`)
+    .text('🔀 Status', `tr:e:${sh}:status`)
     .row()
-    .text('🔄 Check', `tr:cx:${slug}`)
-    .text('♻️ Reset', `tr:rs:${slug}`)
+    .text('🔄 Check', `tr:cx:${sh}`)
+    .text('♻️ Reset', `tr:rs:${sh}`)
     .row()
-    .text('🗑️ Hapus', `tr:dv:${slug}`)
+    .text('🗑️ Hapus', `tr:dv:${sh}`)
     .text('◀️ Kembali', 'tr:l');
 
   const payload = {
@@ -9077,20 +9614,15 @@ async function showDetail(
   };
 
   if (edit && ctx.callbackQuery?.message?.message_id) {
-    await ctx
+    await ctx.api
       .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, lines.join('\n'), payload)
       .catch(() => {});
     return;
   }
-
   await ctx.reply(lines.join('\n'), payload);
 }
 
-/* ============================================================
-   EDIT PROMPT
-   ============================================================ */
-
-async function promptEdit(
+export async function promptEdit(
   ctx: Context,
   env: Env,
   userId: number,
@@ -9106,120 +9638,73 @@ async function promptEdit(
   }
 
   const sessionId = await createSession(env.DB, userId, 'edit_value', {
-    slug,
-    edit_field: field,
+    slug, edit_field: field,
   });
+  const sh = hashSlug(slug);
 
   let prompt = '';
   let kb: InlineKeyboard | undefined;
 
   switch (field) {
     case 'site':
-      prompt =
-        `🎬 <b>Edit Site</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Site sekarang: <b>${row.site}</b>\n\n` +
-        `Pilih site baru:`;
+      prompt = `🎬 <b>Edit Site</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSite sekarang: <b>${row.site}</b>\n\nPilih site baru:`;
       kb = new InlineKeyboard()
         .text('🎬 lexanime', `tr:set:${sessionId}:lexanime`)
         .text('🎬 animesub', `tr:set:${sessionId}:animesub`)
         .row()
         .text('🎬 samehadaku', `tr:set:${sessionId}:samehadaku`)
         .row()
-        .text('❌ Batal', `tr:v:${slug}`);
+        .text('❌ Batal', `tr:v:${sh}`);
       break;
-
     case 'status':
-      prompt =
-        `🔀 <b>Edit Status</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Status sekarang: <b>${row.status}</b>\n\n` +
-        `Pilih status baru:`;
+      prompt = `🔀 <b>Edit Status</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nStatus sekarang: <b>${row.status}</b>\n\nPilih status baru:`;
       kb = new InlineKeyboard()
         .text('🟢 Active', `tr:set:${sessionId}:active`)
         .text('⏸️ Paused', `tr:set:${sessionId}:paused`)
         .row()
         .text('✅ Finished', `tr:set:${sessionId}:finished`)
         .row()
-        .text('❌ Batal', `tr:v:${slug}`);
+        .text('❌ Batal', `tr:v:${sh}`);
       break;
-
-    case 'schedule_day':
-      prompt =
-        `📅 <b>Edit Hari</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Sekarang: <b>${row.schedule_day}</b>\n\n` +
-        `Pilih hari baru:`;
-      {
-        const kbd = new InlineKeyboard();
-        for (let i = 0; i < 7; i++) {
-          kbd.text(DAYS_SHORT[i]!, `tr:set:${sessionId}:${DAYS[i]}`);
-          if ((i + 1) % 4 === 0) kbd.row();
-        }
-        kbd.text('🎲 Random', `tr:set:${sessionId}:Random`).row();
-        kbd.text('❌ Batal', `tr:v:${slug}`);
-        kb = kbd;
+    case 'schedule_day': {
+      prompt = `📅 <b>Edit Hari</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.schedule_day}</b>\n\nPilih hari baru:`;
+      const kbd = new InlineKeyboard();
+      for (let i = 0; i < 7; i++) {
+        kbd.text(DAYS_SHORT[i]!, `tr:set:${sessionId}:${DAYS[i]}`);
+        if ((i + 1) % 4 === 0) kbd.row();
       }
+      kbd.text('🎲 Random', `tr:set:${sessionId}:Random`).row();
+      kbd.text('❌ Batal', `tr:v:${sh}`);
+      kb = kbd;
       break;
-
+    }
     case 'schedule_hour':
-      prompt =
-        `⏰ <b>Edit Jam</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Sekarang: <b>${String(row.schedule_hour).padStart(2, '0')}:${String(row.schedule_minute ?? 0).padStart(2, '0')} WIB</b>\n\n` +
-        `Kirim jam baru (WIB, 24 jam):\n` +
-        `<code>18</code> / <code>18:30</code> / <code>18.15</code>`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      prompt = `⏰ <b>Edit Jam</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${String(row.schedule_hour).padStart(2, '0')}:${String(row.schedule_minute ?? 0).padStart(2, '0')} WIB</b>\n\nKirim jam baru:\n<code>18</code> / <code>18:30</code> / <code>18.15</code>`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
-
     case 'last_ep':
-      prompt =
-        `📼 <b>Edit Last Episode</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Sekarang: <b>${row.last_ep}</b>\n\n` +
-        `Kirim angka last_ep baru (0 untuk reset):\n` +
-        `<i>Set 0 → bot akan re-detect dari awal</i>`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      prompt = `📼 <b>Edit Last Episode</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.last_ep}</b>\n\nKirim angka last_ep baru (0 = reset):`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
-
     case 'chunk':
-      prompt =
-        `📦 <b>Edit Chunk</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Sekarang: <b>${row.chunk_start}-${row.chunk_end}</b>\n\n` +
-        `Kirim range chunk baru:\n` +
-        `Format: <code>2-6</code> (start-end)`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      prompt = `📦 <b>Edit Chunk</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.chunk_start}-${row.chunk_end}</b>\n\nKirim range: <code>2-6</code>`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
-
     case 'buffer_min':
-      prompt =
-        `⏱️ <b>Edit Buffer</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Sekarang: <b>${row.buffer_min}</b> menit\n\n` +
-        `Kirim buffer baru (menit):\n` +
-        `<i>Minimal 5, maksimal 480</i>`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      prompt = `⏱️ <b>Edit Buffer</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <b>${row.buffer_min}</b> menit\n\nKirim buffer baru (5-480):`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
-
     case 'source_slug':
-      prompt =
-        `🔗 <b>Edit Source Slug</b>\n\n` +
-        `Anime: <code>${escapeHtml(slug)}</code>\n` +
-        `Sekarang: <code>${escapeHtml(row.source_slug)}</code>\n\n` +
-        `Kirim slug baru:\n` +
-        `• Slug langsung: <code>tensei-goblin-shitsumon-sub-indo</code>\n` +
-        `• Atau URL Samehadaku: <code>https://samehadaku.li/anime/...</code>`;
-      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${slug}`);
+      prompt = `🔗 <b>Edit Source Slug</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <code>${escapeHtml(row.source_slug)}</code>\n\nKirim slug baru, atau URL Samehadaku:`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
-
     default:
       await ctx.answerCallbackQuery({ text: '❌ Field tidak dikenal' }).catch(() => {});
       return;
   }
 
   await ctx.answerCallbackQuery().catch(() => {});
-  await ctx
+  await ctx.api
     .editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!, prompt, {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -9227,942 +9712,766 @@ async function promptEdit(
     })
     .catch(() => {});
 }
-===== END FILE =====
 
-===== FILE: ./src/commands/track/flow.ts =====
-
-// src/commands/track/flow.ts
-import type { Context } from 'grammy';
-import type { Env } from '../../types/env';
-import { githubGetFile } from '../../lib/github';
-import { escapeHtml } from '../../lib/utils';
-import { saveTrackedAnime, type SiteKey } from '../../lib/cron/state';
-import {
-  deleteTrackSession,
-  getLatestTrackSessionByUser,
-  updateTrackSession,
-  type TrackSessionRow,
-} from './state';
-import {
-  buildConfirmKeyboard,
-  buildDayKeyboard,
-  buildDayPrompt,
-  buildHourPrompt,
-  buildSlugPrompt,
-  buildSourceSlugPrompt,
-  buildSummary,
-} from './ui';
-
-const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
-
-function extractSamehadakuSlug(url: string): string | null {
-  const trimmed = url.trim();
-
-  const animeMatch = trimmed.match(/\/anime\/([a-z0-9-]+)\/?/i);
-  if (animeMatch?.[1]) return animeMatch[1].toLowerCase();
-
-  const epMatch = trimmed.match(
-    /\/([a-z0-9-]+?)-episode-\d+-subtitle-indonesia\/?/i
-  );
-  if (epMatch?.[1]) return epMatch[1].toLowerCase();
-
-  return null;
-}
-
-export async function handleTrackTextInput(
-  ctx: Context,
-  env: Env
-): Promise<boolean> {
-  const userId = ctx.from?.id;
-  if (!userId) return false;
-
-  const text = ctx.message?.text?.trim() ?? '';
-  if (!text || text.startsWith('/')) return false;
-
-  const session = await getLatestTrackSessionByUser(env.DB, userId);
-  if (!session) return false;
-
-  switch (session.step) {
-    case 'slug':
-      await handleSlugInput(ctx, env, session, text);
-      return true;
-    case 'source_slug':
-      await handleSourceSlugInput(ctx, env, session, text);
-      return true;
-    case 'hour':
-      await handleHourInput(ctx, env, session, text);
-      return true;
-    default:
-      return false;
-  }
-}
-
-async function handleSlugInput(
+export async function startAddFlow(
   ctx: Context,
   env: Env,
-  session: TrackSessionRow,
-  slug: string
+  userId: number
 ): Promise<void> {
-  if (!SLUG_RE.test(slug)) {
-    await ctx.reply(
-      '❌ Slug tidak valid. Hanya <code>a-z</code>, <code>0-9</code>, dan <code>-</code>.\n\nCoba lagi:',
-      { parse_mode: 'HTML' }
-    );
-    return;
-  }
-
-  const path = `src/content/anime/${slug}.md`;
-  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
-  try {
-    file = await githubGetFile(env, path, 'qimochi');
-  } catch (err) {
-    console.warn('[Track] githubGetFile error:', err);
-  }
-
-  if (!file) {
-    await ctx.reply(
-      `❌ <b>Markdown belum ada di qimochi.</b>\n\n` +
-        `Path: <code>${escapeHtml(path)}</code>\n\n` +
-        `<i>Push dulu via /anime → 📦 Post ke qimochi.</i>\n\n` +
-        `<i>Kalau salah ketik, kirim slug lagi.</i>`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-    return;
-  }
-
-  await updateTrackSession(env.DB, session.session_id, {
-    slug,
-    source_slug: slug,
-    step: 'source_slug',
-  });
-
-  await ctx.reply(buildSourceSlugPrompt(slug, session.site ?? '-'), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
-}
-
-async function handleSourceSlugInput(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  input: string
-): Promise<void> {
-  let sourceSlug: string;
-
-  if (input === '-') {
-    sourceSlug = session.slug ?? '';
-  } else if (session.site === 'samehadaku' && /^https?:\/\//i.test(input)) {
-    const extracted = extractSamehadakuSlug(input);
-    if (!extracted) {
-      await ctx.reply(
-        '❌ URL Samehadaku tidak valid.\n\n' +
-          'Format yang diterima:\n' +
-          '• <code>https://samehadaku.li/anime/{slug}/</code>\n' +
-          '• <code>https://samehadaku.li/{slug}-episode-N-subtitle-indonesia/</code>\n\n' +
-          'Coba lagi:',
-        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-      );
-      return;
-    }
-    sourceSlug = extracted;
-    await ctx.reply(
-      `✅ Slug diekstrak: <code>${escapeHtml(sourceSlug)}</code>`,
-      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
-    );
-  } else {
-    sourceSlug = input.trim();
-  }
-
-  if (!SLUG_RE.test(sourceSlug)) {
-    await ctx.reply(
-      '❌ Slug tidak valid. Hanya <code>a-z</code>, <code>0-9</code>, dan <code>-</code>.\n\n' +
-        'Atau kirim <code>-</code> kalau sama dengan qimochi.\n' +
-        (session.site === 'samehadaku'
-          ? 'Atau kirim URL anime Samehadaku.'
-          : ''),
-      { parse_mode: 'HTML' }
-    );
-    return;
-  }
-
-  await updateTrackSession(env.DB, session.session_id, {
-    source_slug: sourceSlug,
-    step: 'day',
-  });
-
-  await ctx.reply(buildDayPrompt(), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: buildDayKeyboard(session.session_id),
-  });
-}
-
-function parseTimeInput(
-  input: string
-): { hour: number; minute: number } | null {
-  const cleaned = input.trim().replace(/[.,]/g, ':');
-  const parts = cleaned.split(':');
-
-  if (parts.length === 1) {
-    const h = parseInt(parts[0] ?? '', 10);
-    if (isNaN(h) || h < 0 || h > 23) return null;
-    return { hour: h, minute: 0 };
-  }
-
-  if (parts.length === 2) {
-    const h = parseInt(parts[0] ?? '', 10);
-    const m = parseInt(parts[1] ?? '', 10);
-    if (isNaN(h) || isNaN(m)) return null;
-    if (h < 0 || h > 23 || m < 0 || m > 59) return null;
-    return { hour: h, minute: m };
-  }
-
-  return null;
-}
-
-async function handleHourInput(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  input: string
-): Promise<void> {
-  const time = parseTimeInput(input);
-  if (!time) {
-    await ctx.reply(
-      '❌ Format jam tidak valid.\n\n' +
-        '<b>Contoh yang benar:</b>\n' +
-        '• <code>18</code> → 18:00\n' +
-        '• <code>18:30</code> → 18:30\n' +
-        '• <code>18.15</code> → 18:15',
-      { parse_mode: 'HTML' }
-    );
-    return;
-  }
-
-  await updateTrackSession(env.DB, session.session_id, {
-    schedule_hour: time.hour,
-    schedule_minute: time.minute,
-    step: 'confirm',
-  });
-
-  const updated: TrackSessionRow = {
-    ...session,
-    schedule_hour: time.hour,
-    schedule_minute: time.minute,
-    step: 'confirm',
-  };
-
-  let existsInRepo = false;
-  if (updated.slug) {
-    try {
-      const f = await githubGetFile(
-        env,
-        `src/content/anime/${updated.slug}.md`,
-        'qimochi'
-      );
-      existsInRepo = !!f;
-    } catch {}
-  }
-
-  await ctx.reply(buildSummary(updated, existsInRepo), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: buildConfirmKeyboard(session.session_id),
-  });
-}
-
-export async function handleSitePick(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  site: SiteKey
-): Promise<void> {
-  await updateTrackSession(env.DB, session.session_id, {
-    site,
-    step: 'slug',
-  });
-  await ctx.editMessageText(buildSlugPrompt(), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
-}
-
-export async function handleDayPick(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow,
-  day: string
-): Promise<void> {
-  await updateTrackSession(env.DB, session.session_id, {
-    schedule_day: day,
-    step: 'hour',
-  });
-  await ctx.editMessageText(buildHourPrompt(day), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  });
-}
-
-export async function handleConfirmSave(
-  ctx: Context,
-  env: Env,
-  session: TrackSessionRow
-): Promise<void> {
-  if (
-    !session.site ||
-    !session.slug ||
-    !session.source_slug ||
-    !session.schedule_day ||
-    session.schedule_hour === null
-  ) {
-    await ctx.answerCallbackQuery({
-      text: '❌ Data belum lengkap',
-      show_alert: true,
-    });
-    return;
-  }
-
-  const site = session.site as SiteKey;
-
-  let fallbackSite: SiteKey | null;
-  if (site === 'lexanime') fallbackSite = 'animesub';
-  else if (site === 'animesub') fallbackSite = 'lexanime';
-  else fallbackSite = null;
-
-  try {
-    await saveTrackedAnime(env.DB, {
-      slug: session.slug,
-      site,
-      sourceSlug: session.source_slug,
-      fallbackSite,
-      scheduleDay: session.schedule_day,
-      scheduleHour: session.schedule_hour,
-      scheduleMinute: session.schedule_minute ?? 0,
-      bufferMin: session.buffer_min,
-    });
-  } catch (err: any) {
-    await ctx.answerCallbackQuery({
-      text: `❌ Gagal simpan: ${err?.message ?? 'unknown'}`,
-      show_alert: true,
-    });
-    return;
-  }
-
-  await deleteTrackSession(env.DB, session.session_id);
-  await ctx.answerCallbackQuery({ text: '✅ Tersimpan' });
-
-  const hh = String(session.schedule_hour).padStart(2, '0');
-  const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
-  const bufferH = Math.floor(session.buffer_min / 60);
-  const bufferM = session.buffer_min % 60;
-  const startTotal =
-    session.schedule_hour * 60 +
-    (session.schedule_minute ?? 0) +
-    session.buffer_min;
-  const startH = String(Math.floor(startTotal / 60) % 24).padStart(2, '0');
-  const startM = String(startTotal % 60).padStart(2, '0');
-
-  const lines: string[] = [];
-  lines.push('✅ <b>Anime di-track!</b>');
-  lines.push('');
-  lines.push(`🆔 <code>${escapeHtml(session.slug)}</code>`);
-  lines.push(`🎬 ${site}${fallbackSite ? ` (fallback: ${fallbackSite})` : ''}`);
-  lines.push(`📅 ${session.schedule_day} ${hh}:${mm} WIB`);
-  lines.push('');
-  lines.push(
-    `<i>Bot akan cek situs mulai ${session.schedule_day} jam ${startH}:${startM} WIB ` +
-      `(buffer +${bufferH}j ${bufferM}m).</i>`
-  );
-
-  await ctx
-    .editMessageText(lines.join('\n'), {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      reply_markup: undefined,
-    })
-    .catch(() => {});
-}
-
-export async function handleCancel(
-  ctx: Context,
-  env: Env,
-  sessionId: string | null
-): Promise<void> {
-  if (sessionId && sessionId !== 'noop') {
-    await deleteTrackSession(env.DB, sessionId);
-  }
-  await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
-  await ctx
-    .editMessageText('❌ <b>Dibatalkan.</b>', {
-      parse_mode: 'HTML',
-      reply_markup: undefined,
-    })
-    .catch(() => {});
-}
-
-export function buildInitialPrompt(sessionId: string): string {
-  void sessionId;
-  return (
+  const sessionId = await createSession(env.DB, userId, 'add_site');
+  const text =
     '<b>➕ Track Anime Baru</b>\n\n' +
-    '<b>Step 1/5</b> · Pilih situs sumber:'
-  );
-}
-===== END FILE =====
-
-===== FILE: ./src/commands/track/state.ts =====
-// src/commands/track/state.ts
-import type { D1Database } from '@cloudflare/workers-types';
-import { createLazyInit } from '../../lib/lazy-init';
-
-const SESSION_TTL_MS = 15 * 60 * 1000;
-
-export type TrackStep =
-  | 'site'
-  | 'slug'
-  | 'source_slug'
-  | 'day'
-  | 'hour'
-  | 'confirm';
-
-export interface TrackSessionRow {
-  session_id: string;
-  user_id: number;
-  step: TrackStep;
-  site: string | null;
-  slug: string | null;
-  source_slug: string | null;
-  schedule_day: string | null;
-  schedule_hour: number | null;
-  schedule_minute: number | null;
-  buffer_min: number;
-  created_at: number;
-  expires_at: number;
-}
-
-export const ensureTrackSessionDb = createLazyInit(
-  'TrackSession',
-  async (db) => {
-    await db
-      .prepare(
-        `CREATE TABLE IF NOT EXISTS track_sessions (
-          session_id       TEXT PRIMARY KEY,
-          user_id          INTEGER NOT NULL,
-          step             TEXT NOT NULL,
-          site             TEXT,
-          slug             TEXT,
-          source_slug      TEXT,
-          schedule_day     TEXT,
-          schedule_hour    INTEGER,
-          schedule_minute  INTEGER,
-          buffer_min       INTEGER NOT NULL DEFAULT 60,
-          created_at       INTEGER NOT NULL,
-          expires_at       INTEGER NOT NULL
-        )`
-      )
-      .run();
-
-    try {
-      await db
-        .prepare(
-          'ALTER TABLE track_sessions ADD COLUMN schedule_minute INTEGER'
-        )
-        .run();
-    } catch {}
-  }
-);
-
-export async function createTrackSession(
-  db: D1Database,
-  userId: number
-): Promise<string> {
-  await ensureTrackSessionDb(db);
-  const sessionId = 'tr_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
-  const now = Date.now();
-  await db
-    .prepare(
-      `INSERT INTO track_sessions
-        (session_id, user_id, step, buffer_min, created_at, expires_at)
-       VALUES (?, ?, 'site', 60, ?, ?)`
-    )
-    .bind(sessionId, userId, now, now + SESSION_TTL_MS)
-    .run();
-  return sessionId;
-}
-
-export async function getTrackSession(
-  db: D1Database,
-  sessionId: string
-): Promise<TrackSessionRow | null> {
-  await ensureTrackSessionDb(db);
-  const row = await db
-    .prepare('SELECT * FROM track_sessions WHERE session_id = ?')
-    .bind(sessionId)
-    .first<TrackSessionRow>();
-
-  if (!row) return null;
-  if (row.expires_at < Date.now()) {
-    await db
-      .prepare('DELETE FROM track_sessions WHERE session_id = ?')
-      .bind(sessionId)
-      .run()
-      .catch(() => {});
-    return null;
-  }
-  return row;
-}
-
-export async function getLatestTrackSessionByUser(
-  db: D1Database,
-  userId: number
-): Promise<TrackSessionRow | null> {
-  await ensureTrackSessionDb(db);
-  return db
-    .prepare(
-      `SELECT * FROM track_sessions
-       WHERE user_id = ? AND expires_at > ?
-       ORDER BY created_at DESC LIMIT 1`
-    )
-    .bind(userId, Date.now())
-    .first<TrackSessionRow>();
-}
-
-export interface TrackSessionPatch {
-  step?: TrackStep;
-  site?: string;
-  slug?: string;
-  source_slug?: string;
-  schedule_day?: string;
-  schedule_hour?: number;
-  schedule_minute?: number;
-  buffer_min?: number;
-}
-
-export async function updateTrackSession(
-  db: D1Database,
-  sessionId: string,
-  patch: TrackSessionPatch
-): Promise<void> {
-  await ensureTrackSessionDb(db);
-  const sets: string[] = [];
-  const values: unknown[] = [];
-
-  for (const [k, v] of Object.entries(patch)) {
-    if (v === undefined) continue;
-    sets.push(`${k} = ?`);
-    values.push(v);
-  }
-  if (sets.length === 0) return;
-  values.push(sessionId);
-
-  await db
-    .prepare(
-      `UPDATE track_sessions SET ${sets.join(', ')} WHERE session_id = ?`
-    )
-    .bind(...values)
-    .run();
-}
-
-export async function deleteTrackSession(
-  db: D1Database,
-  sessionId: string
-): Promise<void> {
-  try {
-    await ensureTrackSessionDb(db);
-    await db
-      .prepare('DELETE FROM track_sessions WHERE session_id = ?')
-      .bind(sessionId)
-      .run();
-  } catch (err) {
-    console.warn('[Track] delete session error:', err);
-  }
-}
-
-===== END FILE =====
-
-===== FILE: ./src/commands/track/ui.ts =====
-// src/commands/track/ui.ts
-import { InlineKeyboard } from 'grammy';
-import { escapeHtml } from '../../lib/utils';
-import type { TrackSessionRow } from './state';
-import type { SiteKey, TrackedAnimeRow } from '../../lib/cron/state';
-
-export const SITE_LABEL: Record<SiteKey, string> = {
-  lexanime: '🎬 lexanime',
-  animesub: '🎬 animesub',
-  samehadaku: '🎬 samehadaku',
-};
-
-export const DAYS_ORDER = [
-  'Senin',
-  'Selasa',
-  'Rabu',
-  'Kamis',
-  'Jumat',
-  'Sabtu',
-  'Minggu',
-  'Random',
-];
-
-/* ============================================================
-   MAIN MENU
-   ============================================================ */
-
-export function buildMainMenuKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('➕ Tambah Baru', 'tr:a')
-    .text('📋 Lihat Daftar', 'tr:l')
-    .row()
-    .text('🗑️ Hapus Anime', 'tr:dm')
-    .text('🔄 Cek Episode Baru', 'tr:c');
-}
-
-export function buildMainMenuText(
-  total: number,
-  active: number,
-  paused: number,
-  pending: number
-): string {
-  const lines: string[] = [];
-  lines.push('📡 <b>Track Anime</b>');
-  lines.push('');
-  lines.push(`📊 Total: <b>${total}</b> anime`);
-  if (active > 0) lines.push(`🟢 Active: ${active}`);
-  if (paused > 0) lines.push(`⏸️ Paused: ${paused}`);
-  if (pending > 0) {
-    lines.push('');
-    lines.push(`⚠️ <b>${pending} anime tertinggal!</b>`);
-  }
-  lines.push('');
-  lines.push('<i>Pilih action di bawah:</i>');
-  return lines.join('\n');
-}
-
-/* ============================================================
-   ADD FLOW (existing)
-   ============================================================ */
-
-export function buildSiteKeyboard(sessionId: string): InlineKeyboard {
-  return new InlineKeyboard()
+    '<b>Step 1/5</b> · Pilih situs sumber:\n\n' +
+    '<i>Bot akan cek situs ini setiap hari untuk episode baru.</i>';
+  const kb = new InlineKeyboard()
     .text('🎬 lexanime', `tr:site:${sessionId}:lexanime`)
     .text('🎬 animesub', `tr:site:${sessionId}:animesub`)
     .row()
     .text('🎬 samehadaku', `tr:site:${sessionId}:samehadaku`)
     .row()
     .text('❌ Batal', `tr:x:${sessionId}`);
-}
 
-export function buildDayKeyboard(sessionId: string): InlineKeyboard {
-  const kb = new InlineKeyboard();
-  const short = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
+  const payload = {
+    parse_mode: 'HTML' as const,
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  };
 
-  for (let i = 0; i < short.length; i++) {
-    const day = DAYS_ORDER[i]!;
-    kb.text(short[i]!, `tr:day:${sessionId}:${day}`);
-    if ((i + 1) % 4 === 0) kb.row();
+  if (ctx.callbackQuery?.message?.message_id) {
+    await ctx.api
+      .editMessageText(ctx.chat!.id, ctx.callbackQuery.message.message_id, text, payload)
+      .catch(() => {});
+    return;
   }
-  kb.text('🎲 Random', `tr:day:${sessionId}:Random`).row();
-  kb.text('❌ Batal', `tr:x:${sessionId}`);
-  return kb;
+  await ctx.reply(text, payload);
 }
 
-export function buildConfirmKeyboard(sessionId: string): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('✅ Simpan', `tr:save:${sessionId}`)
-    .text('❌ Batal', `tr:x:${sessionId}`);
-}
+export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
+  const loading = await ctx.reply('🔍 Mencari anime yang tertinggal...');
+  try {
+    const all = await listAllTrackedAnime(env.DB);
+    const active = all.filter((r) => r.status === 'active');
+    const candidates = active.filter(isInScheduleWindow);
 
-export function buildSitePrompt(sessionId: string): string {
-  void sessionId;
-  return (
-    '<b>➕ Track Anime Baru</b>\n\n' +
-    '<b>Step 1/5</b> · Pilih situs sumber:\n\n' +
-    '<i>Bot akan cek situs ini setiap hari untuk episode baru.</i>'
-  );
-}
+    if (candidates.length === 0) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id, loading.message_id,
+        `✅ <b>Semua anime up-to-date.</b>\n\n<i>Total aktif: ${active.length}.</i>`,
+        {
+          parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard().text('🏠 Menu', 'tr:h'),
+        }
+      );
+      return;
+    }
 
-export function buildSlugPrompt(): string {
-  return (
-    '<b>Step 2/5</b> · Kirim <b>slug anime</b> yang ada di qimochi.\n\n' +
-    '<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>\n\n' +
-    '<i>Pastikan markdown anime sudah di-push via /anime → Post ke qimochi.</i>'
-  );
-}
+    const MAX_PER_RUN = 3;
+    const batch = candidates.slice(0, MAX_PER_RUN);
+    const remaining = candidates.length - batch.length;
+    const results: { slug: string; pushed: number; error?: string }[] = [];
+    let totalPushed = 0;
 
-export function buildSourceSlugPrompt(
-  qimochiSlug: string,
-  site: string
-): string {
-  if (site === 'samehadaku') {
-    return (
-      `<b>Step 3/5</b> · Slug di <b>${escapeHtml(site)}</b>\n\n` +
-      `🆔 Qimochi: <code>${escapeHtml(qimochiSlug)}</code>\n\n` +
-      `<b>Opsi input:</b>\n` +
-      `• Kirim <b>URL anime</b> Samehadaku, contoh:\n` +
-      `<code>https://samehadaku.li/anime/tensei-goblin-dakedo-shitsumon-aru/</code>\n` +
-      `• Atau kirim <b>slug</b> langsung\n` +
-      `• Atau kirim <code>-</code> kalau sama dengan qimochi`
-    );
+    for (let i = 0; i < batch.length; i++) {
+      const row = batch[i]!;
+      await ctx.api.editMessageText(
+        ctx.chat!.id, loading.message_id,
+        `🔄 <b>Catch-up</b> [${i + 1}/${batch.length}]\n\n🎬 <code>${escapeHtml(row.slug)}</code>`,
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      ).catch(() => {});
+      try {
+        const { runManualCheck } = await import('../lib/cron/runner');
+        const res = await runManualCheck(env, row.slug);
+        totalPushed += res.episodesPushed;
+        results.push({
+          slug: row.slug, pushed: res.episodesPushed,
+          error: res.errors.length > 0 ? res.errors[0] : undefined,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'unknown';
+        results.push({ slug: row.slug, pushed: 0, error: msg });
+      }
+    }
+
+    const lines: string[] = [];
+    lines.push(`✅ <b>Catch-up selesai</b>`);
+    lines.push('');
+    lines.push(`📼 Push: <b>${totalPushed}</b>`);
+    lines.push(`🔍 Dicek: <b>${batch.length}</b>`);
+    const success = results.filter((r) => !r.error);
+    const failed = results.filter((r) => r.error);
+    if (success.length > 0) {
+      lines.push('');
+      lines.push(`<b>✅ Sukses:</b>`);
+      for (const r of success.slice(0, 10)) lines.push(`• <code>${escapeHtml(r.slug)}</code> — ${r.pushed} ep`);
+    }
+    if (failed.length > 0) {
+      lines.push('');
+      lines.push(`<b>⚠️ Gagal:</b>`);
+      for (const r of failed.slice(0, 5))
+        lines.push(`• <code>${escapeHtml(r.slug)}</code> — <i>${escapeHtml((r.error ?? '').slice(0, 80))}</i>`);
+    }
+    if (remaining > 0) {
+      lines.push('');
+      lines.push(`<i>⏭️ ${remaining} lain. Klik 🔄 lagi.</i>`);
+    }
+    const kb = new InlineKeyboard();
+    if (remaining > 0) kb.text('🔄 Lanjut', 'tr:c').row();
+    kb.text('🏠 Menu', 'tr:h');
+    await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb,
+    }).catch(() => {});
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'unknown';
+    await ctx.api.editMessageText(
+      ctx.chat!.id, loading.message_id,
+      `❌ <b>Error:</b> <code>${escapeHtml(msg.slice(0, 300))}</code>`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
   }
-
-  return (
-    `<b>Step 3/5</b> · Slug di <b>${escapeHtml(site)}</b> beda dengan qimochi?\n\n` +
-    `🆔 Qimochi: <code>${escapeHtml(qimochiSlug)}</code>\n\n` +
-    `<b>Kalau sama:</b> kirim <code>-</code> (tanda hubung)\n` +
-    `<b>Kalau beda:</b> kirim slug di situs, contoh <code>tensei-goblin-shitsumon-sub-indo</code>`
-  );
-}
-
-export function buildDayPrompt(): string {
-  return (
-    '<b>Step 4/5</b> · Pilih <b>hari rilis</b> di situs:\n\n' +
-    '<i>Pilih "Random" kalau situs tidak tentukan jadwal tetap.</i>'
-  );
-}
-
-export function buildHourPrompt(day: string): string {
-  return (
-    `<b>Step 5/5</b> · Hari: <b>${escapeHtml(day)}</b>\n\n` +
-    'Kirim <b>jam rilis</b> (WIB) format 24 jam.\n\n' +
-    '<b>Format:</b>\n' +
-    '• <code>18</code> → jam 18:00 WIB\n' +
-    '• <code>18:30</code> → jam 18:30 WIB\n' +
-    '• <code>18.15</code> → jam 18:15 WIB\n\n' +
-    '<i>Bot akan cek mulai jam tersebut + buffer 60 menit.</i>'
-  );
-}
-
-export function buildSummary(
-  session: TrackSessionRow,
-  existsInRepo: boolean
-): string {
-  const hh = String(session.schedule_hour ?? 0).padStart(2, '0');
-  const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
-
-  const lines: string[] = [];
-  lines.push('<b>📋 Konfirmasi Track</b>');
-  lines.push('');
-  lines.push(`🎬 <b>Situs:</b> ${escapeHtml(session.site ?? '-')}`);
-  lines.push(
-    `🆔 <b>Slug Qimochi:</b> <code>${escapeHtml(session.slug ?? '-')}</code>`
-  );
-  if (session.source_slug && session.source_slug !== session.slug) {
-    lines.push(
-      `🔗 <b>Slug Sumber:</b> <code>${escapeHtml(session.source_slug)}</code>`
-    );
-  }
-  lines.push(
-    `📅 <b>Jadwal:</b> ${escapeHtml(session.schedule_day ?? '-')} ${hh}:${mm} WIB`
-  );
-  lines.push(`⏱️ <b>Buffer:</b> ${session.buffer_min} menit`);
-  lines.push('');
-  if (existsInRepo) {
-    lines.push('✅ Markdown qimochi ditemukan.');
-  } else {
-    lines.push(
-      '⚠️ <b>Markdown belum ada di qimochi!</b>\n' +
-        '<i>Push dulu via /anime → Post ke qimochi.</i>'
-    );
-  }
-  lines.push('');
-  lines.push('<i>Klik ✅ Simpan kalau cocok.</i>');
-  return lines.join('\n');
 }
 
 /* ============================================================
-   DELETE MENU
+   TEXT INPUT
    ============================================================ */
 
-export function buildDeleteMenuKeyboard(counts: {
-  lexanime: number;
-  animesub: number;
-  samehadaku: number;
-}): InlineKeyboard {
-  const kb = new InlineKeyboard();
+export async function handleTrackTextV2(ctx: Context, env: Env): Promise<boolean> {
+  const userId = ctx.from?.id;
+  if (!userId) return false;
+  const text = ctx.message?.text?.trim() ?? '';
+  if (!text || text.startsWith('/')) return false;
+  const session = await getLatestSession(env.DB, userId);
+  if (!session) return false;
+  switch (session.step) {
+    case 'add_slug': return await handleAddSlug(ctx, env, session, text);
+    case 'add_source': return await handleAddSource(ctx, env, session, text);
+    case 'add_hour': return await handleAddHour(ctx, env, session, text);
+    case 'edit_value': return await handleEditValue(ctx, env, session, text);
+    default: return false;
+  }
+}
 
-  const buttons: { label: string; site: SiteKey; count: number }[] = [
-    { label: '🎬 lexanime', site: 'lexanime', count: counts.lexanime },
-    { label: '🎬 animesub', site: 'animesub', count: counts.animesub },
-    { label: '🎬 samehadaku', site: 'samehadaku', count: counts.samehadaku },
-  ];
+async function handleAddSlug(ctx: Context, env: Env, session: TrackSessionRow, slug: string): Promise<boolean> {
+  if (!SLUG_RE.test(slug)) { await ctx.reply('❌ Slug invalid. Coba lagi:'); return true; }
+  const path = `src/content/anime/${slug}.md`;
+  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
+  try { file = await githubGetFile(env, path, 'qimochi'); } catch {}
+  if (!file) {
+    await ctx.reply(
+      `❌ <b>Markdown belum ada di qimochi.</b>\n\nPath: <code>${escapeHtml(path)}</code>\n\n<i>Push dulu via /anime.</i>`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return true;
+  }
+  await updateSession(env.DB, session.session_id, { slug, source_slug: slug, step: 'add_source' });
+  const isSamehadaku = session.site === 'samehadaku';
+  const prompt = isSamehadaku
+    ? `<b>Step 3/5</b> · Slug di <b>samehadaku</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Opsi:</b>\n• URL anime Samehadaku\n• Slug langsung\n• <code>-</code> kalau sama`
+    : `<b>Step 3/5</b> · Slug di <b>${session.site}</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Kalau sama:</b> kirim <code>-</code>\n<b>Kalau beda:</b> kirim slug situs`;
+  await ctx.reply(prompt, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+  return true;
+}
 
-  for (const b of buttons) {
-    if (b.count > 0) {
-      kb.text(`${b.label} (${b.count})`, `tr:ds:${b.site}`).row();
+async function handleAddSource(ctx: Context, env: Env, session: TrackSessionRow, input: string): Promise<boolean> {
+  let sourceSlug: string;
+  if (input === '-') {
+    sourceSlug = session.slug ?? '';
+  } else if (session.site === 'samehadaku' && /^https?:\/\//i.test(input)) {
+    const extracted = extractSamehadakuSlug(input);
+    if (!extracted) {
+      await ctx.reply(
+        '❌ URL Samehadaku invalid.\n• <code>https://samehadaku.li/anime/{slug}/</code>\n• <code>https://samehadaku.li/{slug}-episode-N-subtitle-indonesia/</code>',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return true;
     }
+    sourceSlug = extracted;
+    await ctx.reply(`✅ Slug: <code>${escapeHtml(sourceSlug)}</code>`, { parse_mode: 'HTML' });
+  } else {
+    sourceSlug = input.trim();
+  }
+  if (!SLUG_RE.test(sourceSlug)) { await ctx.reply('❌ Slug invalid. Kirim ulang:'); return true; }
+  await updateSession(env.DB, session.session_id, { source_slug: sourceSlug, step: 'add_day' });
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < 7; i++) {
+    kb.text(DAYS_SHORT[i]!, `tr:day:${session.session_id}:${DAYS[i]}`);
+    if ((i + 1) % 4 === 0) kb.row();
+  }
+  kb.text('🎲 Random', `tr:day:${session.session_id}:Random`).row();
+  kb.text('❌ Batal', `tr:x:${session.session_id}`);
+  await ctx.reply('<b>Step 4/5</b> · Pilih hari rilis:', {
+    parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb,
+  });
+  return true;
+}
+
+async function handleAddHour(ctx: Context, env: Env, session: TrackSessionRow, input: string): Promise<boolean> {
+  const parsed = parseTime(input);
+  if (!parsed) {
+    await ctx.reply('❌ Format jam invalid.\n\nContoh: <code>18</code> / <code>18:30</code> / <code>18.15</code>', { parse_mode: 'HTML' });
+    return true;
+  }
+  await updateSession(env.DB, session.session_id, {
+    schedule_hour: parsed.hour, schedule_minute: parsed.minute, step: 'add_confirm',
+  });
+  const hh = String(parsed.hour).padStart(2, '0');
+  const mm = String(parsed.minute).padStart(2, '0');
+  await ctx.reply(
+    `📋 <b>Konfirmasi</b>\n\n🎬 Site: <b>${session.site}</b>\n🆔 <code>${escapeHtml(session.slug ?? '-')}</code>\n🔗 <code>${escapeHtml(session.source_slug ?? '-')}</code>\n📅 ${session.schedule_day} ${hh}:${mm} WIB\n\n<i>Klik Simpan.</i>`,
+    {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('✅ Simpan', `tr:save:${session.session_id}`)
+        .text('❌ Batal', `tr:x:${session.session_id}`),
+    }
+  );
+  return true;
+}
+
+async function handleEditValue(ctx: Context, env: Env, session: TrackSessionRow, input: string): Promise<boolean> {
+  const slug = session.slug;
+  const field = session.edit_field;
+  if (!slug || !field) { await deleteSession(env.DB, session.session_id); return false; }
+
+  const patch: Record<string, unknown> = {};
+  let error: string | null = null;
+
+  if (field === 'schedule_hour') {
+    const parsed = parseTime(input);
+    if (parsed) { patch.schedule_hour = parsed.hour; patch.schedule_minute = parsed.minute; }
+    else error = 'Format jam invalid. Contoh: 18 atau 18:30';
+  } else if (field === 'last_ep') {
+    const n = parseInt(input.trim(), 10);
+    if (!isNaN(n) && n >= 0 && n <= 9999) patch.last_ep = n;
+    else error = 'Angka 0-9999';
+  } else if (field === 'chunk') {
+    const m = input.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) { patch.chunk_start = parseInt(m[1] ?? '0', 10); patch.chunk_end = parseInt(m[2] ?? '0', 10); }
+    else error = 'Format: 2-6';
+  } else if (field === 'buffer_min') {
+    const n = parseInt(input.trim(), 10);
+    if (!isNaN(n) && n >= 5 && n <= 480) patch.buffer_min = n;
+    else error = 'Angka 5-480';
+  } else if (field === 'source_slug') {
+    let s = input.trim();
+    if (session.site === 'samehadaku' && /^https?:\/\//i.test(s)) {
+      const extracted = extractSamehadakuSlug(s);
+      if (extracted) s = extracted;
+    }
+    if (SLUG_RE.test(s)) patch.source_slug = s;
+    else error = 'Slug invalid';
   }
 
-  kb.text('◀️ Kembali', 'tr:h');
-  return kb;
+  if (error) { await ctx.reply(`❌ ${error}\n\nCoba lagi:`); return true; }
+
+  await updateTrackedAnime(env.DB, slug, patch);
+  await deleteSession(env.DB, session.session_id);
+  await ctx.reply(`✅ <b>Updated:</b> <code>${escapeHtml(slug)}</code>`, {
+    parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+  });
+  await showDetail(ctx, env, slug, false);
+  return true;
 }
 
-export function buildDeleteMenuText(counts: {
-  lexanime: number;
-  animesub: number;
-  samehadaku: number;
-}): string {
+/* ============================================================
+   COMMAND
+   ============================================================ */
+
+export const trackCommand: CommandDefinition = {
+  name: 'track',
+  description: 'Track anime + episode auto-fetch',
+  usage: '/track',
+  adminOnly: true,
+
+  handler: async (ctx, env) => {
+    const arg = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    const parts = arg.split(/\s+/).filter(Boolean);
+    const sub = (parts[0] ?? '').toLowerCase();
+
+    if (!sub) { await showMainMenu(ctx, env); return; }
+
+    if (sub === 'add') {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+      await startAddFlow(ctx, env, userId);
+      return;
+    }
+    if (sub === 'list') { await showList(ctx, env, 0); return; }
+    if (sub === 'catchup') { await handleCatchup(ctx, env); return; }
+
+    if (sub === 'remove') {
+      const slug = parts[1];
+      if (!slug) { await ctx.reply('Usage: <code>/track remove &lt;slug&gt;</code>', { parse_mode: 'HTML' }); return; }
+      const ok = await deleteTrackedAnime(env.DB, slug);
+      await ctx.reply(ok ? `✅ <code>${escapeHtml(slug)}</code> dihapus.` : `❌ Tidak ada: <code>${escapeHtml(slug)}</code>`, { parse_mode: 'HTML' });
+      return;
+    }
+
+    if (sub === 'check') {
+      const slug = parts[1];
+      if (!slug) { await ctx.reply('Usage: <code>/track check &lt;slug&gt;</code>', { parse_mode: 'HTML' }); return; }
+      const loading = await ctx.reply(`🔍 Cek <code>${escapeHtml(slug)}</code>...`, {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      });
+      try {
+        const { runManualCheck } = await import('../lib/cron/runner');
+        const result = await runManualCheck(env, slug);
+        const lines: string[] = [];
+        lines.push(`📡 <b>Check: ${escapeHtml(slug)}</b>`);
+        lines.push('');
+        lines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
+        lines.push(`📼 Push: <b>${result.episodesPushed}</b>`);
+        if (result.errors.length > 0) {
+          lines.push('');
+          lines.push('⚠️ <b>Error:</b>');
+          for (const e of result.errors) lines.push(`• <code>${escapeHtml(e.slice(0, 200))}</code>`);
+        }
+        await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+          parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard().text('🏠 Menu', 'tr:h'),
+        }).catch(() => {});
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'unknown';
+        await ctx.api.editMessageText(
+          ctx.chat!.id, loading.message_id,
+          `❌ <b>Error:</b> <code>${escapeHtml(msg.slice(0, 300))}</code>`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    await ctx.reply('❌ Subcommand tidak dikenal.\n\n<i>Ketik <code>/track</code> untuk menu.</i>', { parse_mode: 'HTML' });
+  },
+};
+
+/* ============================================================
+   CALLBACKS
+   ============================================================ */
+
+export function setupTrackCallbacks(bot: Bot, env: Env): void {
+  bot.callbackQuery(/^tr:h$/, async (ctx) => {
+    await ctx.answerCallbackQuery({ text: '🏠' });
+    await showMainMenu(ctx, env, true);
+  });
+  bot.callbackQuery(/^tr:a$/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    await ctx.answerCallbackQuery({ text: '➕' });
+    await startAddFlow(ctx, env, userId);
+  });
+  bot.callbackQuery(/^tr:l$/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showList(ctx, env, 0);
+  });
+  bot.callbackQuery(/^tr:c$/, async (ctx) => {
+    await ctx.answerCallbackQuery({ text: '🔄' });
+    await handleCatchup(ctx, env);
+  });
+  bot.callbackQuery(/^tr:lp:(\d+)$/, async (ctx) => {
+    const page = parseInt(ctx.match[1] ?? '0', 10);
+    try { await ctx.answerCallbackQuery({ text: `📄 Hal ${page + 1}` }); } catch {}
+    try {
+      await showList(ctx, env, page);
+    } catch (err) {
+      console.error('[Track] pagination failed:', err);
+      const msg = err instanceof Error ? err.message : 'unknown';
+      await ctx.reply(`❌ Pagination error: <code>${msg.slice(0, 200)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+    }
+  });
+  bot.callbackQuery(/^tr:v:(.+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showDetail(ctx, env, slug, true);
+  });
+  bot.callbackQuery(/^tr:e:(.+):(\w+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const field = ctx.match[2] ?? '';
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
+    await promptEdit(ctx, env, userId, slug, field);
+  });
+  bot.callbackQuery(/^tr:set:(ts_[a-z0-9]+):(.+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const value = ctx.match[2] ?? '';
+    const session = await getSession(env.DB, sessionId);
+    if (!session) { await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true }); return; }
+    if (ctx.from?.id !== session.user_id) { await ctx.answerCallbackQuery({ text: '⛔' }); return; }
+    if (!session.slug || !session.edit_field) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    const patch: Record<string, unknown> = {};
+    const field = session.edit_field;
+    if (field === 'site') {
+      if (!isValidSite(value)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+      patch.site = value;
+    } else if (field === 'status') {
+      if (!['active','paused','finished'].includes(value)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+      patch.status = value;
+    } else if (field === 'schedule_day') {
+      patch.schedule_day = value;
+    } else { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await updateTrackedAnime(env.DB, session.slug, patch);
+    await deleteSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '✅' });
+    await showDetail(ctx, env, session.slug, true);
+  });
+  bot.callbackQuery(/^tr:cx:(.+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
+    await ctx.answerCallbackQuery({ text: '🔄' });
+    const loading = await ctx.reply(`🔍 Cek <code>${escapeHtml(slug)}</code>...`, {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+    });
+    try {
+      const { runManualCheck } = await import('../lib/cron/runner');
+      const result = await runManualCheck(env, slug);
+      const lines: string[] = [];
+      lines.push(`📡 <b>Check: ${escapeHtml(slug)}</b>`);
+      lines.push('');
+      lines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
+      lines.push(`📼 Push: <b>${result.episodesPushed}</b>`);
+      if (result.errors.length > 0) {
+        lines.push('');
+        lines.push('⚠️ <b>Error:</b>');
+        for (const e of result.errors.slice(0, 3)) lines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
+      }
+      await ctx.api.editMessageText(ctx.chat!.id, loading.message_id, lines.join('\n'), {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('◀️ Kembali', `tr:v:${hashSlug(slug)}`),
+      }).catch(() => {});
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'unknown';
+      await ctx.api.editMessageText(ctx.chat!.id, loading.message_id,
+        `❌ <b>Error:</b> <code>${escapeHtml(msg.slice(0, 200))}</code>`,
+        { parse_mode: 'HTML' }).catch(() => {});
+    }
+  });
+  bot.callbackQuery(/^tr:rs:(.+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
+    await updateTrackedAnime(env.DB, slug, { last_ep: 0, chunk_start: 0, chunk_end: 0 });
+    await ctx.answerCallbackQuery({ text: '♻️ Reset' });
+    await showDetail(ctx, env, slug, true);
+  });
+  bot.callbackQuery(/^tr:dv:(.+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
+    await ctx.answerCallbackQuery({ text: '⚠️' });
+    await ctx.api.editMessageText(ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
+      `⚠️ <b>Hapus anime?</b>\n\n<code>${escapeHtml(slug)}</code>`,
+      {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard()
+          .text('✅ Ya, Hapus', `tr:dvy:${hash}`)
+          .text('❌ Batal', `tr:v:${hash}`),
+      }).catch(() => {});
+  });
+  bot.callbackQuery(/^tr:dvy:(.+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) { await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true }); return; }
+    await deleteTrackedAnime(env.DB, slug);
+    await ctx.answerCallbackQuery({ text: '🗑️' });
+    await showList(ctx, env, 0);
+  });
+
+  /* DELETE MENU */
+  bot.callbackQuery(/^tr:dm$/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showDeleteMenu(ctx, env);
+  });
+  bot.callbackQuery(/^tr:ds:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showDeleteSite(ctx, env, site);
+  });
+  bot.callbackQuery(/^tr:dall:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await ctx.answerCallbackQuery({ text: '⚠️' });
+    await confirmDeleteAll(ctx, env, site);
+  });
+  bot.callbackQuery(/^tr:dally:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await ctx.answerCallbackQuery({ text: '🗑️' });
+    await execDeleteAll(ctx, env, site);
+  });
+  bot.callbackQuery(/^tr:dsel:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showDeleteSelect(ctx, env, site, 0);
+  });
+  bot.callbackQuery(/^tr:dt:(\w+):(\d+):(\d+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    const mask = parseInt(ctx.match[2] ?? '0', 10);
+    const idx = parseInt(ctx.match[3] ?? '0', 10);
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await toggleDeleteSelect(ctx, env, site, mask, idx);
+  });
+  bot.callbackQuery(/^tr:dgo:(\w+):(\d+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    const mask = parseInt(ctx.match[2] ?? '0', 10);
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await confirmDeleteSelected(ctx, env, site, mask);
+  });
+  bot.callbackQuery(/^tr:dgy:(\w+):(\d+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    const mask = parseInt(ctx.match[2] ?? '0', 10);
+    if (!isValidSite(site)) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+    await execDeleteSelected(ctx, env, site, mask);
+  });
+
+  /* ADD FLOW */
+  bot.callbackQuery(/^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const site = (ctx.match[2] ?? '') as SiteKey;
+    const session = await getSession(env.DB, sessionId);
+    if (!session) { await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true }); return; }
+    if (ctx.from?.id !== session.user_id) { await ctx.answerCallbackQuery({ text: '⛔' }); return; }
+    await updateSession(env.DB, sessionId, { site, step: 'add_slug' });
+    await ctx.answerCallbackQuery({ text: site });
+    await ctx.api.editMessageText(
+      ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
+      '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>',
+      {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
+      }
+    ).catch(() => {});
+  });
+  bot.callbackQuery(/^tr:day:(ts_[a-z0-9]+):([A-Za-z]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const day = ctx.match[2] ?? '';
+    const session = await getSession(env.DB, sessionId);
+    if (!session) { await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true }); return; }
+    if (ctx.from?.id !== session.user_id) { await ctx.answerCallbackQuery({ text: '⛔' }); return; }
+    await updateSession(env.DB, sessionId, { schedule_day: day, step: 'add_hour' });
+    await ctx.answerCallbackQuery({ text: day });
+    await ctx.api.editMessageText(
+      ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
+      `<b>Step 5/5</b> · Hari: <b>${day}</b>\n\nKirim <b>jam rilis</b> (WIB):\n\n• <code>18</code> → 18:00\n• <code>18:30</code> → 18:30\n• <code>18.15</code> → 18:15`,
+      {
+        parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
+      }
+    ).catch(() => {});
+  });
+  bot.callbackQuery(/^tr:save:(ts_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const session = await getSession(env.DB, sessionId);
+    if (!session) { await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true }); return; }
+    if (ctx.from?.id !== session.user_id) { await ctx.answerCallbackQuery({ text: '⛔' }); return; }
+    if (!session.site || !session.slug || !session.source_slug || !session.schedule_day || session.schedule_hour === null) {
+      await ctx.answerCallbackQuery({ text: '❌ Data kurang', show_alert: true }); return;
+    }
+    const site = session.site as SiteKey;
+    const fallbackSite: SiteKey | null =
+      site === 'lexanime' ? 'animesub' : site === 'animesub' ? 'lexanime' : null;
+    await saveTrackedAnime(env.DB, {
+      slug: session.slug, site, sourceSlug: session.source_slug, fallbackSite,
+      scheduleDay: session.schedule_day, scheduleHour: session.schedule_hour,
+      scheduleMinute: session.schedule_minute ?? 0, bufferMin: session.buffer_min,
+    });
+    await deleteSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '✅' });
+    const hh = String(session.schedule_hour).padStart(2, '0');
+    const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
+    await ctx.api.editMessageText(
+      ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
+      `✅ <b>Anime di-track!</b>\n\n🆔 <code>${escapeHtml(session.slug)}</code>\n🎬 ${site}\n📅 ${session.schedule_day} ${hh}:${mm} WIB`,
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: undefined }
+    ).catch(() => {});
+  });
+  bot.callbackQuery(/^tr:x:(ts_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    await deleteSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '🗑️' });
+    await ctx.api.editMessageText(
+      ctx.chat!.id, ctx.callbackQuery!.message!.message_id!,
+      '❌ <b>Dibatalkan.</b>',
+      { parse_mode: 'HTML', reply_markup: undefined }
+    ).catch(() => {});
+  });
+}
+
+/* ============================================================
+   DELETE MENU INTERNAL
+   ============================================================ */
+
+async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const counts: Record<SiteKey, number> = { lexanime: 0, animesub: 0, samehadaku: 0 };
+  for (const r of all) { if (r.site in counts) counts[r.site]++; }
   const total = counts.lexanime + counts.animesub + counts.samehadaku;
-  return (
-    '🗑️ <b>Hapus Anime</b>\n\n' +
-    `Total: <b>${total}</b> anime\n\n` +
-    '<i>Pilih situs untuk lihat daftarnya:</i>'
-  );
-}
+  const editId = ctx.callbackQuery!.message!.message_id!;
 
-export function buildDeleteSiteActionKeyboard(
-  site: SiteKey,
-  count: number
-): InlineKeyboard {
+  if (total === 0) {
+    await ctx.api.editMessageText(ctx.chat!.id, editId, '📭 Belum ada anime.', {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:h'),
+    }).catch(() => {});
+    return;
+  }
   const kb = new InlineKeyboard();
-  kb.text(`🗑️ Hapus Semua (${count})`, `tr:dall:${site}`).row();
-  kb.text('☑️ Pilih Satu-satu', `tr:dsel:${site}`).row();
-  kb.text('◀️ Kembali', 'tr:dm');
-  return kb;
+  if (counts.lexanime > 0) kb.text(`🎬 lexanime (${counts.lexanime})`, 'tr:ds:lexanime').row();
+  if (counts.animesub > 0) kb.text(`🎬 animesub (${counts.animesub})`, 'tr:ds:animesub').row();
+  if (counts.samehadaku > 0) kb.text(`🎬 samehadaku (${counts.samehadaku})`, 'tr:ds:samehadaku').row();
+  kb.text('◀️ Kembali', 'tr:h');
+  await ctx.api.editMessageText(ctx.chat!.id, editId,
+    `🗑️ <b>Hapus Anime</b>\n\nTotal: <b>${total}</b>\n\n<i>Pilih situs:</i>`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb }
+  ).catch(() => {});
 }
 
-export function buildDeleteSiteActionText(
-  site: SiteKey,
-  list: TrackedAnimeRow[]
-): string {
+async function showDeleteSite(ctx: Context, env: Env, site: SiteKey): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
+  const editId = ctx.callbackQuery!.message!.message_id!;
+  if (list.length === 0) {
+    await ctx.api.editMessageText(ctx.chat!.id, editId, `📭 Tidak ada anime dari <b>${site}</b>.`, {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:dm'),
+    }).catch(() => {});
+    return;
+  }
   const lines: string[] = [];
   lines.push(`🗑️ <b>Hapus dari ${escapeHtml(site)}</b>`);
   lines.push('');
-  lines.push(`📊 Total: <b>${list.length}</b> anime`);
+  lines.push(`📊 Total: <b>${list.length}</b>`);
   lines.push('');
-  lines.push('<b>Daftar:</b>');
-  const preview = list.slice(0, 8);
-  for (const r of preview) {
-    lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
-  }
-  if (list.length > preview.length) {
-    lines.push(`<i>… dan ${list.length - preview.length} lainnya</i>`);
-  }
-  lines.push('');
-  lines.push('<i>Pilih action:</i>');
-  return lines.join('\n');
+  for (const r of list.slice(0, 8)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  if (list.length > 8) lines.push(`<i>… dan ${list.length - 8} lainnya</i>`);
+  const kb = new InlineKeyboard()
+    .text(`🗑️ Hapus Semua (${list.length})`, `tr:dall:${site}`)
+    .row()
+    .text('☑️ Pilih Satu-satu', `tr:dsel:${site}`)
+    .row()
+    .text('◀️ Kembali', 'tr:dm');
+  await ctx.api.editMessageText(ctx.chat!.id, editId, lines.join('\n'), {
+    parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb,
+  }).catch(() => {});
 }
 
-export function buildDeleteAllConfirmKeyboard(site: SiteKey): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('✅ Ya, Hapus Semua', `tr:dally:${site}`)
-    .text('❌ Batal', `tr:ds:${site}`);
-}
-
-export function buildDeleteAllConfirmText(
-  site: SiteKey,
-  list: TrackedAnimeRow[]
-): string {
+async function confirmDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site);
+  const editId = ctx.callbackQuery!.message!.message_id!;
   const lines: string[] = [];
   lines.push('⚠️ <b>Konfirmasi Hapus Semua</b>');
   lines.push('');
-  lines.push(
-    `Yakin hapus <b>${list.length}</b> anime dari <b>${escapeHtml(site)}</b>?`
-  );
+  lines.push(`Yakin hapus <b>${list.length}</b> anime dari <b>${escapeHtml(site)}</b>?`);
   lines.push('');
-  const preview = list.slice(0, 10);
-  for (const r of preview) {
-    lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
-  }
-  if (list.length > preview.length) {
-    lines.push(`<i>… dan ${list.length - preview.length} lainnya</i>`);
-  }
+  for (const r of list.slice(0, 10)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  if (list.length > 10) lines.push(`<i>… dan ${list.length - 10} lainnya</i>`);
   lines.push('');
   lines.push('<b>⚠️ Tidak bisa dibatalkan.</b>');
-  return lines.join('\n');
+  await ctx.api.editMessageText(ctx.chat!.id, editId, lines.join('\n'), {
+    parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+    reply_markup: new InlineKeyboard()
+      .text('✅ Ya, Hapus Semua', `tr:dally:${site}`)
+      .text('❌ Batal', `tr:ds:${site}`),
+  }).catch(() => {});
 }
 
-/* ============================================================
-   DELETE SELECT MODE
-   ============================================================ */
-
-export function buildDeleteSelectKeyboard(
-  site: SiteKey,
-  list: TrackedAnimeRow[],
-  mask: number
-): InlineKeyboard {
-  const kb = new InlineKeyboard();
-
-  list.forEach((row, i) => {
-    const checked = (mask & (1 << i)) !== 0;
-    const mark = checked ? '✅' : '⬜';
-    const label = `${mark} ${row.slug}`;
-    const shortLabel = label.length > 40 ? label.slice(0, 38) + '…' : label;
-
-    kb.text(shortLabel, `tr:dt:${site}:${mask}:${i}`);
-    kb.row();
-  });
-
-  const selectedCount = countBits(mask);
-  const delLabel =
-    selectedCount > 0
-      ? `🗑️ Hapus (${selectedCount})`
-      : `🗑️ Hapus (0)`;
-
-  kb.text(delLabel, `tr:dgo:${site}:${mask}`)
-    .text('❌ Batal', `tr:ds:${site}`);
-
-  return kb;
+async function execDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site);
+  let deleted = 0;
+  for (const r of list) {
+    const ok = await deleteTrackedAnime(env.DB, r.slug);
+    if (ok) deleted++;
+  }
+  const editId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api.editMessageText(ctx.chat!.id, editId,
+    `✅ <b>Hapus selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${escapeHtml(site)}</b>`,
+    {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('🗑️ Hapus Lagi', 'tr:dm')
+        .text('🏠 Menu', 'tr:h'),
+    }
+  ).catch(() => {});
 }
 
-export function buildDeleteSelectText(
-  site: SiteKey,
-  list: TrackedAnimeRow[],
-  mask: number
-): string {
+async function showDeleteSelect(ctx: Context, env: Env, site: SiteKey, mask: number): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
   const selected = countBits(mask);
-  const lines: string[] = [];
-  lines.push(`☑️ <b>Pilih Anime — ${escapeHtml(site)}</b>`);
-  lines.push('');
-  lines.push(`Total: <b>${list.length}</b> · Dipilih: <b>${selected}</b>`);
-  lines.push('');
-  lines.push('<i>Tap untuk toggle. Klik 🗑️ Hapus kalau sudah selesai.</i>');
-  return lines.join('\n');
+  const kb = new InlineKeyboard();
+  list.forEach((row, i) => {
+    const mark = (mask & (1 << i)) !== 0 ? '✅' : '⬜';
+    const label = `${mark} ${row.slug}`;
+    const short = label.length > 44 ? label.slice(0, 42) + '…' : label;
+    kb.text(short, `tr:dt:${site}:${mask}:${i}`).row();
+  });
+  kb.text(`🗑️ Hapus (${selected})`, `tr:dgo:${site}:${mask}`)
+    .text('❌ Batal', `tr:ds:${site}`);
+  const editId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api.editMessageText(ctx.chat!.id, editId,
+    `☑️ <b>Pilih — ${escapeHtml(site)}</b>\n\nTotal: <b>${list.length}</b> · Dipilih: <b>${selected}</b>\n\n<i>Tap untuk toggle.</i>`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: kb }
+  ).catch(() => {});
 }
 
-export function buildDeleteSelectedConfirmKeyboard(
-  site: SiteKey,
-  mask: number
-): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('✅ Ya, Hapus', `tr:dgy:${site}:${mask}`)
-    .text('❌ Batal', `tr:dsel:${site}`);
+async function toggleDeleteSelect(ctx: Context, env: Env, site: SiteKey, mask: number, idx: number): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
+  if (idx < 0 || idx >= list.length) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+  const newMask = mask ^ (1 << idx);
+  await ctx.answerCallbackQuery({ text: '✓' });
+  await showDeleteSelect(ctx, env, site, newMask);
 }
 
-export function buildDeleteSelectedConfirmText(
-  site: SiteKey,
-  list: TrackedAnimeRow[],
-  mask: number
-): string {
+async function confirmDeleteSelected(ctx: Context, env: Env, site: SiteKey, mask: number): Promise<void> {
+  if (mask === 0) { await ctx.answerCallbackQuery({ text: '❌ Kosong', show_alert: true }); return; }
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
   const selected = list.filter((_, i) => (mask & (1 << i)) !== 0);
-
   const lines: string[] = [];
-  lines.push('⚠️ <b>Konfirmasi Hapus</b>');
+  lines.push('⚠️ <b>Konfirmasi</b>');
   lines.push('');
-  lines.push(
-    `Yakin hapus <b>${selected.length}</b> anime dari <b>${escapeHtml(site)}</b>?`
-  );
+  lines.push(`Hapus <b>${selected.length}</b> anime?`);
   lines.push('');
-  for (const r of selected.slice(0, 15)) {
-    lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
-  }
-  if (selected.length > 15) {
-    lines.push(`<i>… dan ${selected.length - 15} lainnya</i>`);
-  }
-  return lines.join('\n');
+  for (const r of selected.slice(0, 15)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  await ctx.answerCallbackQuery({ text: '⚠️' });
+  const editId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api.editMessageText(ctx.chat!.id, editId, lines.join('\n'), {
+    parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+    reply_markup: new InlineKeyboard()
+      .text('✅ Ya, Hapus', `tr:dgy:${site}:${mask}`)
+      .text('❌ Batal', `tr:dsel:${site}`),
+  }).catch(() => {});
 }
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
-
-export function countBits(n: number): number {
-  let count = 0;
-  let x = n;
-  while (x > 0) {
-    count += x & 1;
-    x >>>= 1;
+async function execDeleteSelected(ctx: Context, env: Env, site: SiteKey, mask: number): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
+  const selected = list.filter((_, i) => (mask & (1 << i)) !== 0);
+  if (selected.length === 0) { await ctx.answerCallbackQuery({ text: '❌' }); return; }
+  await ctx.answerCallbackQuery({ text: '🗑️' });
+  let deleted = 0;
+  for (const r of selected) {
+    const ok = await deleteTrackedAnime(env.DB, r.slug);
+    if (ok) deleted++;
   }
-  return count;
+  const editId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api.editMessageText(ctx.chat!.id, editId,
+    `✅ <b>Selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${escapeHtml(site)}</b>`,
+    {
+      parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('🗑️ Hapus Lagi', 'tr:dm')
+        .text('🏠 Menu', 'tr:h'),
+    }
+  ).catch(() => {});
 }
 ===== END FILE =====
 
@@ -11327,7 +11636,6 @@ function hexToBytes(hex: string): Uint8Array {
 ===== END FILE =====
 
 ===== FILE: ./src/index.ts =====
-=== FILE: src/index.ts ===
 import { Bot, webhookCallback } from 'grammy';
 import type { Env } from './types/env';
 import { registerCommands } from './commands/registry';
@@ -11346,8 +11654,7 @@ import { setupPostCallbacks } from './commands/post';
 import { setupKillCallbacks } from './commands/kill';
 import { setupEditCallbacks } from './commands/edit/callbacks';
 import { handleEditTextInput } from './commands/edit';
-import { handleTrackTextV2 } from './commands/track';
-import { setupTrackCmsCallbacks } from './commands/track-callbacks';
+import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';
 import { COMMANDS } from './commands/list';
 
 const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
@@ -11361,9 +11668,7 @@ function createBot(env: Env): Bot {
 
   bot.command('start', async (ctx) => {
     await ctx.reply(
-      '🤖 <b>Yukio Bot</b>\n' +
-        '<i>Personal assistant</i>\n\n' +
-        'Ketik /help untuk lihat command.',
+      '🤖 <b>Yukio Bot</b>\n<i>Personal assistant</i>\n\nKetik /help untuk lihat command.',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
   });
@@ -11376,17 +11681,15 @@ function createBot(env: Env): Bot {
   setupPublishCallbacks(bot, env);
   setupPostCallbacks(bot, env);
   setupKillCallbacks(bot, env);
-  setupTrackCmsCallbacks(bot, env);
+  setupTrackCallbacks(bot, env);
   setupEditCallbacks(bot, env);
 
   bot.on('message:text', async (ctx) => {
     if (!isAdmin(ctx.from?.id, env)) return;
     if (ctx.chat?.type !== 'private') return;
-
     try {
       const handledTrackV2 = await handleTrackTextV2(ctx, env);
       if (handledTrackV2) return;
-
       const handledEdit = await handleEditTextInput(ctx, env);
       if (handledEdit) return;
     } catch (err) {
@@ -11399,10 +11702,8 @@ function createBot(env: Env): Bot {
     if (caption.startsWith('/')) return;
     if (ctx.chat?.type !== 'private') return;
     if (!isAdmin(ctx.from?.id, env)) return;
-
     const name = ctx.message.document.file_name ?? '';
     if (!/\.(html?|txt)$/i.test(name)) return;
-
     try {
       await handleDocumentAuto(ctx, env);
     } catch (err) {
@@ -11421,46 +11722,29 @@ function createBot(env: Env): Bot {
 async function applyBotCommands(
   bot: Bot
 ): Promise<{ commands: { command: string; description: string }[]; skipped: string[] }> {
-  const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map(
-    (c) => ({
-      command: c.name,
-      description: (c.description || c.name).slice(0, 256),
-    })
-  );
-
-  const skipped = COMMANDS.filter(
-    (c) => !COMMAND_NAME_RE.test(c.name)
-  ).map((c) => c.name);
-
-  if (skipped.length > 0) {
-    console.warn(
-      `[Bot] Skipped invalid command names from menu: ${skipped.join(', ')}`
-    );
-  }
-
+  const commands = COMMANDS.filter((c) => COMMAND_NAME_RE.test(c.name)).map((c) => ({
+    command: c.name,
+    description: (c.description || c.name).slice(0, 256),
+  }));
+  const skipped = COMMANDS.filter((c) => !COMMAND_NAME_RE.test(c.name)).map((c) => c.name);
+  if (skipped.length > 0) console.warn(`[Bot] Skipped: ${skipped.join(', ')}`);
   await bot.api.setMyCommands(commands);
-
   return { commands, skipped };
 }
 
 async function setupBotMenu(bot: Bot, token: string): Promise<void> {
   if (menuSetForToken === token) return;
-
   try {
     const { commands } = await applyBotCommands(bot);
     menuSetForToken = token;
-    console.log(`[Bot] setMyCommands: ${commands.length} commands registered`);
+    console.log(`[Bot] setMyCommands: ${commands.length} commands`);
   } catch (err) {
     console.error('[Bot] setMyCommands failed:', err);
   }
 }
 
 async function getBot(env: Env): Promise<Bot> {
-  if (!cachedBot) {
-    console.log('[Bot] creating new instance');
-    cachedBot = createBot(env);
-  }
-
+  if (!cachedBot) { cachedBot = createBot(env); }
   if (!initPromise) {
     const t0 = Date.now();
     initPromise = cachedBot
@@ -11470,32 +11754,23 @@ async function getBot(env: Env): Promise<Bot> {
         await setupBotMenu(cachedBot!, env.TELEGRAM_BOT_TOKEN);
       })
       .catch((err) => {
-        console.error(`[Bot] init FAILED in ${Date.now() - t0}ms:`, err);
+        console.error(`[Bot] init FAILED:`, err);
         initPromise = null;
         cachedBot = null;
         throw err;
       });
   }
-
   await initPromise;
   return cachedBot;
 }
 
 export default {
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/health' || url.pathname === '/') {
       return new Response(
-        JSON.stringify({
-          status: 'ok',
-          bot: 'yukio-bot',
-          timestamp: new Date().toISOString(),
-        }),
+        JSON.stringify({ status: 'ok', bot: 'yukio-bot', timestamp: new Date().toISOString() }),
         { headers: { 'Content-Type': 'application/json' } }
       );
     }
@@ -11503,67 +11778,23 @@ export default {
     if (url.pathname === '/debug') {
       const t0 = Date.now();
       try {
-        const res = await fetch(
-          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`
-        );
+        const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`);
         const data = await res.json();
         return new Response(
-          JSON.stringify(
-            { ok: res.ok, status: res.status, elapsed: Date.now() - t0, data },
-            null,
-            2
-          ),
+          JSON.stringify({ ok: res.ok, status: res.status, elapsed: Date.now() - t0, data }, null, 2),
           { headers: { 'Content-Type': 'application/json' } }
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
         return new Response(
-          JSON.stringify({
-            ok: false,
-            elapsed: Date.now() - t0,
-            error: err?.message ?? String(err),
-          }),
+          JSON.stringify({ ok: false, elapsed: Date.now() - t0, error: msg }),
           { status: 500, headers: { 'Content-Type': 'application/json' } }
         );
       }
     }
 
-    if (url.pathname === '/debug/gh-app') {
-      try {
-        const { getInstallationToken } = await import('./lib/github-app');
-        const token = await getInstallationToken(env);
-
-        return new Response(
-          JSON.stringify(
-            {
-              ok: true,
-              tokenPreview: token.slice(0, 20) + '...',
-              tokenLength: token.length,
-              appId: env.GH_APP_ID,
-              installationId: env.GH_APP_INSTALLATION_ID,
-            },
-            null,
-            2
-          ),
-          { headers: { 'Content-Type': 'application/json' } }
-        );
-      } catch (err: any) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error: err?.message ?? String(err),
-          }),
-          { status: 500, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-
-    if (url.pathname === '/discord/register') {
-      return registerDiscordCommands(env);
-    }
-
-    if (url.pathname === '/discord') {
-      return handleDiscordRequest(request, env, ctx);
-    }
+    if (url.pathname === '/discord/register') return registerDiscordCommands(env);
+    if (url.pathname === '/discord') return handleDiscordRequest(request, env, ctx);
 
     if (url.pathname === '/webhook') {
       const t0 = Date.now();
@@ -11576,88 +11807,64 @@ export default {
         const res = await handler(request);
         console.log(`[Worker] webhook done in ${Date.now() - t0}ms`);
         return res;
-      } catch (err: any) {
-        console.error(
-          `[Worker] webhook error after ${Date.now() - t0}ms:`,
-          err?.message ?? err
-        );
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[Worker] webhook error after ${Date.now() - t0}ms:`, msg);
         return new Response('OK', { status: 200 });
       }
     }
     return new Response('Not Found', { status: 404 });
   },
 
-  async scheduled(
-    event: ScheduledEvent,
-    env: Env,
-    _ctx: ExecutionContext
-  ): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     const cron = event.cron;
     console.log(`[Cron] trigger: ${cron}`);
 
     if (cron === '0 3 * * *') {
       try {
         const cleaned = await cleanupCache(env.DB);
-        console.log(`[Cron] Cleaned ${cleaned} expired cache entries`);
+        console.log(`[Cron] Cleaned ${cleaned}`);
       } catch (err) {
         console.error('[Cron] cleanup error:', err);
       }
       return;
     }
+
     if (cron === '0 23 * * *' || cron === '0 11 * * *') {
       try {
         const { runCron } = await import('./lib/cron/runner');
         const result = await runCron(env);
-
         const summaryLines: string[] = [];
-        summaryLines.push(
-          `<b>📡 Cron Episode Report</b>\n` +
-            `🕐 <code>${cron}</code>\n`
-        );
-        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b> anime`);
-        summaryLines.push(
-          `📼 Push: <b>${result.episodesPushed}</b> episode baru`
-        );
-
+        summaryLines.push(`<b>📡 Cron Episode Report</b>\n🕐 <code>${cron}</code>\n`);
+        summaryLines.push(`🔍 Dicek: <b>${result.animeChecked}</b>`);
+        summaryLines.push(`📼 Push: <b>${result.episodesPushed}</b>`);
         if (result.errors.length > 0) {
           summaryLines.push('');
           summaryLines.push(`⚠️ <b>Error (${result.errors.length}):</b>`);
-          for (const e of result.errors.slice(0, 5)) {
+          for (const e of result.errors.slice(0, 5))
             summaryLines.push(`• <code>${escapeHtml(e.slice(0, 150))}</code>`);
-          }
-          if (result.errors.length > 5) {
-            summaryLines.push(
-              `<i>…dan ${result.errors.length - 5} lainnya</i>`
-            );
-          }
+          if (result.errors.length > 5)
+            summaryLines.push(`<i>…dan ${result.errors.length - 5}</i>`);
         }
         try {
           const { Bot: BotCtor } = await import('grammy');
           const bot = new BotCtor(env.TELEGRAM_BOT_TOKEN);
-          await bot.api.sendMessage(
-            env.ADMIN_USER_ID,
-            summaryLines.join('\n'),
-            {
-              parse_mode: 'HTML',
-              link_preview_options: { is_disabled: true },
-            }
-          );
+          await bot.api.sendMessage(env.ADMIN_USER_ID, summaryLines.join('\n'), {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+          });
         } catch (notifErr) {
           console.error('[Cron] notif error:', notifErr);
         }
-
-        console.log(
-          `[Cron] episode check done — pushed ${result.episodesPushed}, errors ${result.errors.length}`
-        );
+        console.log(`[Cron] done — pushed ${result.episodesPushed}, errors ${result.errors.length}`);
       } catch (err) {
-        console.error('[Cron] episode check error:', err);
+        console.error('[Cron] error:', err);
       }
       return;
     }
-    console.warn(`[Cron] unknown trigger: ${cron}`);
+    console.warn(`[Cron] unknown: ${cron}`);
   },
 };
-=== END ===
 ===== END FILE =====
 
 ===== FILE: ./src/lib/batch-session.ts =====
