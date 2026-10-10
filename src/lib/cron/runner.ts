@@ -7,7 +7,6 @@ import {
   githubGetFile,
   type FileToCommit,
 } from '../github';
-import { slugify } from '../utils';
 import {
   listTrackedAnime,
   getTrackedAnime,
@@ -25,7 +24,7 @@ import { fetchLatestEpisodeNumber, fetchEpisode } from './fetcher';
 const MAX_ANIME_PER_RUN = 5;
 
 function chunkPath(slug: string, start: number, end: number): string {
-  return `src/data/anime/${slug}/episodes/${start}-${end}.json`;
+  return `data/anime/${slug}/episodes/streams/${start}-${end}.json`;
 }
 
 interface ChunkResult {
@@ -53,23 +52,21 @@ async function buildNewChunk(
     : chunkPath(slug, currentChunkStart, currentChunkEnd);
   const newPath = chunkPath(slug, newChunkStart, newChunkEnd);
 
-  let existingEpisodes: EpisodeObject[] = [];
+  let existing: EpisodeObject[] = [];
   if (!isNewChunk && oldPath) {
     try {
-      const file = await githubGetFile(env, oldPath, 'qimochi');
+      const file = await githubGetFile(env, oldPath, 'yukio-data');
       if (file) {
         const parsed = JSON.parse(file.content);
-        if (Array.isArray(parsed)) existingEpisodes = parsed as EpisodeObject[];
+        if (Array.isArray(parsed)) existing = parsed as EpisodeObject[];
       }
     } catch (err) {
-      console.warn('[Runner] fetch old chunk failed:', err);
+      console.warn('[Runner] fetch old stream chunk failed:', err);
       return null;
     }
   }
 
-  const merged = [...existingEpisodes, newEpisode].sort(
-    (a, b) => a.number - b.number
-  );
+  const merged = [...existing, newEpisode].sort((a, b) => a.number - b.number);
 
   return {
     newPath,
@@ -78,18 +75,14 @@ async function buildNewChunk(
   };
 }
 
-/**
- * Update `updatedAt` di MD qimochi. Support format dengan / tanpa quote.
- * Support format date-only (2026-10-10) DAN full ISO (2026-10-10T...).
- */
-async function updateQimochiMd(
+async function updateYukioDataMd(
   env: Env,
   slug: string
 ): Promise<FileToCommit | null> {
   const mdPath = `src/content/anime/${slug}.md`;
 
   try {
-    const mdFile = await githubGetFile(env, mdPath, 'qimochi');
+    const mdFile = await githubGetFile(env, mdPath, 'yukio-data');
     if (!mdFile) {
       console.warn(`[Runner] MD tidak ditemukan: ${mdPath}`);
       return null;
@@ -98,27 +91,30 @@ async function updateQimochiMd(
     const today = new Date().toISOString().split('T')[0] ?? '2026-01-01';
     let mdContent = mdFile.content;
 
-    if (/^updatedAt:\s*.+$/m.test(mdContent)) {
-      mdContent = mdContent.replace(
-        /^updatedAt:\s*.+$/m,
-        `updatedAt: "${today}"`
-      );
-    } else if (/^addedAt:\s*.+$/m.test(mdContent)) {
-      mdContent = mdContent.replace(
-        /^(addedAt:\s*.+)$/m,
-        `$1\nupdatedAt: "${today}"`
-      );
-    } else {
-      mdContent = mdContent.replace(
-        /^---\s*$/m,
-        `updatedAt: "${today}"\n---`
-      );
+    const fmMatch = mdContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+    if (!fmMatch) {
+      console.warn(`[Runner] MD frontmatter invalid: ${mdPath}`);
+      return null;
     }
 
+    const [, frontmatter, body] = fmMatch;
+    let fm = frontmatter ?? '';
+    const bd = body ?? '';
+
+    if (/^updatedAt:\s*.+$/m.test(fm)) {
+      fm = fm.replace(/^updatedAt:\s*.+$/m, `updatedAt: "${today}"`);
+    } else if (/^addedAt:\s*.+$/m.test(fm)) {
+      fm = fm.replace(/^(addedAt:\s*.+)$/m, `$1\nupdatedAt: "${today}"`);
+    } else {
+      fm = fm.trimEnd() + `\naddedAt: "${today}"\nupdatedAt: "${today}"`;
+    }
+
+    mdContent = `---\n${fm}\n---\n${bd.startsWith('\n') ? '' : '\n'}${bd}`;
+
     console.log(`[Runner] MD updated: ${mdPath} → ${today}`);
-    return { path: mdPath, content: mdContent, target: 'qimochi' };
+    return { path: mdPath, content: mdContent, target: 'yukio-data' };
   } catch (err) {
-    console.warn(`[Runner] updateQimochiMd failed for ${slug}:`, err);
+    console.warn(`[Runner] updateYukioDataMd failed for ${slug}:`, err);
     return null;
   }
 }
@@ -138,11 +134,7 @@ async function processOneAnime(
   let usedSite: SiteKey = site;
 
   if (latestEp === null && fallback_site) {
-    latestEp = await fetchLatestEpisodeNumber(
-      env,
-      fallback_site,
-      source_slug
-    );
+    latestEp = await fetchLatestEpisodeNumber(env, fallback_site, source_slug);
     if (latestEp !== null) usedSite = fallback_site;
   }
 
@@ -159,9 +151,7 @@ async function processOneAnime(
   let lastError: string | null = null;
 
   const fresh = await getTrackedAnime(env.DB, slug);
-  if (!fresh) {
-    return { pushed: 0, error: `Tracked anime hilang: ${slug}` };
-  }
+  if (!fresh) return { pushed: 0, error: `Tracked anime hilang: ${slug}` };
 
   let currentChunkStart = fresh.chunk_start;
   let currentChunkEnd = fresh.chunk_end;
@@ -172,12 +162,7 @@ async function processOneAnime(
 
     let episode = await fetchEpisode(env, usedSite, source_slug, ep);
     if (!episode && usedSite !== (fallback_site ?? site)) {
-      episode = await fetchEpisode(
-        env,
-        fallback_site as SiteKey,
-        source_slug,
-        ep
-      );
+      episode = await fetchEpisode(env, fallback_site as SiteKey, source_slug, ep);
       if (episode) usedSite = fallback_site as SiteKey;
     }
 
@@ -199,74 +184,52 @@ async function processOneAnime(
       break;
     }
 
-    /* STEP 1: commit chunk episode dulu (sendiri) */
     const chunkFiles: FileToCommit[] = [
-      {
-        path: chunk.newPath,
-        content: chunk.newContent,
-        target: 'qimochi',
-      },
+      { path: chunk.newPath, content: chunk.newContent, target: 'yukio-data' },
     ];
     if (chunk.oldPath) {
       chunkFiles.push({
         path: chunk.oldPath,
         content: null,
-        target: 'qimochi',
+        target: 'yukio-data',
       });
     }
 
     const chunkCommit = await githubCommitMultipleFiles(
       env,
       chunkFiles,
-      `feat(episode): add ep ${ep} for ${slug}`,
-      'qimochi'
+      `feat(streams): add ep ${ep} for ${slug}`,
+      'yukio-data'
     );
 
     if (!chunkCommit.ok) {
-      lastError = `Commit chunk gagal untuk ep ${ep}: ${chunkCommit.error ?? 'unknown'}`;
+      lastError = `Commit streams gagal untuk ep ${ep}: ${chunkCommit.error ?? 'unknown'}`;
       break;
     }
 
-    /* STEP 2: commit MD terpisah — supaya error di sini tidak ganggu chunk */
-    const mdFile = await updateQimochiMd(env, slug);
+    const mdFile = await updateYukioDataMd(env, slug);
     if (mdFile) {
       const mdCommit = await githubCommitFile(
         env,
         mdFile.path,
         mdFile.content,
         `chore: bump updatedAt for ${slug} (ep ${ep})`,
-        'qimochi'
+        'yukio-data'
       );
       if (!mdCommit.ok) {
-        console.warn(
-          `[Runner] MD commit gagal untuk ep ${ep}: ${mdCommit.error}`
-        );
-        // Jangan break — chunk sudah ke-commit, biarkan lanjut ep berikutnya
+        console.warn(`[Runner] MD commit gagal untuk ep ${ep}: ${mdCommit.error}`);
       }
     }
 
-    const { chunkStart, chunkEnd } = await updateTrackedChunkState(
-      env.DB,
-      slug,
-      ep
-    );
-    await markEpisodePublished(
-      env.DB,
-      slug,
-      ep,
-      usedSite,
-      chunkCommit.sha ?? null
-    );
+    const { chunkStart, chunkEnd } = await updateTrackedChunkState(env.DB, slug, ep);
+    await markEpisodePublished(env.DB, slug, ep, usedSite, chunkCommit.sha ?? null);
 
     currentChunkStart = chunkStart;
     currentChunkEnd = chunkEnd;
     pushed++;
   }
 
-  if (!lastError) {
-    await setLastCheckAt(env.DB, slug);
-  }
-
+  if (!lastError) await setLastCheckAt(env.DB, slug);
   return { pushed, error: lastError };
 }
 
@@ -319,12 +282,7 @@ export async function runCron(env: Env): Promise<CronRunResult> {
     errors,
   });
 
-  return {
-    animeChecked: checked,
-    episodesFound,
-    episodesPushed,
-    errors,
-  };
+  return { animeChecked: checked, episodesFound, episodesPushed, errors };
 }
 
 export async function runManualCheck(
@@ -359,5 +317,3 @@ export async function runManualCheck(
     errors: result.error ? [result.error] : [],
   };
 }
-
-void slugify;
