@@ -128,21 +128,7 @@ async function rewriteSynopsisToId(
 }
 
 /* ============================================================
-   QIMOCHI YAML HELPERS
-   ============================================================ */
-
-function escapeQimochiYaml(s: string): string {
-  const cleaned = s.replace(/\n/g, ' ').trim();
-  const needsQuote =
-    /[:#&*!|>'"%@`{}\[\],]/.test(cleaned) ||
-    cleaned === '' ||
-    /^\d/.test(cleaned);
-  if (!needsQuote) return cleaned;
-  return `"${cleaned.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-}
-
-/* ============================================================
-   RESOLVE BODY (dipakai bareng yukionime + qimochi)
+   RESOLVE BODY
    ============================================================ */
 
 export async function resolveSessionBody(
@@ -169,7 +155,7 @@ export async function resolveSessionBody(
 }
 
 /* ============================================================
-   BUILDERS — yukionime
+   BUILDERS — semua ke yukio-data
    ============================================================ */
 
 export function buildMetadataFile(
@@ -187,87 +173,9 @@ export function buildMetadataFile(
   return {
     path: `src/content/anime/${slug}.md`,
     content: `${yaml}\n\n${body}\n`,
-    target: 'yukionime',
+    target: 'yukio-data',
   };
 }
-
-/* ============================================================
-   BUILDERS — qimochi (mirror tipis dari DBA)
-   ============================================================ */
-
-export function buildQimochiMarkdownFromDba(
-  slug: string,
-  media: AniListMedia,
-  body: string
-): FileToCommit {
-  const STATUS_MAP: Record<string, string> = {
-    RELEASING: 'Ongoing',
-    FINISHED: 'Completed',
-    NOT_YET_RELEASED: 'Ongoing',
-    CANCELLED: 'Hiatus',
-    HIATUS: 'Hiatus',
-  };
-
-  const FORMAT_MAP: Record<string, string> = {
-    TV: 'TV',
-    TV_SHORT: 'TV',
-    MOVIE: 'Movie',
-    SPECIAL: 'Special',
-    OVA: 'OVA',
-    ONA: 'ONA',
-    MUSIC: 'Special',
-  };
-
-  const status = STATUS_MAP[media.status] ?? 'Ongoing';
-  const type = FORMAT_MAP[media.format] ?? 'TV';
-
-  const genres = (media.genres ?? [])
-    .filter((g) => g && g.trim())
-    .map((g) => g.charAt(0).toUpperCase() + g.slice(1));
-
-  const studio = media.studios?.nodes?.[0]?.name ?? 'Unknown';
-
-  const y = media.startDate?.year ?? media.seasonYear;
-  const mo = media.startDate?.month ?? 1;
-  const d = media.startDate?.day ?? 1;
-  const releaseDate = y
-    ? `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`
-    : new Date().toISOString().split('T')[0] ?? '2026-01-01';
-
-  const addedAt = new Date().toISOString().split('T')[0] ?? '2026-01-01';
-  const rating =
-    typeof media.averageScore === 'number' && media.averageScore > 0
-      ? (media.averageScore / 10).toFixed(1)
-      : '0.0';
-
-  const cover = media.coverImage.extraLarge || media.coverImage.large || '';
-
-  const yamlLines: string[] = [
-    '---',
-    `title: ${escapeQimochiYaml(media.title.romaji || 'Unknown')}`,
-    `cover: ${cover}`,
-    `status: ${status}`,
-    `type: ${type}`,
-    `genre: [${genres.join(', ')}]`,
-    `studio: ${escapeQimochiYaml(studio)}`,
-    `releaseDate: ${releaseDate}`,
-    `addedAt: ${addedAt}`,
-    `updatedAt: ${addedAt}`,
-    `rating: ${rating}`,
-    '---',
-  ];
-
-  return {
-    path: `src/content/anime/${slug}.md`,
-    content: `${yamlLines.join('\n')}\n\n${body}\n`,
-    target: 'qimochi',
-    itemCount: 1,
-  };
-}
-
-/* ============================================================
-   BUILDERS — yukio-data
-   ============================================================ */
 
 export async function buildCharacterFiles(
   env: Env,
@@ -334,7 +242,7 @@ export async function buildFranchiseFiles(
   const { data: result } = await safeFetch(
     () =>
       chainRelations({
-        malId: session.mal_id,
+        malId: session.mal_id!,
         kitsuId: session.kitsu_id,
         title: session.title,
       }),
@@ -347,20 +255,13 @@ export async function buildFranchiseFiles(
   if (filtered.length === 0) return [];
 
   const json = JSON.stringify(filtered, null, 2) + '\n';
-  const itemCount = filtered.length;
 
   return [
     {
       path: `data/anime/${slug}/franchises.json`,
       content: json,
       target: 'yukio-data',
-      itemCount,
-    },
-    {
-      path: `src/data/anime/${slug}/franchises.json`,
-      content: json,
-      target: 'qimochi',
-      itemCount,
+      itemCount: filtered.length,
     },
   ];
 }
