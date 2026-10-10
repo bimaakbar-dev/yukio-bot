@@ -22,10 +22,6 @@ import {
   RELATION_FETCH_TIMEOUT_MS,
 } from './types';
 
-/* ============================================================
-   SANITIZERS
-   ============================================================ */
-
 function hasText(v: unknown): v is string {
   return typeof v === 'string' && v.trim().length > 0;
 }
@@ -89,10 +85,6 @@ function sanitizeActor(va: VoiceActorRow): CleanActor {
   return out;
 }
 
-/* ============================================================
-   AI REWRITE SYNOPSIS
-   ============================================================ */
-
 async function rewriteSynopsisToId(
   env: Env,
   title: string,
@@ -127,10 +119,6 @@ async function rewriteSynopsisToId(
   return null;
 }
 
-/* ============================================================
-   RESOLVE BODY
-   ============================================================ */
-
 export async function resolveSessionBody(
   env: Env,
   session: DbaSessionRow,
@@ -153,10 +141,6 @@ export async function resolveSessionBody(
   const aiBody = await rewriteSynopsisToId(env, session.title, clean);
   return aiBody ?? clean;
 }
-
-/* ============================================================
-   BUILDERS — semua ke yukio-data
-   ============================================================ */
 
 export function buildMetadataFile(
   session: DbaSessionRow,
