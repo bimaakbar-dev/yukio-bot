@@ -19,7 +19,7 @@ import { handleEditTextInput } from './commands/edit';
 import { handleTrackTextV2, setupTrackCallbacks } from './commands/track';
 import { COMMANDS } from './commands/list';
 
-const COMMAND_NAME_RE = /^[a-z0-9_]{1,32}$/;
+const COMMAND_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 
 let cachedBot: Bot | null = null;
 let initPromise: Promise<void> | null = null;
