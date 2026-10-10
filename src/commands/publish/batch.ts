@@ -141,7 +141,7 @@ export async function doPublishBatchPreview(
     return;
   }
 
-  const path = `src/data/anime/${slug}/episodes/${session.min_ep}-${session.max_ep}.json`;
+  const path = `src/data/anime/${slug}/episodes/streams/${session.min_ep}-${session.max_ep}.json`;
   const sizeKB = Math.round(session.combined_json.length / 1024);
 
   let episodes: { number: number }[] = [];
@@ -209,7 +209,7 @@ export async function doPublishBatchPush(
   }
 
   const slug = session.chosen_slug;
-  const path = `src/data/anime/${slug}/episodes/${session.min_ep}-${session.max_ep}.json`;
+  const path = `src/data/anime/${slug}/episodes/streams/${session.min_ep}-${session.max_ep}.json`;
 
   await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
 
