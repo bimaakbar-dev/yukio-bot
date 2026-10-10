@@ -28,6 +28,7 @@ import { postCommand } from './post';
 import { killCommand } from './kill';
 import { trackCommand } from './track';
 import { editCommand } from './edit';
+import { databaseCommand } from './cms';
 
 export const COMMANDS: CommandDefinition[] = [
   pingCommand,
@@ -52,4 +53,5 @@ export const COMMANDS: CommandDefinition[] = [
   editCommand,
   trackCommand,
   killCommand,
+  databaseCommand,
 ];
