@@ -143,9 +143,10 @@ async function handleWizardSlug(
     return true;
   }
 
-  const loading = await ctx.reply(`🔍 Cek <code>${escapeHtml(slug)}</code> ke yukio-data...`, {
-    parse_mode: 'HTML',
-  });
+  const loading = await ctx.reply(
+    `🔍 Cek <code>${escapeHtml(slug)}</code> ke yukio-data...`,
+    { parse_mode: 'HTML' }
+  );
 
   let file = null;
   try {
@@ -316,7 +317,6 @@ async function execBatchWizard(
   }
 
   await ctx.answerCallbackQuery({ text: '🔄 Memproses...' });
-  await deleteCache(env.DB, `bw:${userId}`);
 
   const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
   const chatId = ctx.chat!.id;
@@ -458,16 +458,32 @@ async function execBatchWizard(
 
     lines.push('');
     lines.push(`🔗 Commit: <code>${result.sha?.slice(0, 7) ?? '?'}</code>`);
+    lines.push('');
+    lines.push('<i>Lanjut range berikutnya? Slug & source tetap.</i>');
 
     await ctx.api
       .editMessageText(chatId, loadingMsgId, lines.join('\n'), {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         reply_markup: new InlineKeyboard()
-          .text('🔍 Batch Lagi', 'bw:start')
+          .text('🔄 Range Baru', 'bw:next')
+          .text('➕ Anime Baru', 'bw:start')
+          .row()
           .text('🏠 Close', 'bw:close'),
       })
       .catch(() => {});
+
+    // Retain slug + source untuk batch berikutnya — hanya range yang reset
+    const nextState: WizardState = {
+      step: 'awaiting_range',
+      slug: state.slug,
+      sourceUrl: state.sourceUrl,
+      sourceSite: state.sourceSite,
+      sourceSlug: state.sourceSlug,
+      rangeStart: null,
+      rangeEnd: null,
+    };
+    await setCache(env.DB, `bw:${userId}`, nextState, WIZARD_TTL_MS);
   } catch (err: any) {
     console.error('[BatchWizard] push failed:', err);
     await ctx.api
@@ -485,6 +501,40 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
   bot.callbackQuery(/^bw:start$/, async (ctx) => {
     await ctx.answerCallbackQuery({ text: '📦' });
     await startBatchWizard(ctx, env);
+  });
+
+  bot.callbackQuery(/^bw:next$/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const state = await getCache<WizardState>(env.DB, `bw:${userId}`);
+    if (!state || !state.slug || !state.sourceSlug || !state.sourceSite) {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Session habis. Kirim /batch lagi.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: '🔄' });
+
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery!.message!.message_id!,
+        `🔄 <b>Range Baru</b>\n\n` +
+          `🎬 Repo: <code>${escapeHtml(state.slug)}</code>\n` +
+          `🔗 Site: <b>${state.sourceSite}</b>\n` +
+          `📼 Source: <code>${escapeHtml(state.sourceSlug)}</code>\n\n` +
+          `Kirim <b>range episode</b> baru.\n` +
+          `Contoh: <code>7-12</code> atau <code>13</code>`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard().text('❌ Batal', 'bw:cancel'),
+        }
+      )
+      .catch(() => {});
   });
 
   bot.callbackQuery(/^bw:go$/, async (ctx) => {
@@ -506,8 +556,12 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
   });
 
   bot.callbackQuery(/^bw:close$/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (userId) await deleteCache(env.DB, `bw:${userId}`);
     await ctx.answerCallbackQuery({ text: '🏠' });
-    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+    await ctx
+      .editMessageReplyMarkup({ reply_markup: undefined })
+      .catch(() => {});
   });
 }
 
