@@ -11,6 +11,7 @@ import {
   setupBatchWizardCallbacks,
 } from './commands/decode';
 import { setupAnimeCallbacks } from './commands/anime';
+import { setupAddCallbacks } from './commands/add';
 import { setupVaCallbacks } from './commands/va';
 import { handleDiscordRequest } from './discord/handler';
 import { registerDiscordCommands } from './discord/register';
@@ -42,6 +43,7 @@ function createBot(env: Env): Bot {
 
   registerCommands(bot, env);
   setupBusinessHandler(bot, env);
+  setupAddCallbacks(bot, env);
   setupAnimeCallbacks(bot, env);
   setupDatabaseAnimeCallbacks(bot, env);
   setupVaCallbacks(bot, env);
@@ -62,13 +64,12 @@ function createBot(env: Env): Bot {
 
       const handledBatchWizard = await handleBatchWizardText(ctx, env);
       if (handledBatchWizard) return;
-      
+
       const handledCms = await handleCmsText(ctx, env);
       if (handledCms) return;
 
       const handledEdit = await handleEditTextInput(ctx, env);
       if (handledEdit) return;
-      
     } catch (err) {
       console.error('[Text] handler error:', err);
     }
