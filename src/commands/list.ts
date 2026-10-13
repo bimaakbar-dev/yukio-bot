@@ -17,6 +17,7 @@ import {
   dbaShortCommand,
   endCommand,
 } from './database-anime';
+import { addAnimeCommand } from './add';
 import { vaCommand } from './va';
 import {
   publishAnimeCommand,
@@ -34,6 +35,7 @@ export const COMMANDS: CommandDefinition[] = [
   pingCommand,
   helpCommand,
   statusCommand,
+  addAnimeCommand,
   animeCommand,
   databaseAnimeCommand,
   dbaShortCommand,
