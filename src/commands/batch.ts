@@ -1,4 +1,4 @@
-=== FILE: src/commands/batch.ts ===
+
 // src/commands/batch.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
@@ -753,4 +753,3 @@ export const batchCommand: CommandDefinition = {
     await startBatchWizard(ctx, env);
   },
 };
-=== END FILE ===
