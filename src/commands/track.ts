@@ -1690,4 +1690,489 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
         ctx.callbackQuery!.message!.message_id!,
         `⚠️ <b>Hapus anime?</b>\n\n<code>${escapeHtml(slug)}</code>`,
         {
-          parse_mode:
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard()
+            .text('✅ Ya, Hapus', `tr:dvy:${hash}`)
+            .text('❌ Batal', `tr:v:${hash}`),
+        }
+      )
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^tr:dvy:(.+)$/, async (ctx) => {
+    const hash = ctx.match[1] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) {
+      await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true });
+      return;
+    }
+    await deleteTrackedAnime(env.DB, slug);
+    await ctx.answerCallbackQuery({ text: '🗑️' });
+    await showList(ctx, env, 0);
+  });
+
+  /* Delete menu */
+  bot.callbackQuery(/^tr:dm$/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showDeleteMenu(ctx, env);
+  });
+
+  bot.callbackQuery(/^tr:ds:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (site !== 'custom' && !isValidSite(site)) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showDeleteSite(ctx, env, site as TrackSite);
+  });
+
+  bot.callbackQuery(/^tr:dall:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (site !== 'custom' && !isValidSite(site)) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: '⚠️' });
+    await confirmDeleteAll(ctx, env, site as TrackSite);
+  });
+
+  bot.callbackQuery(/^tr:dally:(\w+)$/, async (ctx) => {
+    const site = ctx.match[1] ?? '';
+    if (site !== 'custom' && !isValidSite(site)) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: '🗑️' });
+    await execDeleteAll(ctx, env, site as TrackSite);
+  });
+
+  /* Add flow — pilih site */
+  bot.callbackQuery(
+    /^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku|custom)$/,
+    async (ctx) => {
+      const sessionId = ctx.match[1] ?? '';
+      const rawSite = ctx.match[2] ?? '';
+      const session = await getSession(env.DB, sessionId);
+      if (!session) {
+        await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
+        return;
+      }
+      if (ctx.from?.id !== session.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔' });
+        return;
+      }
+
+      const isCustom = rawSite === 'custom';
+      const siteValue: TrackSite = isCustom ? 'custom' : (rawSite as SiteKey);
+
+      await updateSession(env.DB, sessionId, { site: siteValue, step: 'add_slug' });
+      await ctx.answerCallbackQuery({ text: isCustom ? '🌐 Custom' : rawSite });
+
+      const prompt = isCustom
+        ? '<b>Step 2</b> · Kirim <b>slug anime</b> (kunci di yukio-data).\n\n<i>Contoh: <code>chii-fuyo</code></i>'
+        : '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>';
+
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          ctx.callbackQuery!.message!.message_id!,
+          prompt,
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
+          }
+        )
+        .catch(() => {});
+    }
+  );
+
+  bot.callbackQuery(/^tr:day:(ts_[a-z0-9]+):([A-Za-z]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const day = ctx.match[2] ?? '';
+    const session = await getSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
+      return;
+    }
+    if (ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔' });
+      return;
+    }
+    await updateSession(env.DB, sessionId, { schedule_day: day, step: 'add_hour' });
+    await ctx.answerCallbackQuery({ text: day });
+
+    const isCustom = session.site === 'custom';
+    const stepLabel = isCustom ? 'Step 6' : 'Step 5/5';
+
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery!.message!.message_id!,
+        `<b>${stepLabel}</b> · Hari: <b>${day}</b>\n\nKirim <b>jam rilis</b> (WIB):\n\n• <code>18</code> → 18:00\n• <code>18:30</code> → 18:30`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
+        }
+      )
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^tr:save:(ts_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const session = await getSession(env.DB, sessionId);
+    if (!session) {
+      await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
+      return;
+    }
+    if (ctx.from?.id !== session.user_id) {
+      await ctx.answerCallbackQuery({ text: '⛔' });
+      return;
+    }
+
+    if (
+      !session.site ||
+      !session.slug ||
+      !session.schedule_day ||
+      session.schedule_hour === null
+    ) {
+      await ctx.answerCallbackQuery({ text: '❌ Data kurang', show_alert: true });
+      return;
+    }
+
+    const site = session.site as TrackSite;
+    const isCustom = site === 'custom';
+
+    if (isCustom) {
+      if (!session.custom_episode_pattern) {
+        await ctx.answerCallbackQuery({ text: '❌ Pattern kosong', show_alert: true });
+        return;
+      }
+      if (!session.custom_anime_url) {
+        await ctx.answerCallbackQuery({
+          text: '⚠️ Anime URL kosong. Cron tidak akan bisa auto-detect.',
+          show_alert: true,
+        });
+      }
+
+      await saveTrackedAnime(env.DB, {
+        slug: session.slug,
+        site: 'custom',
+        sourceSlug: session.source_slug ?? session.slug,
+        fallbackSite: null,
+        scheduleDay: session.schedule_day,
+        scheduleHour: session.schedule_hour,
+        scheduleMinute: session.schedule_minute ?? 0,
+        bufferMin: session.buffer_min,
+        customEpisodePattern: session.custom_episode_pattern,
+        customAnimeUrl: session.custom_anime_url,
+      });
+    } else {
+      if (!session.source_slug) {
+        await ctx.answerCallbackQuery({ text: '❌ Source slug kosong', show_alert: true });
+        return;
+      }
+
+      const siteKey = site as SiteKey;
+      const fallbackSite: SiteKey | null =
+        siteKey === 'lexanime'
+          ? 'animesub'
+          : siteKey === 'animesub'
+            ? 'lexanime'
+            : null;
+
+      await saveTrackedAnime(env.DB, {
+        slug: session.slug,
+        site: siteKey,
+        sourceSlug: session.source_slug,
+        fallbackSite,
+        scheduleDay: session.schedule_day,
+        scheduleHour: session.schedule_hour,
+        scheduleMinute: session.schedule_minute ?? 0,
+        bufferMin: session.buffer_min,
+        customEpisodePattern: null,
+        customAnimeUrl: null,
+      });
+    }
+
+    await deleteSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '✅' });
+
+    const hh = String(session.schedule_hour).padStart(2, '0');
+    const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
+
+    const lines: string[] = [];
+    lines.push(`✅ <b>Anime di-track!</b>`);
+    lines.push('');
+    lines.push(`🆔 <code>${escapeHtml(session.slug)}</code>`);
+    lines.push(`🎬 ${siteLabel(site)}`);
+    if (isCustom) {
+      lines.push(`📼 <code>${escapeHtml(session.custom_episode_pattern ?? '-')}</code>`);
+      if (session.custom_anime_url) {
+        lines.push(`🔍 <code>${escapeHtml(session.custom_anime_url)}</code>`);
+      } else {
+        lines.push(`⚠️ <i>Anime URL kosong → cron skip. Set manual via edit.</i>`);
+      }
+    }
+    lines.push(`📅 ${session.schedule_day} ${hh}:${mm} WIB`);
+
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery!.message!.message_id!,
+        lines.join('\n'),
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: undefined }
+      )
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^tr:x:(ts_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    await deleteSession(env.DB, sessionId);
+    await ctx.answerCallbackQuery({ text: '🗑️' });
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery!.message!.message_id!,
+        '❌ <b>Dibatalkan.</b>',
+        { parse_mode: 'HTML', reply_markup: undefined }
+      )
+      .catch(() => {});
+  });
+
+  /* Rescan */
+  bot.callbackQuery(/^tr:rc$/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await showRescanList(ctx, env, 0);
+  });
+
+  bot.callbackQuery(/^tr:rcl:(rc_[a-z0-9]+):(\d+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const page = parseInt(ctx.match[2] ?? '0', 10);
+    await ctx.answerCallbackQuery({ text: `📄 Hal ${page + 1}` });
+    await showRescanList(ctx, env, page, sessionId);
+  });
+
+  bot.callbackQuery(/^tr:rcv:(rc_[a-z0-9]+):(.+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const hash = ctx.match[2] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) {
+      await ctx.answerCallbackQuery({ text: '❌ Tidak ditemukan', show_alert: true });
+      return;
+    }
+    await showRescanDetail(ctx, env, sessionId, slug);
+  });
+
+  bot.callbackQuery(/^tr:rcc:(rc_[a-z0-9]+):(.+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const hash = ctx.match[2] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    const all = await listAllTrackedAnime(env.DB);
+    const row = all.find((r) => r.slug === slug);
+    const from = (row?.last_ep ?? 0) + 1;
+    await confirmRescan(ctx, env, sessionId, slug, from);
+  });
+
+  bot.callbackQuery(/^tr:rcf:(rc_[a-z0-9]+):(.+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const hash = ctx.match[2] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+
+    await createSession(env.DB, ctx.from!.id, 'edit_value', {
+      slug,
+      edit_field: 'rescan_from',
+    });
+
+    await ctx.answerCallbackQuery({ text: '📼' });
+    await ctx.api
+      .editMessageText(
+        ctx.chat!.id,
+        ctx.callbackQuery!.message!.message_id!,
+        `📼 <b>Rescan dari Ep N</b>\n\n🆔 <code>${escapeHtml(slug)}</code>\n\nKirim <b>nomor episode</b>.\nContoh: <code>5</code>\n\n<i>Kirim <code>0</code> untuk mulai dari ep 1.</i>`,
+        {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+          reply_markup: new InlineKeyboard().text('❌ Batal', `tr:rcv:${sessionId}:${hash}`).row(),
+        }
+      )
+      .catch(() => {});
+  });
+
+  bot.callbackQuery(/^tr:rca:(rc_[a-z0-9]+):(.+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const hash = ctx.match[2] ?? '';
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await confirmRescan(ctx, env, sessionId, slug, 1);
+  });
+
+  bot.callbackQuery(/^tr:rcy:(rc_[a-z0-9]+):(.+):(\d+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    const hash = ctx.match[2] ?? '';
+    const from = parseInt(ctx.match[3] ?? '1', 10);
+    const slug = await findSlugByHash(env, hash);
+    if (!slug) {
+      await ctx.answerCallbackQuery({ text: '❌' });
+      return;
+    }
+    await execRescan(ctx, env, sessionId, slug, from);
+  });
+
+  bot.callbackQuery(/^tr:rcx:(rc_[a-z0-9]+)$/, async (ctx) => {
+    const sessionId = ctx.match[1] ?? '';
+    await ctx.answerCallbackQuery({ text: '🗑️ Dibatalkan' });
+    await cleanupRescanSession(ctx, env, sessionId);
+  });
+}
+
+/* ============================================================
+   DELETE MENU (quick by site)
+   ============================================================ */
+
+async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const counts: Record<TrackSite, number> = {
+    lexanime: 0,
+    animesub: 0,
+    samehadaku: 0,
+    custom: 0,
+  };
+  for (const r of all) {
+    if (r.site in counts) counts[r.site as TrackSite]++;
+  }
+  const total = counts.lexanime + counts.animesub + counts.samehadaku + counts.custom;
+  const editId = ctx.callbackQuery!.message!.message_id!;
+
+  if (total === 0) {
+    await ctx.api
+      .editMessageText(ctx.chat!.id, editId, '📭 Belum ada anime.', {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:h'),
+      })
+      .catch(() => {});
+    return;
+  }
+
+  const kb = new InlineKeyboard();
+  if (counts.lexanime > 0) kb.text(`🎬 lexanime (${counts.lexanime})`, 'tr:ds:lexanime').row();
+  if (counts.animesub > 0) kb.text(`🎬 animesub (${counts.animesub})`, 'tr:ds:animesub').row();
+  if (counts.samehadaku > 0) kb.text(`🎬 samehadaku (${counts.samehadaku})`, 'tr:ds:samehadaku').row();
+  if (counts.custom > 0) kb.text(`🌐 custom (${counts.custom})`, 'tr:ds:custom').row();
+  kb.text('◀️ Kembali', 'tr:h');
+
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      editId,
+      `🗑️ <b>Hapus Anime</b>\n\nTotal: <b>${total}</b>\n\n<i>Pilih situs:</i>`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: kb,
+      }
+    )
+    .catch(() => {});
+}
+
+async function showDeleteSite(ctx: Context, env: Env, site: TrackSite): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
+  const editId = ctx.callbackQuery!.message!.message_id!;
+
+  if (list.length === 0) {
+    await ctx.api
+      .editMessageText(ctx.chat!.id, editId, `📭 Tidak ada anime dari <b>${siteLabel(site)}</b>.`, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:dm'),
+      })
+      .catch(() => {});
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push(`🗑️ <b>Hapus dari ${siteLabel(site)}</b>`);
+  lines.push('');
+  lines.push(`📊 Total: <b>${list.length}</b>`);
+  lines.push('');
+  for (const r of list.slice(0, 8)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  if (list.length > 8) lines.push(`<i>… dan ${list.length - 8} lainnya</i>`);
+
+  const kb = new InlineKeyboard()
+    .text(`🗑️ Hapus Semua (${list.length})`, `tr:dall:${site}`)
+    .row()
+    .text('◀️ Kembali', 'tr:dm');
+
+  await ctx.api
+    .editMessageText(ctx.chat!.id, editId, lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: kb,
+    })
+    .catch(() => {});
+}
+
+async function confirmDeleteAll(ctx: Context, env: Env, site: TrackSite): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site);
+  const editId = ctx.callbackQuery!.message!.message_id!;
+
+  const lines: string[] = [];
+  lines.push('⚠️ <b>Konfirmasi Hapus Semua</b>');
+  lines.push('');
+  lines.push(`Yakin hapus <b>${list.length}</b> anime dari <b>${siteLabel(site)}</b>?`);
+  lines.push('');
+  for (const r of list.slice(0, 10)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
+  if (list.length > 10) lines.push(`<i>… dan ${list.length - 10} lainnya</i>`);
+  lines.push('');
+  lines.push('<b>⚠️ Tidak bisa dibatalkan.</b>');
+
+  await ctx.api
+    .editMessageText(ctx.chat!.id, editId, lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('✅ Ya, Hapus Semua', `tr:dally:${site}`)
+        .text('❌ Batal', `tr:ds:${site}`),
+    })
+    .catch(() => {});
+}
+
+async function execDeleteAll(ctx: Context, env: Env, site: TrackSite): Promise<void> {
+  const all = await listAllTrackedAnime(env.DB);
+  const list = all.filter((r) => r.site === site);
+  let deleted = 0;
+  for (const r of list) {
+    const ok = await deleteTrackedAnime(env.DB, r.slug);
+    if (ok) deleted++;
+  }
+  const editId = ctx.callbackQuery!.message!.message_id!;
+  await ctx.api
+    .editMessageText(
+      ctx.chat!.id,
+      editId,
+      `✅ <b>Hapus selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${siteLabel(site)}</b>`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('🗑️ Hapus Lagi', 'tr:dm').text('🏠 Menu', 'tr:h'),
+      }
+    )
+    .catch(() => {});
+}
