@@ -15,10 +15,23 @@ const BASE64_PARAM_NAMES = new Set([
 const VIDEO_EXT_RE = /\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i;
 
 const VIDEO_HOSTS = [
-  'player.', 'streamtape', 'dood', 'filemoon', 'voe', 'mp4upload',
-  'mixdrop', 'iixdrop', 'abyss', 'abyssplayer',
-  'framezi', 'kturbo',
-  'pixeldrain', 'vikingfile', 'buzzheavier', 'mega.nz', 'doply',
+  'player.', 
+  'streamtape',
+  'dood', 
+  'filemoon', 
+  'voe', 
+  'mp4upload',
+  'mixdrop', 
+  'iixdrop', 
+  'abyss', 
+  'abyssplayer',
+  'framezi', 
+  'kturbo',
+  'pixeldrain', 
+  'vikingfile', 
+  'buzzheavier', 
+  'mega.nz', 
+  'doply',
   'xtwap.top',
   'otakudesu',
   'kuramanime',
@@ -42,6 +55,7 @@ const VIDEO_HOSTS = [
   'animesub',
   'lexanime',
   'dropbox.com',
+  'sumantritelnologi',
 ];
 
 const WRAPPER_HOSTS = [
@@ -376,6 +390,72 @@ export function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
+interface InertiaMirrorStream {
+  provider?: string;
+  quality?: string;
+  url?: string;
+  stream_url?: string;
+  original_url?: string;
+}
+
+interface InertiaEpisode {
+  number?: number;
+  mirror_streams?: InertiaMirrorStream[];
+}
+
+interface InertiaPageData {
+  component?: string;
+  props?: {
+    episode?: InertiaEpisode;
+    anime?: { episodes?: InertiaEpisode[] };
+  };
+}
+
+function extractInertiaEmbeds(html: string): RawEntry[] {
+  const out: RawEntry[] = [];
+  const seen = new Set<string>();
+
+  const re = /\bdata-page\s*=\s*"([^"]+)"/gi;
+  for (const m of html.matchAll(re)) {
+    const encoded = m[1];
+    if (!encoded || encoded.length < 50) continue;
+
+    let data: InertiaPageData;
+    try {
+      data = JSON.parse(htmlDecode(encoded)) as InertiaPageData;
+    } catch {
+      continue;
+    }
+
+    const episodes: InertiaEpisode[] = [];
+    const direct = data.props?.episode;
+    if (direct && Array.isArray(direct.mirror_streams)) episodes.push(direct);
+    const list = data.props?.anime?.episodes;
+    if (Array.isArray(list)) episodes.push(...list);
+
+    for (const ep of episodes) {
+      if (!Array.isArray(ep.mirror_streams)) continue;
+      for (const s of ep.mirror_streams) {
+        const url = s.stream_url ?? s.original_url ?? s.url;
+        if (!url || typeof url !== 'string') continue;
+        if (!/^https?:\/\//i.test(url)) continue;
+        if (seen.has(url)) continue;
+        seen.add(url);
+
+        const provider = (s.provider ?? '').trim();
+        const quality = (s.quality ?? '').trim();
+        const label =
+          quality && quality.toLowerCase() !== 'default'
+            ? `[${quality}] ${provider || 'unknown'}`
+            : provider || null;
+
+        out.push({ url, label });
+      }
+    }
+  }
+  return out;
+}
+
 function extractNextJsEmbeds(html: string): RawEntry[] {
   const out: RawEntry[] = [];
   const seen = new Set<string>();
@@ -404,9 +484,16 @@ export function extractEntries(html: string): RawEntry[] {
   const entries: RawEntry[] = [];
   const seen = new Set<string>();
 
+  for (const e of extractInertiaEmbeds(html)) {
+    const key = e.url ?? e.base64 ?? '';
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    entries.push(e);
+  }
+
   for (const e of extractNextJsEmbeds(html)) {
-    const key = e.url!;
-    if (seen.has(key)) continue;
+    const key = e.url ?? '';
+    if (!key || seen.has(key)) continue;
     seen.add(key);
     entries.push(e);
   }
@@ -634,8 +721,9 @@ export async function fetchUrlViaProxy(
     }
 
     return { body: data.body, debug };
-  } catch (err: any) {
-    debug.error = `fetch threw: ${err?.message ?? 'unknown'}`;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'unknown';
+    debug.error = `fetch threw: ${msg}`;
     return { body: null, debug };
   }
 }
