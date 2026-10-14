@@ -759,3 +759,72 @@ export function buildBatchUrls(input: string, start: number, end: number): strin
   }
   return urls;
 }
+
+export function resolveCustomPattern(
+  input: string
+): { pattern: string; host: string } | null {
+  const trimmed = input.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  let host: string;
+  try {
+    host = new URL(trimmed.replace(/\{n\}/g, '1')).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+
+  if (/\{n\}/.test(trimmed)) {
+    return { pattern: trimmed, host };
+  }
+
+  const m1 = trimmed.match(/^(.*?)(episode|ep|eps)([-_.]?)(\d+)(.*)$/i);
+  if (m1) {
+    const prefix = m1[1] ?? '';
+    const keyword = m1[2] ?? 'episode';
+    const sep = m1[3] ?? '';
+    const suffix = m1[5] ?? '';
+    return { pattern: `${prefix}${keyword}${sep}{n}${suffix}`, host };
+  }
+
+  const m2 = trimmed.match(/^(.*\/)(\d+)(\D.*)?$/);
+  if (m2) {
+    const prefix = m2[1] ?? '';
+    const suffix = m2[3] ?? '';
+    return { pattern: `${prefix}{n}${suffix}`, host };
+  }
+
+  return null;
+}
+
+export function extractInertiaEpisodeNumbers(html: string): number[] {
+  const numbers: number[] = [];
+  const seen = new Set<number>();
+  const re = /\bdata-page\s*=\s*"([^"]+)"/gi;
+
+  for (const m of html.matchAll(re)) {
+    const encoded = m[1];
+    if (!encoded || encoded.length < 50) continue;
+
+    let data: InertiaPageData;
+    try {
+      data = JSON.parse(htmlDecode(encoded)) as InertiaPageData;
+    } catch {
+      continue;
+    }
+
+    const episodes: InertiaEpisode[] = [];
+    const direct = data.props?.episode;
+    if (direct) episodes.push(direct);
+    const list = data.props?.anime?.episodes;
+    if (Array.isArray(list)) episodes.push(...list);
+
+    for (const ep of episodes) {
+      const n = ep.number;
+      if (typeof n === 'number' && n > 0 && !seen.has(n)) {
+        seen.add(n);
+        numbers.push(n);
+      }
+    }
+  }
+  return numbers;
+}
