@@ -1,3 +1,4 @@
+=== FILE: src/commands/batch.ts ===
 // src/commands/batch.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
@@ -16,20 +17,28 @@ import {
 
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 
+type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
+type WizardSite = SiteKey | 'custom';
+
 interface WizardState {
   step: 'awaiting_slug' | 'awaiting_source' | 'awaiting_range' | 'ready';
   slug: string | null;
   sourceUrl: string | null;
-  sourceSite: string | null;
+  sourceSite: WizardSite | null;
+  /** Untuk site known: slug di situs sumber. Untuk custom: hostname saja. */
   sourceSlug: string | null;
+  /** Khusus custom: URL template dengan placeholder `{n}`. */
+  customPattern: string | null;
   rangeStart: number | null;
   rangeEnd: number | null;
 }
 
-const WIZARD_SITES: Record<
-  string,
-  { host: string; episodePath: (slug: string, n: number) => string }
-> = {
+interface SiteConfig {
+  host: string;
+  episodePath: (slug: string, n: number) => string;
+}
+
+const WIZARD_SITES: Record<SiteKey, SiteConfig> = {
   lexanime: {
     host: 'https://lexanime.web.id',
     episodePath: (slug, n) => `/tonton/${slug}/episode-${n}-sub-indo`,
@@ -44,33 +53,94 @@ const WIZARD_SITES: Record<
   },
 };
 
-function parseSourceUrl(url: string): { site: string; slug: string } | null {
-  try {
-    const u = new URL(url.trim());
-    const host = u.hostname.toLowerCase();
+type ParsedSource =
+  | { kind: 'known'; site: SiteKey; slug: string }
+  | { kind: 'custom'; pattern: string; host: string };
 
-    if (host.includes('lexanime')) {
-      const m = u.pathname.match(/\/tonton\/([^\/]+)/);
-      if (m?.[1]) return { site: 'lexanime', slug: m[1] };
-    }
-    if (host.includes('animesub')) {
-      const m = u.pathname.match(/\/tonton\/([^\/]+)/);
-      if (m?.[1]) return { site: 'animesub', slug: m[1] };
-    }
-    if (host.includes('samehadaku')) {
-      const m1 = u.pathname.match(/\/anime\/([^\/]+)/);
-      if (m1?.[1]) return { site: 'samehadaku', slug: m1[1] };
-      const m2 = u.pathname.match(/\/([^\/]+?)-episode-\d+-subtitle-indonesia/);
-      if (m2?.[1]) return { site: 'samehadaku', slug: m2[1] };
-    }
-    return null;
+/**
+ * Auto-detect pola episode di URL → template dengan `{n}`.
+ * Return null kalau tidak ada pola yang bisa dipakai.
+ */
+function resolveCustomPattern(
+  input: string
+): { pattern: string; host: string } | null {
+  const trimmed = input.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  // Hostname — substitute {n} biar URL valid untuk parsing.
+  let host: string;
+  try {
+    host = new URL(trimmed.replace(/\{n\}/g, '1')).hostname.toLowerCase();
   } catch {
     return null;
   }
+
+  // 1) User sudah kasih {n} eksplisit
+  if (/\{n\}/.test(trimmed)) {
+    return { pattern: trimmed, host };
+  }
+
+  // 2) "episode-5", "ep_12", "EP.3", dst.
+  const m1 = trimmed.match(/^(.*?)(episode|ep|eps)([-_.]?)(\d+)(.*)$/i);
+  if (m1) {
+    const prefix = m1[1] ?? '';
+    const keyword = m1[2] ?? 'episode';
+    const sep = m1[3] ?? '';
+    const suffix = m1[5] ?? '';
+    return { pattern: `${prefix}${keyword}${sep}{n}${suffix}`, host };
+  }
+
+  // 3) URL diakhiri segmen angka: /watch/foo/12, /watch/foo/12/, /watch/foo/12?x=1
+  const m2 = trimmed.match(/^(.*\/)(\d+)(\D.*)?$/);
+  if (m2) {
+    const prefix = m2[1] ?? '';
+    const suffix = m2[3] ?? '';
+    return { pattern: `${prefix}{n}${suffix}`, host };
+  }
+
+  return null;
+}
+
+function parseSourceUrl(url: string): ParsedSource | null {
+  const trimmed = url.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  try {
+    const u = new URL(trimmed.replace(/\{n\}/g, '1'));
+    const host = u.hostname.toLowerCase();
+
+    if (host.includes('lexanime')) {
+      const slug = u.pathname.match(/\/tonton\/([^/]+)/)?.[1];
+      if (slug) return { kind: 'known', site: 'lexanime', slug };
+    }
+    if (host.includes('animesub')) {
+      const slug = u.pathname.match(/\/tonton\/([^/]+)/)?.[1];
+      if (slug) return { kind: 'known', site: 'animesub', slug };
+    }
+    if (host.includes('samehadaku')) {
+      const s1 = u.pathname.match(/\/anime\/([^/]+)/)?.[1];
+      if (s1) return { kind: 'known', site: 'samehadaku', slug: s1 };
+      const s2 = u.pathname.match(
+        /\/([^/]+?)-episode-\d+-subtitle-indonesia/
+      )?.[1];
+      if (s2) return { kind: 'known', site: 'samehadaku', slug: s2 };
+    }
+  } catch {
+    return null;
+  }
+
+  const custom = resolveCustomPattern(trimmed);
+  if (custom) {
+    return { kind: 'custom', pattern: custom.pattern, host: custom.host };
+  }
+  return null;
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 async function startBatchWizard(ctx: Context, env: Env): Promise<void> {
@@ -83,6 +153,7 @@ async function startBatchWizard(ctx: Context, env: Env): Promise<void> {
     sourceUrl: null,
     sourceSite: null,
     sourceSlug: null,
+    customPattern: null,
     rangeStart: null,
     rangeEnd: null,
   };
@@ -115,13 +186,13 @@ export async function handleBatchWizardText(
   if (!state) return false;
 
   if (state.step === 'awaiting_slug') {
-    return await handleWizardSlug(ctx, env, userId, state, text);
+    return handleWizardSlug(ctx, env, userId, state, text);
   }
   if (state.step === 'awaiting_source') {
-    return await handleWizardSource(ctx, env, userId, state, text);
+    return handleWizardSource(ctx, env, userId, state, text);
   }
   if (state.step === 'awaiting_range') {
-    return await handleWizardRange(ctx, env, userId, state, text);
+    return handleWizardRange(ctx, env, userId, state, text);
   }
   return false;
 }
@@ -148,7 +219,7 @@ async function handleWizardSlug(
     { parse_mode: 'HTML' }
   );
 
-  let file = null;
+  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
   try {
     file = await githubGetFile(env, `src/content/anime/${slug}.md`);
   } catch (err) {
@@ -179,10 +250,16 @@ async function handleWizardSlug(
     `✅ <b>Slug ditemukan!</b>\n\n` +
       `<b>Step 2/3</b> · Kirim <b>URL source</b>.\n\n` +
       `🎬 Repo: <code>${escapeHtml(slug)}</code>\n\n` +
-      `<b>Format URL yang didukung:</b>\n` +
+      `<b>A. Situs dikenal (slug otomatis):</b>\n` +
       `• <code>https://lexanime.web.id/tonton/{slug}/</code>\n` +
       `• <code>https://animesub.web.id/tonton/{slug}/</code>\n` +
-      `• <code>https://samehadaku.li/anime/{slug}/</code>`,
+      `• <code>https://samehadaku.li/anime/{slug}/</code>\n\n` +
+      `<b>B. Situs lain (custom):</b>\n` +
+      `• Kirim URL episode dengan placeholder <code>{n}</code>:\n` +
+      `  <code>https://situs.com/foo/episode-{n}</code>\n` +
+      `• Atau kirim contoh URL episode (bot auto-detect):\n` +
+      `  <code>https://situs.com/foo/episode-1</code>\n` +
+      `  <code>https://situs.com/watch/foo/1</code>`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -204,10 +281,14 @@ async function handleWizardSource(
   if (!parsed) {
     await ctx.reply(
       '❌ URL tidak dikenali.\n\n' +
-        'Format yang didukung:\n' +
+        '<b>Situs dikenal:</b>\n' +
         '• <code>https://lexanime.web.id/tonton/{slug}/</code>\n' +
         '• <code>https://animesub.web.id/tonton/{slug}/</code>\n' +
         '• <code>https://samehadaku.li/anime/{slug}/</code>\n\n' +
+        '<b>Custom URL:</b> pastikan ada nomor episode, atau pakai placeholder:\n' +
+        '• <code>https://situs.com/foo/episode-{n}</code>\n' +
+        '• <code>https://situs.com/foo/episode-1</code>\n' +
+        '• <code>https://situs.com/watch/foo/1</code>\n\n' +
         'Coba lagi:',
       {
         parse_mode: 'HTML',
@@ -220,17 +301,37 @@ async function handleWizardSource(
 
   state.step = 'awaiting_range';
   state.sourceUrl = text.trim();
-  state.sourceSite = parsed.site;
-  state.sourceSlug = parsed.slug;
+
+  if (parsed.kind === 'known') {
+    state.sourceSite = parsed.site;
+    state.sourceSlug = parsed.slug;
+    state.customPattern = null;
+  } else {
+    state.sourceSite = 'custom';
+    state.sourceSlug = parsed.host;
+    state.customPattern = parsed.pattern;
+  }
+
   await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
+
+  const siteLabel =
+    parsed.kind === 'known' ? parsed.site : `custom (${parsed.host})`;
+
+  let patternLabel: string;
+  if (parsed.kind === 'known') {
+    const cfg = WIZARD_SITES[parsed.site];
+    patternLabel = `${cfg.host}${cfg.episodePath(parsed.slug, 1)}`;
+  } else {
+    patternLabel = parsed.pattern;
+  }
 
   await ctx.reply(
     `✅ <b>Source OK!</b>\n\n` +
       `<b>Step 3/3</b> · Kirim <b>range episode</b>.\n\n` +
-      `🎬 Repo: <code>${escapeHtml(state.slug!)}</code>\n` +
-      `🔗 Site: <b>${parsed.site}</b>\n` +
-      `📼 Source: <code>${escapeHtml(parsed.slug)}</code>\n\n` +
-      `<b>Contoh:</b>\n` +
+      `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
+      `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+      `📼 URL sample ep 1: <code>${escapeHtml(patternLabel)}</code>\n\n` +
+      `<b>Contoh range:</b>\n` +
       `• <code>1-6</code> (ep 1 sampai 6)\n` +
       `• <code>4</code> (hanya ep 4)\n\n` +
       `<i>Kalau file existing sudah ada (misal 1-3), bot akan skip.</i>`,
@@ -259,7 +360,7 @@ async function handleWizardRange(
     return true;
   }
 
-  const start = parseInt(m[1]!, 10);
+  const start = parseInt(m[1] ?? '0', 10);
   const end = m[2] ? parseInt(m[2], 10) : start;
 
   if (start < 1 || end < start || end - start + 1 > BATCH_MAX) {
@@ -275,11 +376,17 @@ async function handleWizardRange(
   state.rangeEnd = end;
   await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
 
+  const siteLabel = state.sourceSite ?? '-';
+  const sourceLabel =
+    state.sourceSite === 'custom'
+      ? (state.customPattern ?? '-')
+      : (state.sourceSlug ?? '-');
+
   await ctx.reply(
     `📋 <b>Konfirmasi Batch</b>\n\n` +
-      `🎬 Repo: <code>${escapeHtml(state.slug!)}</code>\n` +
-      `🔗 Site: <b>${state.sourceSite}</b>\n` +
-      `📼 Source: <code>${escapeHtml(state.sourceSlug!)}</code>\n` +
+      `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
+      `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+      `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n` +
       `📊 Range: <b>${start}-${end}</b> (${end - start + 1} ep)\n\n` +
       `<i>Bot akan cek file existing di <code>episodes/streams/</code>, fetch yang belum ada, lalu merge.</i>`,
     {
@@ -299,15 +406,24 @@ async function execBatchWizard(
   userId: number
 ): Promise<void> {
   const state = await getCache<WizardState>(env.DB, `bw:${userId}`);
+  if (!state || state.step !== 'ready') {
+    await ctx.answerCallbackQuery({
+      text: '⏱️ Session kadaluarsa',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const slug = state.slug;
+  const sourceSite = state.sourceSite;
+  const rangeStart = state.rangeStart;
+  const rangeEnd = state.rangeEnd;
+
   if (
-    !state ||
-    state.step !== 'ready' ||
-    !state.slug ||
-    !state.sourceUrl ||
-    !state.sourceSite ||
-    !state.sourceSlug ||
-    state.rangeStart === null ||
-    state.rangeEnd === null
+    !slug ||
+    !sourceSite ||
+    rangeStart === null ||
+    rangeEnd === null
   ) {
     await ctx.answerCallbackQuery({
       text: '⏱️ Session kadaluarsa',
@@ -320,48 +436,80 @@ async function execBatchWizard(
 
   const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
   const chatId = ctx.chat!.id;
-
-  const { slug, sourceSite, sourceSlug, rangeStart, rangeEnd } = state;
   const total = rangeEnd - rangeStart + 1;
 
+  /* ── Build URL builder ───────────────────────────────── */
+  let epUrlBuilder: (n: number) => string;
+
+  if (sourceSite === 'custom') {
+    const pattern = state.customPattern;
+    if (!pattern) {
+      await ctx.api
+        .editMessageText(
+          chatId,
+          loadingMsgId,
+          '❌ Pattern custom hilang. Ulangi /batch.',
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+    epUrlBuilder = (n) => pattern.replace(/\{n\}/g, String(n));
+  } else {
+    // TS narrow sourceSite → SiteKey
+    const siteConfig = WIZARD_SITES[sourceSite];
+    const sourceSlug = state.sourceSlug;
+    if (!sourceSlug) {
+      await ctx.api
+        .editMessageText(
+          chatId,
+          loadingMsgId,
+          '❌ Source slug hilang. Ulangi /batch.',
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+    epUrlBuilder = (n) =>
+      `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
+  }
+
+  /* ── Read existing chunks ────────────────────────────── */
   const existing = new Map<number, EpisodeObject>();
   try {
     const dir = await githubListDir(env, `data/anime/${slug}/episodes/streams`);
     for (const item of dir) {
       if (item.type !== 'file' || !item.name.endsWith('.json')) continue;
-      const file = await githubGetFile(env, `data/anime/${slug}/episodes/streams/${item.name}`);
+      const file = await githubGetFile(
+        env,
+        `data/anime/${slug}/episodes/streams/${item.name}`
+      );
       if (!file) continue;
       try {
-        const eps = JSON.parse(file.content) as EpisodeObject[];
+        const eps = JSON.parse(file.content) as unknown;
         if (Array.isArray(eps)) {
-          for (const ep of eps) {
+          for (const ep of eps as EpisodeObject[]) {
             if (typeof ep.number === 'number') existing.set(ep.number, ep);
           }
         }
-      } catch {}
+      } catch {
+        /* ignore malformed */
+      }
     }
   } catch (err) {
     console.warn('[BatchWizard] read existing failed:', err);
   }
 
-  const siteConfig = WIZARD_SITES[sourceSite];
-  if (!siteConfig) {
-    await ctx.api
-      .editMessageText(chatId, loadingMsgId, `❌ Site tidak dikenal: ${escapeHtml(sourceSite)}`, {
-        parse_mode: 'HTML',
-      })
-      .catch(() => {});
-    return;
-  }
-
+  /* ── Fetch loop ──────────────────────────────────────── */
   const merged: EpisodeObject[] = [];
   const errors: { number: number; error: string }[] = [];
   const added: number[] = [];
   const skipped: number[] = [];
 
   for (let n = rangeStart; n <= rangeEnd; n++) {
-    if (existing.has(n)) {
-      merged.push(existing.get(n)!);
+    const cached = existing.get(n);
+    if (cached) {
+      merged.push(cached);
       skipped.push(n);
       continue;
     }
@@ -376,7 +524,7 @@ async function execBatchWizard(
       )
       .catch(() => {});
 
-    const epUrl = `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
+    const epUrl = epUrlBuilder(n);
     const { body, debug } = await fetchUrlViaProxy(env, epUrl);
 
     if (!body) {
@@ -397,17 +545,22 @@ async function execBatchWizard(
 
   merged.sort((a, b) => a.number - b.number);
 
-  if (merged.length === 0) {
+  const first = merged[0];
+  const last = merged[merged.length - 1];
+  if (!first || !last) {
     await ctx.api
-      .editMessageText(chatId, loadingMsgId, `❌ Tidak ada episode yang berhasil di-fetch.`, {
-        parse_mode: 'HTML',
-      })
+      .editMessageText(
+        chatId,
+        loadingMsgId,
+        '❌ Tidak ada episode yang berhasil di-fetch.',
+        { parse_mode: 'HTML' }
+      )
       .catch(() => {});
     return;
   }
 
-  const minEp = merged[0]!.number;
-  const maxEp = merged[merged.length - 1]!.number;
+  const minEp = first.number;
+  const maxEp = last.number;
   const combinedJson = JSON.stringify(merged, null, 2) + '\n';
   const totalUrls = merged.reduce(
     (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
@@ -445,8 +598,12 @@ async function execBatchWizard(
     lines.push(`📦 Total: <b>${merged.length}</b> ep (${minEp}-${maxEp})`);
     lines.push(`🎬 URL: <b>${totalUrls}</b>`);
 
-    if (skipped.length > 0) lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
-    if (added.length > 0) lines.push(`➕ Baru: Ep ${added.join(', ')}`);
+    if (skipped.length > 0) {
+      lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
+    }
+    if (added.length > 0) {
+      lines.push(`➕ Baru: Ep ${added.join(', ')}`);
+    }
 
     if (errors.length > 0) {
       lines.push('');
@@ -473,24 +630,26 @@ async function execBatchWizard(
       })
       .catch(() => {});
 
-    // Retain slug + source untuk batch berikutnya — hanya range yang reset
+    // Retain slug + source, reset range
     const nextState: WizardState = {
       step: 'awaiting_range',
       slug: state.slug,
       sourceUrl: state.sourceUrl,
       sourceSite: state.sourceSite,
       sourceSlug: state.sourceSlug,
+      customPattern: state.customPattern,
       rangeStart: null,
       rangeEnd: null,
     };
     await setCache(env.DB, `bw:${userId}`, nextState, WIZARD_TTL_MS);
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'unknown';
     console.error('[BatchWizard] push failed:', err);
     await ctx.api
       .editMessageText(
         chatId,
         loadingMsgId,
-        `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+        `❌ <b>Error:</b> <code>${escapeHtml(msg.slice(0, 300))}</code>`,
         { parse_mode: 'HTML' }
       )
       .catch(() => {});
@@ -508,7 +667,7 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
     if (!userId) return;
 
     const state = await getCache<WizardState>(env.DB, `bw:${userId}`);
-    if (!state || !state.slug || !state.sourceSlug || !state.sourceSite) {
+    if (!state || !state.slug || !state.sourceSite) {
       await ctx.answerCallbackQuery({
         text: '⏱️ Session habis. Kirim /batch lagi.',
         show_alert: true,
@@ -518,14 +677,23 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
 
     await ctx.answerCallbackQuery({ text: '🔄' });
 
+    const siteLabel =
+      state.sourceSite === 'custom'
+        ? `custom (${state.sourceSlug ?? '-'})`
+        : state.sourceSite;
+    const sourceLabel =
+      state.sourceSite === 'custom'
+        ? (state.customPattern ?? '-')
+        : (state.sourceSlug ?? '-');
+
     await ctx.api
       .editMessageText(
         ctx.chat!.id,
         ctx.callbackQuery!.message!.message_id!,
         `🔄 <b>Range Baru</b>\n\n` +
           `🎬 Repo: <code>${escapeHtml(state.slug)}</code>\n` +
-          `🔗 Site: <b>${state.sourceSite}</b>\n` +
-          `📼 Source: <code>${escapeHtml(state.sourceSlug)}</code>\n\n` +
+          `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+          `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n\n` +
           `Kirim <b>range episode</b> baru.\n` +
           `Contoh: <code>7-12</code> atau <code>13</code>`,
         {
@@ -585,3 +753,4 @@ export const batchCommand: CommandDefinition = {
     await startBatchWizard(ctx, env);
   },
 };
+=== END FILE ===
