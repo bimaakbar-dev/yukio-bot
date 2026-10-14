@@ -3,10 +3,11 @@ import type { D1Database } from '@cloudflare/workers-types';
 import { createLazyInit } from '../lazy-init';
 
 export type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
+export type TrackSite = SiteKey | 'custom';
 
 export interface TrackedAnimeRow {
   slug: string;
-  site: SiteKey;
+  site: TrackSite;
   source_slug: string;
   fallback_site: SiteKey | null;
   schedule_day: string;
@@ -19,6 +20,8 @@ export interface TrackedAnimeRow {
   status: 'active' | 'paused' | 'finished';
   last_check_at: number | null;
   last_push_at: number | null;
+  custom_episode_pattern: string | null;
+  custom_anime_url: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -50,6 +53,8 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
         status           TEXT NOT NULL DEFAULT 'active',
         last_check_at    INTEGER,
         last_push_at     INTEGER,
+        custom_episode_pattern TEXT,
+        custom_anime_url       TEXT,
         created_at       INTEGER NOT NULL,
         updated_at       INTEGER NOT NULL
       )`
@@ -59,6 +64,18 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
   try {
     await db
       .prepare('ALTER TABLE tracked_anime ADD COLUMN schedule_minute INTEGER NOT NULL DEFAULT 0')
+      .run();
+  } catch {}
+
+  try {
+    await db
+      .prepare('ALTER TABLE tracked_anime ADD COLUMN custom_episode_pattern TEXT')
+      .run();
+  } catch {}
+
+  try {
+    await db
+      .prepare('ALTER TABLE tracked_anime ADD COLUMN custom_anime_url TEXT')
       .run();
   } catch {}
 
@@ -98,13 +115,15 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
 
 export interface SaveTrackedAnimeInput {
   slug: string;
-  site: SiteKey;
+  site: TrackSite;
   sourceSlug: string;
   fallbackSite: SiteKey | null;
   scheduleDay: string;
   scheduleHour: number;
   scheduleMinute?: number;
   bufferMin?: number;
+  customEpisodePattern?: string | null;
+  customAnimeUrl?: string | null;
 }
 
 export async function saveTrackedAnime(
@@ -119,8 +138,8 @@ export async function saveTrackedAnime(
       `INSERT INTO tracked_anime
         (slug, site, source_slug, fallback_site, schedule_day, schedule_hour,
          schedule_minute, buffer_min, chunk_start, chunk_end, last_ep, status,
-         created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', ?, ?)
+         custom_episode_pattern, custom_anime_url, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', ?, ?, ?, ?)
        ON CONFLICT(slug) DO UPDATE SET
          site = excluded.site,
          source_slug = excluded.source_slug,
@@ -129,6 +148,8 @@ export async function saveTrackedAnime(
          schedule_hour = excluded.schedule_hour,
          schedule_minute = excluded.schedule_minute,
          buffer_min = excluded.buffer_min,
+         custom_episode_pattern = excluded.custom_episode_pattern,
+         custom_anime_url = excluded.custom_anime_url,
          status = 'active',
          updated_at = excluded.updated_at`
     )
@@ -141,6 +162,8 @@ export async function saveTrackedAnime(
       data.scheduleHour,
       data.scheduleMinute ?? 0,
       data.bufferMin ?? 60,
+      data.customEpisodePattern ?? null,
+      data.customAnimeUrl ?? null,
       now,
       now
     )
@@ -232,7 +255,7 @@ export async function markEpisodePublished(
   db: D1Database,
   slug: string,
   epNumber: number,
-  site: SiteKey,
+  site: TrackSite,
   commitSha: string | null
 ): Promise<void> {
   await ensureCronDb(db);
