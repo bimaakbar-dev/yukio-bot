@@ -3,6 +3,11 @@ import type { Env } from '../../types/env';
 import type { EpisodeObject } from '../../types/anime';
 import { safeFetch } from '../dba-common';
 import type { SiteKey } from './state';
+import {
+  decodeInput,
+  buildEpisodeObject,
+  extractInertiaEpisodeNumbers,
+} from '../../services/decode-core';
 
 interface SiteConfig {
   host: string;
@@ -34,7 +39,7 @@ const SITES: Record<SiteKey, SiteConfig> = {
 
 const FETCH_TIMEOUT_MS = 12000;
 
-async function fetchViaProxy(env: Env, url: string): Promise<string | null> {
+export async function fetchViaProxy(env: Env, url: string): Promise<string | null> {
   const proxyUrl = env.VAL_TOWN_FETCH_URL;
   if (!proxyUrl) {
     console.error('[Fetcher] VAL_TOWN_FETCH_URL tidak di-set');
@@ -97,6 +102,58 @@ export async function fetchLatestEpisodeNumber(
   if (site === 'samehadaku') return parseLatestEpisodeSamehadaku(html);
   return parseLatestEpisodeLexanime(html);
 }
+
+/* ── Custom site support ── */
+
+export async function fetchLatestEpisodeNumberCustom(
+  env: Env,
+  animeUrl: string | null
+): Promise<number | null> {
+  if (!animeUrl || !/^https?:\/\//i.test(animeUrl)) return null;
+
+  const html = await fetchViaProxy(env, animeUrl);
+  if (!html) return null;
+
+  // Try Inertia payload first
+  const inertiaEps = extractInertiaEpisodeNumbers(html);
+  if (inertiaEps.length > 0) return Math.max(...inertiaEps);
+
+  // Fallback: regex
+  const numbers = new Set<number>();
+  for (const m of html.matchAll(/\/episode\/(\d+)/gi)) {
+    const n = parseInt(m[1] ?? '', 10);
+    if (!isNaN(n) && n > 0 && n < 10000) numbers.add(n);
+  }
+  for (const m of html.matchAll(/episode[-\s](\d+)/gi)) {
+    const n = parseInt(m[1] ?? '', 10);
+    if (!isNaN(n) && n > 0 && n < 10000) numbers.add(n);
+  }
+  for (const m of html.matchAll(/\bep\s*(\d+)\b/gi)) {
+    const n = parseInt(m[1] ?? '', 10);
+    if (!isNaN(n) && n > 0 && n < 10000) numbers.add(n);
+  }
+
+  if (numbers.size === 0) return null;
+  return Math.max(...numbers);
+}
+
+export async function fetchEpisodeCustom(
+  env: Env,
+  pattern: string,
+  epNumber: number
+): Promise<EpisodeObject | null> {
+  const url = pattern.replace(/\{n\}/g, String(epNumber));
+  const html = await fetchViaProxy(env, url);
+  if (!html) return null;
+  if (html.length < 2000 && /404|not found/i.test(html)) return null;
+
+  const processed = decodeInput(html, 'html');
+  if (!processed) return null;
+
+  return buildEpisodeObject(processed.videos, epNumber);
+}
+
+/* ── Known site (existing) ── */
 
 interface ParsedEpisode {
   sourceUrl: string;
