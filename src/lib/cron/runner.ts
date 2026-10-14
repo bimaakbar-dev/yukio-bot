@@ -17,9 +17,15 @@ import {
   writeCronLog,
   isInScheduleWindow,
   type SiteKey,
+  type TrackSite,
   type TrackedAnimeRow,
 } from './state';
-import { fetchLatestEpisodeNumber, fetchEpisode } from './fetcher';
+import {
+  fetchLatestEpisodeNumber,
+  fetchEpisode,
+  fetchLatestEpisodeNumberCustom,
+  fetchEpisodeCustom,
+} from './fetcher';
 
 const MAX_ANIME_PER_RUN = 5;
 
@@ -114,19 +120,55 @@ interface ProcessResult {
   error: string | null;
 }
 
-async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessResult> {
-  const { slug, site, source_slug, fallback_site } = row;
+interface DetectResult {
+  latest: number | null;
+  usedSite: TrackSite;
+}
 
-  let latestEp = await fetchLatestEpisodeNumber(env, site, source_slug);
-  let usedSite: SiteKey = site;
-
-  if (latestEp === null && fallback_site) {
-    latestEp = await fetchLatestEpisodeNumber(env, fallback_site, source_slug);
-    if (latestEp !== null) usedSite = fallback_site;
+async function detectLatest(
+  env: Env,
+  row: TrackedAnimeRow
+): Promise<DetectResult> {
+  if (row.site === 'custom') {
+    const n = await fetchLatestEpisodeNumberCustom(env, row.custom_anime_url);
+    return { latest: n, usedSite: 'custom' };
   }
 
+  let latest = await fetchLatestEpisodeNumber(env, row.site, row.source_slug);
+  let usedSite: TrackSite = row.site;
+
+  if (latest === null && row.fallback_site) {
+    latest = await fetchLatestEpisodeNumber(env, row.fallback_site, row.source_slug);
+    if (latest !== null) usedSite = row.fallback_site;
+  }
+
+  return { latest, usedSite };
+}
+
+async function fetchEpisodeForRow(
+  env: Env,
+  row: TrackedAnimeRow,
+  usedSite: TrackSite,
+  epNumber: number
+): Promise<EpisodeObject | null> {
+  if (usedSite === 'custom') {
+    if (!row.custom_episode_pattern) return null;
+    return fetchEpisodeCustom(env, row.custom_episode_pattern, epNumber);
+  }
+  return fetchEpisode(env, usedSite as SiteKey, row.source_slug, epNumber);
+}
+
+async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessResult> {
+  const { slug } = row;
+
+  if (row.site === 'custom' && !row.custom_episode_pattern) {
+    return { pushed: 0, error: `Custom site tanpa episode pattern untuk ${slug}` };
+  }
+
+  const { latest: latestEp, usedSite } = await detectLatest(env, row);
+
   if (latestEp === null) {
-    return { pushed: 0, error: `Semua site gagal cek latest ep untuk ${slug}` };
+    return { pushed: 0, error: `Gagal cek latest ep untuk ${slug}` };
   }
 
   if (latestEp <= row.last_ep) {
@@ -147,14 +189,19 @@ async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessR
     const already = await isEpisodePublished(env.DB, slug, ep);
     if (already) continue;
 
-    let episode = await fetchEpisode(env, usedSite, source_slug, ep);
-    if (!episode && usedSite !== (fallback_site ?? site)) {
-      episode = await fetchEpisode(env, fallback_site as SiteKey, source_slug, ep);
-      if (episode) usedSite = fallback_site as SiteKey;
+    let episode = await fetchEpisodeForRow(env, row, usedSite, ep);
+
+    if (
+      !episode &&
+      usedSite !== 'custom' &&
+      row.fallback_site &&
+      usedSite !== row.fallback_site
+    ) {
+      episode = await fetchEpisode(env, row.fallback_site, row.source_slug, ep);
     }
 
     if (!episode) {
-      lastError = `Ep ${ep} tidak bisa di-fetch dari semua site`;
+      lastError = `Ep ${ep} tidak bisa di-fetch`;
       break;
     }
 
