@@ -19,15 +19,17 @@ import {
   readEpisodeChunk,
   serializeChunk,
   type EpisodeChunkItem,
+  type EpisodeStream,
 } from '../lib/episode-chunks';
 
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 
 type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
 type WizardSite = SiteKey | 'custom';
+type BatchMode = 'skip' | 'overwrite' | 'merge';
 
 interface WizardState {
-  step: 'awaiting_slug' | 'awaiting_source' | 'awaiting_range' | 'ready';
+  step: 'awaiting_slug' | 'awaiting_source' | 'awaiting_range' | 'choose_mode' | 'ready';
   slug: string | null;
   sourceUrl: string | null;
   sourceSite: WizardSite | null;
@@ -35,6 +37,8 @@ interface WizardState {
   customPattern: string | null;
   rangeStart: number | null;
   rangeEnd: number | null;
+  mode: BatchMode | null;
+  existingCount: number;
 }
 
 interface SiteConfig {
@@ -53,7 +57,7 @@ const WIZARD_SITES: Record<SiteKey, SiteConfig> = {
   },
   samehadaku: {
     host: 'https://samehadaku.li',
-    episodePath: (slug, n) => `/${slug}-episode-${n}-subtitle-indonesia/`,
+    episodePath: (slug, n) => `${slug}-episode-${n}-subtitle-indonesia/`,
   },
 };
 
@@ -61,16 +65,11 @@ type ParsedSource =
   | { kind: 'known'; site: SiteKey; slug: string }
   | { kind: 'custom'; pattern: string; host: string };
 
-/**
- * Cek apakah item episode sudah punya streams valid.
- * Metadata-only (dari publisher /anime) dianggap BELUM punya streams.
- */
 function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
   if (!item) return false;
   if (!Array.isArray(item.streams)) return false;
   if (item.streams.length === 0) return false;
 
-  // Pastikan minimal 1 stream punya minimal 1 server dengan URL valid.
   return item.streams.some(
     (s) =>
       Array.isArray(s.servers) &&
@@ -78,6 +77,55 @@ function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
         (srv) => typeof srv.url === 'string' && srv.url.trim() !== ''
       )
   );
+}
+
+/**
+ * Merge streams: existing + incoming, dedup by URL per quality.
+ * Existing dipertahankan, server baru di-append.
+ */
+function mergeStreams(
+  existing: EpisodeStream[] | undefined,
+  incoming: EpisodeStream[]
+): EpisodeStream[] {
+  const byQuality = new Map<string, Map<string, { name: string; url: string }>>();
+
+  const addServer = (quality: string, name: string, url: string): void => {
+    if (!byQuality.has(quality)) byQuality.set(quality, new Map());
+    const map = byQuality.get(quality)!;
+    if (!map.has(url)) {
+      map.set(url, { name, url });
+    }
+  };
+
+  for (const s of existing ?? []) {
+    for (const srv of s.servers) {
+      if (srv.url && srv.url.trim() !== '') {
+        addServer(s.quality, srv.name || 'unknown', srv.url);
+      }
+    }
+  }
+
+  for (const s of incoming) {
+    for (const srv of s.servers) {
+      if (srv.url && srv.url.trim() !== '') {
+        addServer(s.quality, srv.name || 'unknown', srv.url);
+      }
+    }
+  }
+
+  const result: EpisodeStream[] = [];
+  for (const [quality, servers] of byQuality) {
+    if (servers.size === 0) continue;
+    result.push({ quality, servers: [...servers.values()] });
+  }
+
+  const rank = (q: string): number => {
+    const n = parseInt(q.replace(/p$/i, ''), 10);
+    return isNaN(n) ? -1 : n;
+  };
+  result.sort((a, b) => rank(b.quality) - rank(a.quality));
+
+  return result;
 }
 
 function resolveCustomPattern(
@@ -171,6 +219,8 @@ async function startBatchWizard(ctx: Context, env: Env): Promise<void> {
     customPattern: null,
     rangeStart: null,
     rangeEnd: null,
+    mode: null,
+    existingCount: 0,
   };
   await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
 
@@ -346,10 +396,10 @@ async function handleWizardSource(
       `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
       `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
       `📼 URL sample ep 1: <code>${escapeHtml(patternLabel)}</code>\n\n` +
-      `<b>Contoh range:</b>\n` +
+      `<b>Contoh:</b>\n` +
       `• <code>1-6</code> (ep 1 sampai 6)\n` +
       `• <code>4</code> (hanya ep 4)\n\n` +
-      `<i>Episode yang sudah punya streams akan di-skip. Metadata-only akan di-fetch ulang.</i>`,
+      `<i>Kalau episode sudah ada streams, bot akan tanya mau diapakan.</i>`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -357,6 +407,41 @@ async function handleWizardSource(
     }
   );
   return true;
+}
+
+/**
+ * Hitung berapa episode di range yang sudah punya streams valid.
+ */
+async function countExistingInRange(
+  env: Env,
+  slug: string,
+  start: number,
+  end: number
+): Promise<number> {
+  const chunkKeys = new Set<string>();
+  const chunks = new Map<string, { start: number; end: number; items: Map<number, EpisodeChunkItem> }>();
+
+  for (let n = start; n <= end; n++) {
+    const { start: cs, end: ce } = chunkRange(n);
+    const key = `${cs}-${ce}`;
+    if (chunkKeys.has(key)) continue;
+    chunkKeys.add(key);
+    chunks.set(key, { start: cs, end: ce, items: new Map() });
+  }
+
+  for (const chunk of chunks.values()) {
+    const items = await readEpisodeChunk(env, slug, chunk.start, chunk.end);
+    for (const item of items) chunk.items.set(item.number, item);
+  }
+
+  let count = 0;
+  for (let n = start; n <= end; n++) {
+    const { start: cs, end: ce } = chunkRange(n);
+    const chunk = chunks.get(`${cs}-${ce}`);
+    if (!chunk) continue;
+    if (hasValidStreams(chunk.items.get(n))) count++;
+  }
+  return count;
 }
 
 async function handleWizardRange(
@@ -386,10 +471,30 @@ async function handleWizardRange(
     return true;
   }
 
-  state.step = 'ready';
+  if (!state.slug) {
+    await ctx.reply('❌ Session hilang. Ulangi /batch.', { parse_mode: 'HTML' });
+    return true;
+  }
+
+  const loading = await ctx.reply(
+    `🔍 Cek episode existing di range ${start}-${end}...`,
+    { parse_mode: 'HTML' }
+  );
+
+  let existingCount = 0;
+  try {
+    existingCount = await countExistingInRange(env, state.slug, start, end);
+  } catch (err) {
+    console.warn('[BatchWizard] count existing failed:', err);
+  }
+
+  await ctx.api.deleteMessage(ctx.chat!.id, loading.message_id).catch(() => {});
+
   state.rangeStart = start;
   state.rangeEnd = end;
-  await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
+  state.existingCount = existingCount;
+
+  const totalInRange = end - start + 1;
 
   const siteLabel = state.sourceSite ?? '-';
   const sourceLabel =
@@ -397,18 +502,58 @@ async function handleWizardRange(
       ? (state.customPattern ?? '-')
       : (state.sourceSlug ?? '-');
 
+  if (existingCount === 0) {
+    // Tidak ada existing → langsung ready, mode overwrite (efek sama dengan skip)
+    state.step = 'ready';
+    state.mode = 'overwrite';
+    await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
+
+    await ctx.reply(
+      `📋 <b>Konfirmasi Batch</b>\n\n` +
+        `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
+        `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+        `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n` +
+        `📊 Range: <b>${start}-${end}</b> (${totalInRange} ep)\n` +
+        `ℹ️ Mode: <b>Fresh</b> (tidak ada existing)\n\n` +
+        `<i>Semua episode akan di-fetch dan ditulis baru.</i>`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard()
+          .text('🔄 Proses', 'bw:go')
+          .text('❌ Batal', 'bw:cancel'),
+      }
+    );
+    return true;
+  }
+
+  // Ada existing → minta user pilih mode
+  state.step = 'choose_mode';
+  await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
+
+  const freshCount = totalInRange - existingCount;
+
   await ctx.reply(
-    `📋 <b>Konfirmasi Batch</b>\n\n` +
+    `📋 <b>Pilih Mode</b>\n\n` +
       `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
       `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
       `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n` +
-      `📊 Range: <b>${start}-${end}</b> (${end - start + 1} ep)\n\n` +
-      `<i>Bot akan cek chunk existing. Episode yang sudah punya streams di-skip, yang belum akan di-fetch.</i>`,
+      `📊 Range: <b>${start}-${end}</b>\n\n` +
+      `⚠️ <b>${existingCount}</b> episode sudah punya streams\n` +
+      `📭 <b>${freshCount}</b> episode belum ada streams\n\n` +
+      `<b>Pilih cara:</b>\n` +
+      `• <b>⏭️ Skip</b> — biarkan existing, hanya isi yang kosong\n` +
+      `• <b>🔁 Timpa</b> — replace streams existing dengan yang baru\n` +
+      `• <b>➕ Merge</b> — tambahkan server baru, existing tetap ada`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
       reply_markup: new InlineKeyboard()
-        .text('🔄 Proses', 'bw:go')
+        .text('⏭️ Skip', 'bw:mode:skip')
+        .text('🔁 Timpa', 'bw:mode:overwrite')
+        .row()
+        .text('➕ Merge', 'bw:mode:merge')
+        .row()
         .text('❌ Batal', 'bw:cancel'),
     }
   );
@@ -433,6 +578,7 @@ async function execBatchWizard(
   const sourceSite = state.sourceSite;
   const rangeStart = state.rangeStart;
   const rangeEnd = state.rangeEnd;
+  const mode: BatchMode = state.mode ?? 'skip';
 
   if (!slug || !sourceSite || rangeStart === null || rangeEnd === null) {
     await ctx.answerCallbackQuery({
@@ -505,18 +651,25 @@ async function execBatchWizard(
     }
   }
 
+  const modeLabel =
+    mode === 'skip' ? '⏭️ skip' : mode === 'overwrite' ? '🔁 timpa' : '➕ merge';
+
   /* ── Fetch loop ── */
   const errors: { number: number; error: string }[] = [];
   const added: number[] = [];
+  const merged: number[] = [];
+  const overwritten: number[] = [];
   const skipped: number[] = [];
 
   for (let n = rangeStart; n <= rangeEnd; n++) {
     const { start, end } = chunkRange(n);
     const chunk = affectedChunks.get(`${start}-${end}`)!;
 
-    // Skip HANYA kalau episode sudah punya streams valid.
-    // Metadata-only (dari /anime publisher) tetap di-fetch.
-    if (hasValidStreams(chunk.items.get(n))) {
+    const existingItem = chunk.items.get(n);
+    const hasStreams = hasValidStreams(existingItem);
+
+    // Skip kalau mode skip & sudah ada streams
+    if (hasStreams && mode === 'skip') {
       skipped.push(n);
       continue;
     }
@@ -525,7 +678,7 @@ async function execBatchWizard(
       .editMessageText(
         chatId,
         loadingMsgId,
-        `📦 <b>Batch ${rangeStart}-${rangeEnd}</b>\n\n` +
+        `📦 <b>Batch ${rangeStart}-${rangeEnd}</b> (${modeLabel})\n\n` +
           `⏳ [${n - rangeStart + 1}/${total}] Episode ${n}...`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       )
@@ -548,27 +701,44 @@ async function execBatchWizard(
 
     const epObj: EpisodeObject = buildEpisodeObject(processed.videos, n);
 
-    // Merge dengan existing item (kalau ada metadata) — preserve title/aired/duration.
-    const prev = chunk.items.get(n) ?? { number: n };
+    let finalStreams: EpisodeStream[];
+    if (mode === 'merge') {
+      finalStreams = mergeStreams(existingItem?.streams, epObj.streams);
+    } else {
+      // skip & overwrite: pakai streams baru saja
+      finalStreams = epObj.streams;
+    }
+
     chunk.items.set(n, {
       number: n,
-      title: prev.title,
-      aired: prev.aired,
-      duration: prev.duration,
-      streams: epObj.streams,
-      downloads: prev.downloads,
+      title: existingItem?.title,
+      aired: existingItem?.aired,
+      duration: existingItem?.duration,
+      streams: finalStreams,
+      downloads: existingItem?.downloads,
     });
-    added.push(n);
+
+    if (hasStreams) {
+      if (mode === 'overwrite') overwritten.push(n);
+      else if (mode === 'merge') merged.push(n);
+    } else {
+      added.push(n);
+    }
   }
 
-  /* ── Commit hanya chunk yang punya episode BARU ── */
+  /* ── Commit chunk yang berubah ── */
   const committed: { path: string; sha?: string; count: number }[] = [];
+  const changedEpisodes = new Set<number>([
+    ...added,
+    ...merged,
+    ...overwritten,
+  ]);
 
   for (const chunk of affectedChunks.values()) {
-    const newInChunk = [...chunk.items.keys()].filter((n) =>
-      added.includes(n)
+    const changedInChunk = [...chunk.items.keys()].filter((n) =>
+      changedEpisodes.has(n)
     );
-    if (newInChunk.length === 0) continue;
+    if (changedInChunk.length === 0) continue;
 
     const sorted = [...chunk.items.values()].sort((a, b) => a.number - b.number);
     const path = chunkPath(slug, chunk.start, chunk.end);
@@ -577,7 +747,7 @@ async function execBatchWizard(
       env,
       path,
       serializeChunk(sorted),
-      `feat(streams): batch ${chunk.start}-${chunk.end} for ${slug}`
+      `feat(streams): batch ${chunk.start}-${chunk.end} for ${slug} (${mode})`
     );
 
     if (!result.ok) {
@@ -597,8 +767,13 @@ async function execBatchWizard(
     committed.push({ path, sha: result.sha, count: sorted.length });
   }
 
-  /* ── Kalau tidak ada fetch sukses & tidak ada skip → truly failed ── */
-  if (added.length === 0 && skipped.length === 0) {
+  /* ── Kalau tidak ada perubahan & tidak ada skip ── */
+  if (
+    added.length === 0 &&
+    merged.length === 0 &&
+    overwritten.length === 0 &&
+    skipped.length === 0
+  ) {
     await ctx.api
       .editMessageText(
         chatId,
@@ -618,11 +793,12 @@ async function execBatchWizard(
   } else {
     lines.push(`ℹ️ <b>Batch ${rangeStart}-${rangeEnd} selesai.</b>`);
     lines.push('');
-    lines.push('<i>Semua episode sudah punya streams, tidak ada yang di-commit.</i>');
+    lines.push('<i>Tidak ada perubahan, tidak ada yang di-commit.</i>');
   }
 
   lines.push('');
   lines.push(`🎬 <code>${escapeHtml(slug)}</code>`);
+  lines.push(`⚙️ Mode: ${modeLabel}`);
 
   if (committed.length === 1) {
     lines.push(`📁 <code>${escapeHtml(committed[0]!.path)}</code>`);
@@ -635,7 +811,10 @@ async function execBatchWizard(
 
   lines.push('');
   if (added.length > 0) lines.push(`➕ Baru: Ep ${added.join(', ')}`);
-  if (skipped.length > 0) lines.push(`⏭️ Skip (sudah ada streams): Ep ${skipped.join(', ')}`);
+  if (merged.length > 0) lines.push(`🔀 Merge: Ep ${merged.join(', ')}`);
+  if (overwritten.length > 0)
+    lines.push(`🔁 Timpa: Ep ${overwritten.join(', ')}`);
+  if (skipped.length > 0) lines.push(`⏭️ Skip: Ep ${skipped.join(', ')}`);
 
   if (errors.length > 0) {
     lines.push('');
@@ -666,7 +845,7 @@ async function execBatchWizard(
     })
     .catch(() => {});
 
-  // Retain slug + source, reset range
+  // Retain slug + source, reset range + mode
   const nextState: WizardState = {
     step: 'awaiting_range',
     slug: state.slug,
@@ -676,6 +855,8 @@ async function execBatchWizard(
     customPattern: state.customPattern,
     rangeStart: null,
     rangeEnd: null,
+    mode: null,
+    existingCount: 0,
   };
   await setCache(env.DB, `bw:${userId}`, nextState, WIZARD_TTL_MS);
 }
@@ -727,6 +908,37 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
         }
       )
       .catch(() => {});
+  });
+
+  bot.callbackQuery(/^bw:mode:(skip|overwrite|merge)$/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const mode = ctx.match[1] as BatchMode;
+    const state = await getCache<WizardState>(env.DB, `bw:${userId}`);
+
+    if (!state || state.step !== 'choose_mode') {
+      await ctx.answerCallbackQuery({
+        text: '⏱️ Session kadaluarsa',
+        show_alert: true,
+      });
+      return;
+    }
+
+    state.step = 'ready';
+    state.mode = mode;
+    await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
+
+    await ctx.answerCallbackQuery({
+      text:
+        mode === 'skip'
+          ? '⏭️ Skip existing'
+          : mode === 'overwrite'
+            ? '🔁 Timpa existing'
+            : '➕ Merge',
+    });
+
+    await execBatchWizard(ctx, env, userId);
   });
 
   bot.callbackQuery(/^bw:go$/, async (ctx) => {
