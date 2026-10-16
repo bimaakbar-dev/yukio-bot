@@ -21,7 +21,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
         '<i>Alur:</i>\n' +
         '1. Fetch metadata (AniList → Shikimori → Kitsu)\n' +
         '2. Klik section: Characters, Episodes, Franchises, Summary\n' +
-        '3. Klik 📤 Publish untuk commit ke yukio-data\n\n' +
+        '3. Klik 📤 Publish untuk commit ke data repo\n\n' +
         '<i>Ketik /anime end untuk membersihkan session.</i>',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
