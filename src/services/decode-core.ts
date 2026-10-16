@@ -403,9 +403,18 @@ export function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
+/* ============================================================
+   Inertia data-page parser
+   - Kompatibel dengan lexanime, komikcast.info, dan situs lain
+     yang pakai Inertia.js (data-page="...")
+   - Support field provider/quality eksplisit DAN field `label`
+     gabungan (misal "otakuwatch3 480p" / "mega 720p").
+   ============================================================ */
+
 interface InertiaMirrorStream {
   provider?: string;
   quality?: string;
+  label?: string;
   url?: string;
   stream_url?: string;
   original_url?: string;
@@ -422,6 +431,62 @@ interface InertiaPageData {
     episode?: InertiaEpisode;
     anime?: { episodes?: InertiaEpisode[] };
   };
+}
+
+/**
+ * Pisahkan label gabungan "otakuwatch3 480p" menjadi
+ * { provider: "otakuwatch3", quality: "480p" }.
+ */
+function splitLabel(
+  label: string
+): { provider: string; quality: string } {
+  const trimmed = label.trim();
+  if (!trimmed) return { provider: '', quality: '' };
+
+  const qm = trimmed.match(/\b(\d{3,4}p)\b/i);
+  if (qm?.[1]) {
+    const quality = qm[1].toLowerCase();
+    const provider = trimmed
+      .replace(new RegExp(`\\b${qm[1]}\\b`, 'i'), '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return { provider, quality };
+  }
+
+  return { provider: trimmed, quality: '' };
+}
+
+/**
+ * Normalisasi stream object dari berbagai format Inertia:
+ * 1. { provider, quality, url }
+ * 2. { label, url } — komikcast style
+ * 3. { stream_url } / { original_url }
+ */
+function normalizeInertiaStream(s: InertiaMirrorStream): {
+  url: string;
+  label: string | null;
+} | null {
+  const url = s.stream_url ?? s.original_url ?? s.url;
+  if (!url || typeof url !== 'string') return null;
+  if (!/^https?:\/\//i.test(url)) return null;
+
+  // Prioritas 1: field provider/quality eksplisit
+  let provider = (s.provider ?? '').trim();
+  let quality = (s.quality ?? '').trim();
+
+  // Prioritas 2: field `label` gabungan
+  if ((!provider || !quality) && typeof s.label === 'string' && s.label.trim()) {
+    const parsed = splitLabel(s.label);
+    if (!provider) provider = parsed.provider;
+    if (!quality) quality = parsed.quality;
+  }
+
+  const label =
+    quality && quality.toLowerCase() !== 'default'
+      ? `[${quality}] ${provider || 'unknown'}`
+      : provider || null;
+
+  return { url, label };
 }
 
 function extractInertiaEmbeds(html: string): RawEntry[] {
@@ -449,20 +514,12 @@ function extractInertiaEmbeds(html: string): RawEntry[] {
     for (const ep of episodes) {
       if (!Array.isArray(ep.mirror_streams)) continue;
       for (const s of ep.mirror_streams) {
-        const url = s.stream_url ?? s.original_url ?? s.url;
-        if (!url || typeof url !== 'string') continue;
-        if (!/^https?:\/\//i.test(url)) continue;
-        if (seen.has(url)) continue;
-        seen.add(url);
+        const norm = normalizeInertiaStream(s);
+        if (!norm) continue;
+        if (seen.has(norm.url)) continue;
+        seen.add(norm.url);
 
-        const provider = (s.provider ?? '').trim();
-        const quality = (s.quality ?? '').trim();
-        const label =
-          quality && quality.toLowerCase() !== 'default'
-            ? `[${quality}] ${provider || 'unknown'}`
-            : provider || null;
-
-        out.push({ url, label, trusted: true });
+        out.push({ url: norm.url, label: norm.label, trusted: true });
       }
     }
   }
