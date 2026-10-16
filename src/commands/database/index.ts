@@ -5,7 +5,7 @@ import { showMainMenu, handleSlugInput } from './actions';
 
 export const databaseCommand: CommandDefinition = {
   name: 'database',
-  description: 'CMS yukio-data — cek slug, edit, hapus',
+  description: 'CMS data repo — cek slug, edit, hapus',
   usage: '/database [slug]',
   adminOnly: true,
 
