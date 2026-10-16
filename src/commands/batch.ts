@@ -1,4 +1,3 @@
-
 // src/commands/batch.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
@@ -6,7 +5,7 @@ import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { EpisodeObject } from '../types/anime';
 import { getCache, setCache, deleteCache } from '../lib/cache';
-import { githubGetFile, githubListDir, githubCommitFile } from '../lib/github';
+import { githubCommitFile } from '../lib/github';
 import {
   BATCH_MAX,
   looksLikeHtml,
@@ -14,6 +13,13 @@ import {
   buildEpisodeObject,
   fetchUrlViaProxy,
 } from '../services/decode-core';
+import {
+  chunkRange,
+  chunkPath,
+  readEpisodeChunk,
+  serializeChunk,
+  type EpisodeChunkItem,
+} from '../lib/episode-chunks';
 
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 
@@ -25,9 +31,7 @@ interface WizardState {
   slug: string | null;
   sourceUrl: string | null;
   sourceSite: WizardSite | null;
-  /** Untuk site known: slug di situs sumber. Untuk custom: hostname saja. */
   sourceSlug: string | null;
-  /** Khusus custom: URL template dengan placeholder `{n}`. */
   customPattern: string | null;
   rangeStart: number | null;
   rangeEnd: number | null;
@@ -57,17 +61,12 @@ type ParsedSource =
   | { kind: 'known'; site: SiteKey; slug: string }
   | { kind: 'custom'; pattern: string; host: string };
 
-/**
- * Auto-detect pola episode di URL → template dengan `{n}`.
- * Return null kalau tidak ada pola yang bisa dipakai.
- */
 function resolveCustomPattern(
   input: string
 ): { pattern: string; host: string } | null {
   const trimmed = input.trim();
   if (!/^https?:\/\//i.test(trimmed)) return null;
 
-  // Hostname — substitute {n} biar URL valid untuk parsing.
   let host: string;
   try {
     host = new URL(trimmed.replace(/\{n\}/g, '1')).hostname.toLowerCase();
@@ -75,12 +74,10 @@ function resolveCustomPattern(
     return null;
   }
 
-  // 1) User sudah kasih {n} eksplisit
   if (/\{n\}/.test(trimmed)) {
     return { pattern: trimmed, host };
   }
 
-  // 2) "episode-5", "ep_12", "EP.3", dst.
   const m1 = trimmed.match(/^(.*?)(episode|ep|eps)([-_.]?)(\d+)(.*)$/i);
   if (m1) {
     const prefix = m1[1] ?? '';
@@ -90,7 +87,6 @@ function resolveCustomPattern(
     return { pattern: `${prefix}${keyword}${sep}{n}${suffix}`, host };
   }
 
-  // 3) URL diakhiri segmen angka: /watch/foo/12, /watch/foo/12/, /watch/foo/12?x=1
   const m2 = trimmed.match(/^(.*\/)(\d+)(\D.*)?$/);
   if (m2) {
     const prefix = m2[1] ?? '';
@@ -219,8 +215,9 @@ async function handleWizardSlug(
     { parse_mode: 'HTML' }
   );
 
-  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
+  let file: Awaited<ReturnType<typeof import('../lib/github').githubGetFile>> = null;
   try {
+    const { githubGetFile } = await import('../lib/github');
     file = await githubGetFile(env, `src/content/anime/${slug}.md`);
   } catch (err) {
     console.error('[BatchWizard] check failed:', err);
@@ -388,7 +385,7 @@ async function handleWizardRange(
       `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
       `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n` +
       `📊 Range: <b>${start}-${end}</b> (${end - start + 1} ep)\n\n` +
-      `<i>Bot akan cek file existing di <code>episodes/streams/</code>, fetch yang belum ada, lalu merge.</i>`,
+      `<i>Bot akan cek file existing di <code>episodes/*.json</code>, fetch yang belum ada, lalu merge.</i>`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -419,12 +416,7 @@ async function execBatchWizard(
   const rangeStart = state.rangeStart;
   const rangeEnd = state.rangeEnd;
 
-  if (
-    !slug ||
-    !sourceSite ||
-    rangeStart === null ||
-    rangeEnd === null
-  ) {
+  if (!slug || !sourceSite || rangeStart === null || rangeEnd === null) {
     await ctx.answerCallbackQuery({
       text: '⏱️ Session kadaluarsa',
       show_alert: true,
@@ -438,7 +430,7 @@ async function execBatchWizard(
   const chatId = ctx.chat!.id;
   const total = rangeEnd - rangeStart + 1;
 
-  /* ── Build URL builder ───────────────────────────────── */
+  /* ── Build URL builder ── */
   let epUrlBuilder: (n: number) => string;
 
   if (sourceSite === 'custom') {
@@ -456,7 +448,6 @@ async function execBatchWizard(
     }
     epUrlBuilder = (n) => pattern.replace(/\{n\}/g, String(n));
   } else {
-    // TS narrow sourceSite → SiteKey
     const siteConfig = WIZARD_SITES[sourceSite];
     const sourceSlug = state.sourceSlug;
     if (!sourceSlug) {
@@ -474,42 +465,38 @@ async function execBatchWizard(
       `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
   }
 
-  /* ── Read existing chunks ────────────────────────────── */
-  const existing = new Map<number, EpisodeObject>();
-  try {
-    const dir = await githubListDir(env, `data/anime/${slug}/episodes/streams`);
-    for (const item of dir) {
-      if (item.type !== 'file' || !item.name.endsWith('.json')) continue;
-      const file = await githubGetFile(
-        env,
-        `data/anime/${slug}/episodes/streams/${item.name}`
-      );
-      if (!file) continue;
-      try {
-        const eps = JSON.parse(file.content) as unknown;
-        if (Array.isArray(eps)) {
-          for (const ep of eps as EpisodeObject[]) {
-            if (typeof ep.number === 'number') existing.set(ep.number, ep);
-          }
-        }
-      } catch {
-        /* ignore malformed */
-      }
+  /* ── Kumpulkan daftar chunk yang terpengaruh range ── */
+  const affectedChunks = new Map<
+    string,
+    { start: number; end: number; items: Map<number, EpisodeChunkItem> }
+  >();
+
+  for (let n = rangeStart; n <= rangeEnd; n++) {
+    const { start, end } = chunkRange(n);
+    const key = `${start}-${end}`;
+    if (!affectedChunks.has(key)) {
+      affectedChunks.set(key, { start, end, items: new Map() });
     }
-  } catch (err) {
-    console.warn('[BatchWizard] read existing failed:', err);
   }
 
-  /* ── Fetch loop ──────────────────────────────────────── */
-  const merged: EpisodeObject[] = [];
+  /* ── Baca existing tiap chunk sekali ── */
+  for (const chunk of affectedChunks.values()) {
+    const existing = await readEpisodeChunk(env, slug, chunk.start, chunk.end);
+    for (const item of existing) {
+      chunk.items.set(item.number, item);
+    }
+  }
+
+  /* ── Fetch loop ── */
   const errors: { number: number; error: string }[] = [];
   const added: number[] = [];
   const skipped: number[] = [];
 
   for (let n = rangeStart; n <= rangeEnd; n++) {
-    const cached = existing.get(n);
-    if (cached) {
-      merged.push(cached);
+    const { start, end } = chunkRange(n);
+    const chunk = affectedChunks.get(`${start}-${end}`)!;
+
+    if (chunk.items.has(n)) {
       skipped.push(n);
       continue;
     }
@@ -539,15 +526,52 @@ async function execBatchWizard(
       continue;
     }
 
-    merged.push(buildEpisodeObject(processed.videos, n));
+    const epObj: EpisodeObject = buildEpisodeObject(processed.videos, n);
+    chunk.items.set(n, {
+      number: n,
+      streams: epObj.streams,
+    });
     added.push(n);
   }
 
-  merged.sort((a, b) => a.number - b.number);
+  /* ── Commit tiap chunk yang berubah ── */
+  const committed: { path: string; sha?: string; count: number }[] = [];
 
-  const first = merged[0];
-  const last = merged[merged.length - 1];
-  if (!first || !last) {
+  for (const chunk of affectedChunks.values()) {
+    // Skip chunk kalau tidak ada item baru (semua existing)
+    const hasNew = [...chunk.items.keys()].some((n) =>
+      added.includes(n) || skipped.includes(n)
+    );
+    if (!hasNew && chunk.items.size === 0) continue;
+
+    const sorted = [...chunk.items.values()].sort((a, b) => a.number - b.number);
+    const path = chunkPath(slug, chunk.start, chunk.end);
+
+    const result = await githubCommitFile(
+      env,
+      path,
+      serializeChunk(sorted),
+      `feat(streams): batch ${chunk.start}-${chunk.end} for ${slug}`
+    );
+
+    if (!result.ok) {
+      await ctx.api
+        .editMessageText(
+          chatId,
+          loadingMsgId,
+          `❌ <b>Gagal push</b>\n\n` +
+            `File: <code>${escapeHtml(path)}</code>\n` +
+            `<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+
+    committed.push({ path, sha: result.sha, count: sorted.length });
+  }
+
+  if (committed.length === 0 && added.length === 0) {
     await ctx.api
       .editMessageText(
         chatId,
@@ -559,101 +583,65 @@ async function execBatchWizard(
     return;
   }
 
-  const minEp = first.number;
-  const maxEp = last.number;
-  const combinedJson = JSON.stringify(merged, null, 2) + '\n';
-  const totalUrls = merged.reduce(
-    (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
-    0
-  );
+  const lines: string[] = [];
+  lines.push(`✅ <b>Batch ${rangeStart}-${rangeEnd} selesai & pushed!</b>`);
+  lines.push('');
+  lines.push(`🎬 <code>${escapeHtml(slug)}</code>`);
 
-  const targetPath = `data/anime/${slug}/episodes/streams/${minEp}-${maxEp}.json`;
-
-  try {
-    const result = await githubCommitFile(
-      env,
-      targetPath,
-      combinedJson,
-      `feat(streams): batch ${minEp}-${maxEp} for ${slug}`
-    );
-
-    if (!result.ok) {
-      await ctx.api
-        .editMessageText(
-          chatId,
-          loadingMsgId,
-          `❌ <b>Gagal push</b>\n\n<code>${escapeHtml(result.error ?? 'unknown')}</code>`,
-          { parse_mode: 'HTML' }
-        )
-        .catch(() => {});
-      return;
+  if (committed.length === 1) {
+    lines.push(`📁 <code>${escapeHtml(committed[0]!.path)}</code>`);
+  } else {
+    lines.push(`📁 ${committed.length} file:`);
+    for (const c of committed) {
+      lines.push(`  • <code>${escapeHtml(c.path)}</code>`);
     }
-
-    const lines: string[] = [];
-    lines.push(`✅ <b>Batch ${minEp}-${maxEp} selesai & pushed!</b>`);
-    lines.push('');
-    lines.push(`🎬 <code>${escapeHtml(slug)}</code>`);
-    lines.push(`📁 <code>${escapeHtml(targetPath)}</code>`);
-    lines.push('');
-    lines.push(`📦 Total: <b>${merged.length}</b> ep (${minEp}-${maxEp})`);
-    lines.push(`🎬 URL: <b>${totalUrls}</b>`);
-
-    if (skipped.length > 0) {
-      lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
-    }
-    if (added.length > 0) {
-      lines.push(`➕ Baru: Ep ${added.join(', ')}`);
-    }
-
-    if (errors.length > 0) {
-      lines.push('');
-      lines.push(`⚠️ Gagal: ${errors.length} ep`);
-      for (const e of errors.slice(0, 3)) {
-        lines.push(`   • Ep ${e.number}: ${escapeHtml(e.error.slice(0, 60))}`);
-      }
-    }
-
-    lines.push('');
-    lines.push(`🔗 Commit: <code>${result.sha?.slice(0, 7) ?? '?'}</code>`);
-    lines.push('');
-    lines.push('<i>Lanjut range berikutnya? Slug & source tetap.</i>');
-
-    await ctx.api
-      .editMessageText(chatId, loadingMsgId, lines.join('\n'), {
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: new InlineKeyboard()
-          .text('🔄 Range Baru', 'bw:next')
-          .text('➕ Anime Baru', 'bw:start')
-          .row()
-          .text('🏠 Close', 'bw:close'),
-      })
-      .catch(() => {});
-
-    // Retain slug + source, reset range
-    const nextState: WizardState = {
-      step: 'awaiting_range',
-      slug: state.slug,
-      sourceUrl: state.sourceUrl,
-      sourceSite: state.sourceSite,
-      sourceSlug: state.sourceSlug,
-      customPattern: state.customPattern,
-      rangeStart: null,
-      rangeEnd: null,
-    };
-    await setCache(env.DB, `bw:${userId}`, nextState, WIZARD_TTL_MS);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'unknown';
-    console.error('[BatchWizard] push failed:', err);
-    await ctx.api
-      .editMessageText(
-        chatId,
-        loadingMsgId,
-        `❌ <b>Error:</b> <code>${escapeHtml(msg.slice(0, 300))}</code>`,
-        { parse_mode: 'HTML' }
-      )
-      .catch(() => {});
   }
+
+  lines.push('');
+  if (added.length > 0) lines.push(`➕ Baru: Ep ${added.join(', ')}`);
+  if (skipped.length > 0) lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
+
+  if (errors.length > 0) {
+    lines.push('');
+    lines.push(`⚠️ Gagal: ${errors.length} ep`);
+    for (const e of errors.slice(0, 3)) {
+      lines.push(`   • Ep ${e.number}: ${escapeHtml(e.error.slice(0, 60))}`);
+    }
+  }
+
+  const lastCommit = committed[committed.length - 1];
+  if (lastCommit?.sha) {
+    lines.push('');
+    lines.push(`🔗 Commit: <code>${lastCommit.sha.slice(0, 7)}</code>`);
+  }
+
+  lines.push('');
+  lines.push('<i>Lanjut range berikutnya? Slug & source tetap.</i>');
+
+  await ctx.api
+    .editMessageText(chatId, loadingMsgId, lines.join('\n'), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard()
+        .text('🔄 Range Baru', 'bw:next')
+        .text('➕ Anime Baru', 'bw:start')
+        .row()
+        .text('🏠 Close', 'bw:close'),
+    })
+    .catch(() => {});
+
+  // Retain slug + source, reset range
+  const nextState: WizardState = {
+    step: 'awaiting_range',
+    slug: state.slug,
+    sourceUrl: state.sourceUrl,
+    sourceSite: state.sourceSite,
+    sourceSlug: state.sourceSlug,
+    customPattern: state.customPattern,
+    rangeStart: null,
+    rangeEnd: null,
+  };
+  await setCache(env.DB, `bw:${userId}`, nextState, WIZARD_TTL_MS);
 }
 
 export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
