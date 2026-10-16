@@ -23,6 +23,7 @@ import {
 } from '../lib/episode-chunks';
 
 const WIZARD_TTL_MS = 15 * 60 * 1000;
+const FETCH_CONCURRENCY = 3;
 
 type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
 type WizardSite = SiteKey | 'custom';
@@ -79,10 +80,6 @@ function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
   );
 }
 
-/**
- * Merge streams: existing + incoming, dedup by URL per quality.
- * Existing dipertahankan, server baru di-append.
- */
 function mergeStreams(
   existing: EpisodeStream[] | undefined,
   incoming: EpisodeStream[]
@@ -409,9 +406,6 @@ async function handleWizardSource(
   return true;
 }
 
-/**
- * Hitung berapa episode di range yang sudah punya streams valid.
- */
 async function countExistingInRange(
   env: Env,
   slug: string,
@@ -419,7 +413,10 @@ async function countExistingInRange(
   end: number
 ): Promise<number> {
   const chunkKeys = new Set<string>();
-  const chunks = new Map<string, { start: number; end: number; items: Map<number, EpisodeChunkItem> }>();
+  const chunks = new Map<
+    string,
+    { start: number; end: number; items: Map<number, EpisodeChunkItem> }
+  >();
 
   for (let n = start; n <= end; n++) {
     const { start: cs, end: ce } = chunkRange(n);
@@ -503,7 +500,6 @@ async function handleWizardRange(
       : (state.sourceSlug ?? '-');
 
   if (existingCount === 0) {
-    // Tidak ada existing → langsung ready, mode overwrite (efek sama dengan skip)
     state.step = 'ready';
     state.mode = 'overwrite';
     await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
@@ -527,7 +523,6 @@ async function handleWizardRange(
     return true;
   }
 
-  // Ada existing → minta user pilih mode
   state.step = 'choose_mode';
   await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
 
@@ -558,6 +553,37 @@ async function handleWizardRange(
     }
   );
   return true;
+}
+
+/**
+ * Fetch 1 episode via proxy. Return EpisodeObject atau error.
+ */
+async function fetchOneEpisode(
+  env: Env,
+  epUrl: string,
+  epNumber: number
+): Promise<{ number: number; episode: EpisodeObject | null; error?: string }> {
+  const { body, debug } = await fetchUrlViaProxy(env, epUrl);
+
+  if (!body) {
+    return { number: epNumber, episode: null, error: debug.error ?? 'fetch failed' };
+  }
+
+  const sourceType: 'base64' | 'html' = looksLikeHtml(body) ? 'html' : 'base64';
+  const processed = decodeInput(body, sourceType);
+
+  if (!processed) {
+    return {
+      number: epNumber,
+      episode: null,
+      error: `no video URLs (${body.length} char)`,
+    };
+  }
+
+  return {
+    number: epNumber,
+    episode: buildEpisodeObject(processed.videos, epNumber),
+  };
 }
 
 async function execBatchWizard(
@@ -654,58 +680,74 @@ async function execBatchWizard(
   const modeLabel =
     mode === 'skip' ? '⏭️ skip' : mode === 'overwrite' ? '🔁 timpa' : '➕ merge';
 
-  /* ── Fetch loop ── */
-  const errors: { number: number; error: string }[] = [];
-  const added: number[] = [];
-  const merged: number[] = [];
-  const overwritten: number[] = [];
+  /* ── Tentukan episode yang perlu di-fetch ── */
+  const episodesToFetch: number[] = [];
   const skipped: number[] = [];
 
   for (let n = rangeStart; n <= rangeEnd; n++) {
     const { start, end } = chunkRange(n);
     const chunk = affectedChunks.get(`${start}-${end}`)!;
-
     const existingItem = chunk.items.get(n);
     const hasStreams = hasValidStreams(existingItem);
 
-    // Skip kalau mode skip & sudah ada streams
     if (hasStreams && mode === 'skip') {
       skipped.push(n);
       continue;
     }
+    episodesToFetch.push(n);
+  }
+
+  /* ── Fetch paralel dengan concurrency limit ── */
+  const epResults = new Map<number, EpisodeObject>();
+  const errors: { number: number; error: string }[] = [];
+
+  const fetchQueue = [...episodesToFetch];
+  let processed = 0;
+
+  while (fetchQueue.length > 0) {
+    const batch = fetchQueue.splice(0, FETCH_CONCURRENCY);
 
     await ctx.api
       .editMessageText(
         chatId,
         loadingMsgId,
         `📦 <b>Batch ${rangeStart}-${rangeEnd}</b> (${modeLabel})\n\n` +
-          `⏳ [${n - rangeStart + 1}/${total}] Episode ${n}...`,
+          `⏳ [${processed + 1}-${processed + batch.length}/${episodesToFetch.length}] Episode ${batch.join(', ')}...`,
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
       )
       .catch(() => {});
 
-    const epUrl = epUrlBuilder(n);
-    const { body, debug } = await fetchUrlViaProxy(env, epUrl);
+    const results = await Promise.all(
+      batch.map((n) => fetchOneEpisode(env, epUrlBuilder(n), n))
+    );
 
-    if (!body) {
-      errors.push({ number: n, error: debug.error ?? 'fetch failed' });
-      continue;
+    for (const r of results) {
+      if (r.episode) {
+        epResults.set(r.number, r.episode);
+      } else {
+        errors.push({ number: r.number, error: r.error ?? 'unknown' });
+      }
     }
 
-    const sourceType: 'base64' | 'html' = looksLikeHtml(body) ? 'html' : 'base64';
-    const processed = decodeInput(body, sourceType);
-    if (!processed) {
-      errors.push({ number: n, error: `no video URLs (${body.length} char)` });
-      continue;
-    }
+    processed += batch.length;
+  }
 
-    const epObj: EpisodeObject = buildEpisodeObject(processed.videos, n);
+  /* ── Merge & commit per chunk ── */
+  const added: number[] = [];
+  const merged: number[] = [];
+  const overwritten: number[] = [];
+  const changedEpisodes = new Set<number>();
+
+  for (const [n, epObj] of epResults) {
+    const { start, end } = chunkRange(n);
+    const chunk = affectedChunks.get(`${start}-${end}`)!;
+    const existingItem = chunk.items.get(n);
+    const hasStreams = hasValidStreams(existingItem);
 
     let finalStreams: EpisodeStream[];
     if (mode === 'merge') {
       finalStreams = mergeStreams(existingItem?.streams, epObj.streams);
     } else {
-      // skip & overwrite: pakai streams baru saja
       finalStreams = epObj.streams;
     }
 
@@ -718,6 +760,8 @@ async function execBatchWizard(
       downloads: existingItem?.downloads,
     });
 
+    changedEpisodes.add(n);
+
     if (hasStreams) {
       if (mode === 'overwrite') overwritten.push(n);
       else if (mode === 'merge') merged.push(n);
@@ -726,13 +770,7 @@ async function execBatchWizard(
     }
   }
 
-  /* ── Commit chunk yang berubah ── */
   const committed: { path: string; sha?: string; count: number }[] = [];
-  const changedEpisodes = new Set<number>([
-    ...added,
-    ...merged,
-    ...overwritten,
-  ]);
 
   for (const chunk of affectedChunks.values()) {
     const changedInChunk = [...chunk.items.keys()].filter((n) =>
@@ -767,12 +805,12 @@ async function execBatchWizard(
     committed.push({ path, sha: result.sha, count: sorted.length });
   }
 
-  /* ── Kalau tidak ada perubahan & tidak ada skip ── */
   if (
     added.length === 0 &&
     merged.length === 0 &&
     overwritten.length === 0 &&
-    skipped.length === 0
+    skipped.length === 0 &&
+    errors.length === 0
   ) {
     await ctx.api
       .editMessageText(
@@ -812,8 +850,7 @@ async function execBatchWizard(
   lines.push('');
   if (added.length > 0) lines.push(`➕ Baru: Ep ${added.join(', ')}`);
   if (merged.length > 0) lines.push(`🔀 Merge: Ep ${merged.join(', ')}`);
-  if (overwritten.length > 0)
-    lines.push(`🔁 Timpa: Ep ${overwritten.join(', ')}`);
+  if (overwritten.length > 0) lines.push(`🔁 Timpa: Ep ${overwritten.join(', ')}`);
   if (skipped.length > 0) lines.push(`⏭️ Skip: Ep ${skipped.join(', ')}`);
 
   if (errors.length > 0) {
@@ -845,7 +882,6 @@ async function execBatchWizard(
     })
     .catch(() => {});
 
-  // Retain slug + source, reset range + mode
   const nextState: WizardState = {
     step: 'awaiting_range',
     slug: state.slug,
