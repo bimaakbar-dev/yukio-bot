@@ -2,10 +2,8 @@
 import type { Env } from '../../types/env';
 import type { EpisodeObject } from '../../types/anime';
 import {
-  githubCommitMultipleFiles,
   githubCommitFile,
   githubGetFile,
-  type FileToCommit,
 } from '../github';
 import {
   listTrackedAnime,
@@ -26,58 +24,15 @@ import {
   fetchLatestEpisodeNumberCustom,
   fetchEpisodeCustom,
 } from './fetcher';
+import {
+  chunkRange,
+  chunkPath,
+  readEpisodeChunk,
+  serializeChunk,
+  type EpisodeChunkItem,
+} from '../episode-chunks';
 
 const MAX_ANIME_PER_RUN = 5;
-
-function chunkPath(slug: string, start: number, end: number): string {
-  return `data/anime/${slug}/episodes/streams/${start}-${end}.json`;
-}
-
-interface ChunkResult {
-  newPath: string;
-  oldPath: string | null;
-  newContent: string;
-}
-
-async function buildNewChunk(
-  env: Env,
-  slug: string,
-  newEpisode: EpisodeObject,
-  currentChunkStart: number,
-  currentChunkEnd: number
-): Promise<ChunkResult | null> {
-  const currentCount =
-    currentChunkStart === 0 ? 0 : currentChunkEnd - currentChunkStart + 1;
-  const isNewChunk = currentCount >= 6 || currentChunkStart === 0;
-
-  const newChunkStart = isNewChunk ? newEpisode.number : currentChunkStart;
-  const newChunkEnd = newEpisode.number;
-
-  const oldPath = isNewChunk ? null : chunkPath(slug, currentChunkStart, currentChunkEnd);
-  const newPath = chunkPath(slug, newChunkStart, newChunkEnd);
-
-  let existing: EpisodeObject[] = [];
-  if (!isNewChunk && oldPath) {
-    try {
-      const file = await githubGetFile(env, oldPath);
-      if (file) {
-        const parsed = JSON.parse(file.content);
-        if (Array.isArray(parsed)) existing = parsed as EpisodeObject[];
-      }
-    } catch (err) {
-      console.warn('[Runner] fetch old stream chunk failed:', err);
-      return null;
-    }
-  }
-
-  const merged = [...existing, newEpisode].sort((a, b) => a.number - b.number);
-
-  return {
-    newPath,
-    oldPath,
-    newContent: JSON.stringify(merged, null, 2) + '\n',
-  };
-}
 
 async function updateYukioDataMd(
   env: Env,
@@ -101,7 +56,7 @@ async function updateYukioDataMd(
 
     if (/^updatedAt:\s*.+$/m.test(fm)) {
       fm = fm.replace(/^updatedAt:\s*.+$/m, `updatedAt: "${today}"`);
-    } else if (/^addedAt:\s*.+$/m.test(fm)) {
+    } else if (/^addedAt:\s+.+$/m.test(fm)) {
       fm = fm.replace(/^(addedAt:\s*.+)$/m, `$1\nupdatedAt: "${today}"`);
     } else {
       fm = fm.trimEnd() + `\naddedAt: "${today}"\nupdatedAt: "${today}"`;
@@ -158,6 +113,47 @@ async function fetchEpisodeForRow(
   return fetchEpisode(env, usedSite as SiteKey, row.source_slug, epNumber);
 }
 
+/**
+ * Tulis satu episode baru ke chunk yang tepat.
+ * Path & format via lib/episode-chunks (kompatibel dengan web qimochi).
+ * Merge dengan existing — field lain (title, aired, duration) yang sudah ada
+ * dari publisher di-preserve.
+ */
+async function commitEpisodeToChunk(
+  env: Env,
+  slug: string,
+  epNumber: number,
+  episode: EpisodeObject
+): Promise<{ ok: boolean; path: string; sha?: string; error?: string }> {
+  const { start, end } = chunkRange(epNumber);
+  const existing = await readEpisodeChunk(env, slug, start, end);
+
+  const map = new Map<number, EpisodeChunkItem>();
+  for (const item of existing) map.set(item.number, item);
+
+  const prev = map.get(epNumber) ?? { number: epNumber };
+  map.set(epNumber, {
+    number: epNumber,
+    title: prev.title,
+    aired: prev.aired,
+    duration: prev.duration,
+    streams: episode.streams,
+    downloads: prev.downloads,
+  });
+
+  const sorted = [...map.values()].sort((a, b) => a.number - b.number);
+  const path = chunkPath(slug, start, end);
+
+  const result = await githubCommitFile(
+    env,
+    path,
+    serializeChunk(sorted),
+    `feat(streams): add ep ${epNumber} for ${slug}`
+  );
+
+  return { ok: result.ok, path, sha: result.sha, error: result.error };
+}
+
 async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessResult> {
   const { slug } = row;
 
@@ -205,27 +201,9 @@ async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessR
       break;
     }
 
-    const chunk = await buildNewChunk(env, slug, episode, currentChunkStart, currentChunkEnd);
-    if (!chunk) {
-      lastError = `Gagal build chunk untuk ep ${ep}`;
-      break;
-    }
-
-    const chunkFiles: FileToCommit[] = [
-      { path: chunk.newPath, content: chunk.newContent },
-    ];
-    if (chunk.oldPath) {
-      chunkFiles.push({ path: chunk.oldPath, content: null });
-    }
-
-    const chunkCommit = await githubCommitMultipleFiles(
-      env,
-      chunkFiles,
-      `feat(streams): add ep ${ep} for ${slug}`
-    );
-
+    const chunkCommit = await commitEpisodeToChunk(env, slug, ep, episode);
     if (!chunkCommit.ok) {
-      lastError = `Commit streams gagal untuk ep ${ep}: ${chunkCommit.error ?? 'unknown'}`;
+      lastError = `Commit chunk gagal untuk ep ${ep}: ${chunkCommit.error ?? 'unknown'}`;
       break;
     }
 
