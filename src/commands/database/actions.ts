@@ -11,16 +11,19 @@ import {
   githubDeleteFile,
   githubListDir,
 } from '../../lib/github';
+
 import {
   getCmsIndex,
   invalidateCmsIndex,
   type CmsIndex,
 } from '../../lib/cms-cache';
+
 import {
   splitContent,
   getFrontmatterField,
   applyEdits,
 } from '../../lib/content-editor';
+
 import {
   EDIT_FIELDS,
   findField,
@@ -205,7 +208,7 @@ export async function showSlugPrompt(
       ctx.callbackQuery!.message!.message_id!,
       '🔍 <b>Cari Anime</b>\n\n' +
         'Kirim <b>slug</b> anime.\n' +
-        '<i>Contoh: <code>jujutsu-kaisen</code></i>',
+        '<i>Contoh: <code>nama-anime</code></i>',
       {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
@@ -243,8 +246,8 @@ export async function handleSlugInput(
 
   if (!file) {
     await ctx.reply(
-      `❌ <b>Slug tidak ditemukan</b>\n\n` +
-        `<code>${escapeHtml(slug)}</code> belum ada di yukio-data.\n\n` +
+        `❌ <b>Slug tidak ditemukan</b>\n\n` +
+        `<code>${escapeHtml(slug)}</code> belum ada di data repo.\n\n` +
         `<i>Pakai /anime untuk tambah baru.</i>`,
       {
         parse_mode: 'HTML',
