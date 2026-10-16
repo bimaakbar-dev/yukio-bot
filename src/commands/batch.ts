@@ -618,7 +618,6 @@ async function execBatchWizard(
 
   const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
   const chatId = ctx.chat!.id;
-  const total = rangeEnd - rangeStart + 1;
 
   /* ── Build URL builder ── */
   let epUrlBuilder: (n: number) => string;
