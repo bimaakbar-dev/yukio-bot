@@ -323,3 +323,9 @@ export async function githubCommitMultipleFiles(
     backupErrors: backupErrors.length > 0 ? backupErrors : undefined,
   };
 }
+
+export function getRepoLabel(env: Env): string {
+  const primary = env.YUKIO_DATA_REPO?.split('/')[1] ?? 'data-repo';
+  const backup = env.YUKIO_BACKUP_REPO?.trim().split('/')[1] ?? '';
+  return backup ? `${primary} + ${backup}` : primary;
+}
