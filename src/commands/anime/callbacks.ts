@@ -56,8 +56,10 @@ import {
   clearTrackedSession,
   type Tracker,
 } from '../../lib/telegram-utils';
+
 import { buildPublishKeyboard } from './ui';
 import { publishAnime } from './publisher';
+import { getRepoLabel } from '../../lib/github';
 
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
@@ -209,7 +211,6 @@ async function handleMetadataMerge(
 }
 
 export function setupAnimeCallbacks(bot: Bot, env: Env): void {
-  /* ── Part characters ── */
   bot.callbackQuery(/^an:cp:(\d+):(q_[a-f0-9]+)$/, async (ctx) => {
     const partIndex = parseInt(ctx.match[1] ?? '0', 10);
     const sessionId = ctx.match[2]!;
@@ -257,7 +258,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     await markPartSent(env.DB, sessionId, partIndex);
   });
 
-  /* ── Main actions ── */
   bot.callbackQuery(
     /^an:(ms|mk|mo|m|c|e|f|s|v|x|pub|push):(q_[a-f0-9]+)$/,
     async (ctx) => {
@@ -278,7 +278,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      /* Cancel */
       if (action === 'x') {
         await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
         const chatId = ctx.chat?.id;
@@ -291,19 +290,21 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      /* Show publish confirmation */
       if (action === 'pub') {
         await ctx.answerCallbackQuery({ text: '📤 Menyiapkan...' });
 
         const charCache = await getCharCache(env.DB, sessionId);
         const epCache = await getEpCache(env.DB, sessionId);
 
+        const repoLabel = escapeHtml(getRepoLabel(env));
         const lines: string[] = [];
+        
         lines.push('📋 <b>Preview Publish</b>');
         lines.push('');
         lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
         lines.push('');
-        lines.push(`📄 Metadata → <b>yukio-data</b>`);
+        lines.push(`📄 Metadata → <b>${repoLabel}</b>`);
+        
         if (charCache && charCache.total > 0) {
           lines.push(`👥 Characters (${charCache.total})`);
         }
@@ -325,7 +326,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
-      /* Execute publish */
       if (action === 'push') {
         await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
 
@@ -352,7 +352,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
 
           const short = result.sha?.slice(0, 7) ?? '?';
           const lines: string[] = [];
-          lines.push('✅ <b>Published ke yukio-data!</b>');
+          lines.push(`✅ <b>Published ke ${escapeHtml(getRepoLabel(env))}!</b>`);
           lines.push('');
           lines.push(`🆔 <code>${escapeHtml(result.slug)}</code>`);
           lines.push(`📦 ${result.filesCount} file`);
