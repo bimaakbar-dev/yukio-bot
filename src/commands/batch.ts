@@ -4,6 +4,7 @@ import type { Context } from 'grammy';
 import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { EpisodeObject } from '../types/anime';
+import type { SiteKey } from '../lib/cron/state';
 import { getCache, setCache, deleteCache } from '../lib/cache';
 import { githubCommitFile, githubGetFile } from '../lib/github';
 import {
@@ -26,7 +27,6 @@ const WIZARD_TTL_MS = 15 * 60 * 1000;
 const FETCH_CONCURRENCY = 3;
 const MAX_SERVERS_PER_QUALITY = 30;
 
-type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
 type WizardSite = SiteKey | 'custom';
 type BatchMode = 'skip' | 'overwrite' | 'merge';
 
@@ -71,8 +71,16 @@ type ParsedSource =
   | { kind: 'known'; site: SiteKey; slug: string }
   | { kind: 'custom'; pattern: string; host: string };
 
+/**
+ * Fingerprint URL untuk dedup yang lebih pintar.
+ *
+ * Contoh:
+ *   https://video.sumantritelnologi.workers.dev/https://desustream.net/abc?x=1
+ *   → https://desustream.net/abc?x=1
+ */
 function fingerprintUrl(url: string): string {
   let u = url.trim();
+
   const proxyMatch = u.match(/\.workers\.dev\/+(https?:\/\/.+)$/i);
   if (proxyMatch?.[1]) u = proxyMatch[1];
 
@@ -206,7 +214,7 @@ function parseSourceUrl(url: string): ParsedSource | null {
       const slug = u.pathname.match(/\/tonton\/([^/]+)/)?.[1];
       if (slug) return { kind: 'known', site: 'animesub', slug };
     }
-        if (host.includes('samehadaku')) {
+    if (host.includes('samehadaku')) {
       const s1 = u.pathname.match(/\/anime\/([^/]+)/)?.[1];
       if (s1) return { kind: 'known', site: 'samehadaku', slug: s1 };
       const s2 = u.pathname.match(
@@ -346,6 +354,7 @@ async function handleWizardSlug(
       `<b>Step 2/3</b> · Kirim <b>URL source</b>.\n\n` +
       `🎬 Repo: <code>${escapeHtml(slug)}</code>\n\n` +
       `<b>A. Situs dikenal (slug otomatis):</b>\n` +
+      `• <code>https://komikcast.info/anime/{slug}</code>\n` +
       `• <code>https://lexanime.web.id/tonton/{slug}/</code>\n` +
       `• <code>https://animesub.web.id/tonton/{slug}/</code>\n` +
       `• <code>https://samehadaku.li/anime/{slug}/</code>\n\n` +
@@ -377,6 +386,7 @@ async function handleWizardSource(
     await ctx.reply(
       '❌ URL tidak dikenali.\n\n' +
         '<b>Situs dikenal:</b>\n' +
+        '• <code>https://komikcast.info/anime/{slug}</code>\n' +
         '• <code>https://lexanime.web.id/tonton/{slug}/</code>\n' +
         '• <code>https://animesub.web.id/tonton/{slug}/</code>\n' +
         '• <code>https://samehadaku.li/anime/{slug}/</code>\n\n' +
