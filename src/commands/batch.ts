@@ -24,6 +24,7 @@ import {
 
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 const FETCH_CONCURRENCY = 3;
+const MAX_SERVERS_PER_QUALITY = 30;
 
 type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
 type WizardSite = SiteKey | 'custom';
@@ -66,6 +67,37 @@ type ParsedSource =
   | { kind: 'known'; site: SiteKey; slug: string }
   | { kind: 'custom'; pattern: string; host: string };
 
+/**
+ * Bangun fingerprint dari URL untuk dedup yang lebih pintar.
+ *
+ * Contoh:
+ *   https://video.sumantritelnologi.workers.dev/https://desustream.net/abc?x=1
+ *   → https://desustream.net/abc?x=1
+ *
+ * URL biasa (tanpa proxy) tetap seperti aslinya, tapi di-normalize:
+ * - lowercase hostname
+ * - strip trailing slash
+ * - drop fragment (#xxx)
+ */
+function fingerprintUrl(url: string): string {
+  let u = url.trim();
+
+  // Strip proxy wrapper: <host>/<inner https url>
+  const proxyMatch = u.match(/\.workers\.dev\/+(https?:\/\/.+)$/i);
+  if (proxyMatch?.[1]) u = proxyMatch[1];
+
+  try {
+    const parsed = new URL(u);
+    parsed.hash = '';
+    // Normalize trailing slash di pathname
+    let path = parsed.pathname;
+    if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${path}${parsed.search}`;
+  } catch {
+    return u;
+  }
+}
+
 function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
   if (!item) return false;
   if (!Array.isArray(item.streams)) return false;
@@ -80,17 +112,26 @@ function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
   );
 }
 
+/**
+ * Merge streams: existing + incoming.
+ * Dedup by URL fingerprint per quality.
+ * Cap jumlah server per quality.
+ */
 function mergeStreams(
   existing: EpisodeStream[] | undefined,
   incoming: EpisodeStream[]
 ): EpisodeStream[] {
-  const byQuality = new Map<string, Map<string, { name: string; url: string }>>();
+  const byQuality = new Map<
+    string,
+    Map<string, { name: string; url: string }>
+  >();
 
   const addServer = (quality: string, name: string, url: string): void => {
     if (!byQuality.has(quality)) byQuality.set(quality, new Map());
     const map = byQuality.get(quality)!;
-    if (!map.has(url)) {
-      map.set(url, { name, url });
+    const fp = fingerprintUrl(url);
+    if (!map.has(fp)) {
+      map.set(fp, { name, url });
     }
   };
 
@@ -113,7 +154,11 @@ function mergeStreams(
   const result: EpisodeStream[] = [];
   for (const [quality, servers] of byQuality) {
     if (servers.size === 0) continue;
-    result.push({ quality, servers: [...servers.values()] });
+    let list = [...servers.values()];
+    if (list.length > MAX_SERVERS_PER_QUALITY) {
+      list = list.slice(0, MAX_SERVERS_PER_QUALITY);
+    }
+    result.push({ quality, servers: list });
   }
 
   const rank = (q: string): number => {
@@ -555,9 +600,6 @@ async function handleWizardRange(
   return true;
 }
 
-/**
- * Fetch 1 episode via proxy. Return EpisodeObject atau error.
- */
 async function fetchOneEpisode(
   env: Env,
   epUrl: string,
@@ -619,7 +661,6 @@ async function execBatchWizard(
   const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
   const chatId = ctx.chat!.id;
 
-  /* ── Build URL builder ── */
   let epUrlBuilder: (n: number) => string;
 
   if (sourceSite === 'custom') {
@@ -654,7 +695,6 @@ async function execBatchWizard(
       `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
   }
 
-  /* ── Kumpulkan chunk yang terpengaruh range ── */
   const affectedChunks = new Map<
     string,
     { start: number; end: number; items: Map<number, EpisodeChunkItem> }
@@ -668,7 +708,6 @@ async function execBatchWizard(
     }
   }
 
-  /* ── Baca existing tiap chunk sekali ── */
   for (const chunk of affectedChunks.values()) {
     const existing = await readEpisodeChunk(env, slug, chunk.start, chunk.end);
     for (const item of existing) {
@@ -679,7 +718,6 @@ async function execBatchWizard(
   const modeLabel =
     mode === 'skip' ? '⏭️ skip' : mode === 'overwrite' ? '🔁 timpa' : '➕ merge';
 
-  /* ── Tentukan episode yang perlu di-fetch ── */
   const episodesToFetch: number[] = [];
   const skipped: number[] = [];
 
@@ -696,7 +734,6 @@ async function execBatchWizard(
     episodesToFetch.push(n);
   }
 
-  /* ── Fetch paralel dengan concurrency limit ── */
   const epResults = new Map<number, EpisodeObject>();
   const errors: { number: number; error: string }[] = [];
 
@@ -731,7 +768,6 @@ async function execBatchWizard(
     processed += batch.length;
   }
 
-  /* ── Merge & commit per chunk ── */
   const added: number[] = [];
   const merged: number[] = [];
   const overwritten: number[] = [];
@@ -822,7 +858,6 @@ async function execBatchWizard(
     return;
   }
 
-  /* ── Susun pesan hasil ── */
   const lines: string[] = [];
 
   if (committed.length > 0) {
