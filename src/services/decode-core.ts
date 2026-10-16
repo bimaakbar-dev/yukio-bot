@@ -88,11 +88,6 @@ export interface RawEntry {
   base64?: string;
   url?: string;
   label: string | null;
-  /**
-   * True kalau entry berasal dari parser yang sangat spesifik
-   * (Next.js Flight payload / Inertia data-page). URL dijamin embed video,
-   * jadi bypass filter isVideoUrl.
-   */
   trusted?: boolean;
 }
 
@@ -100,10 +95,6 @@ export interface ResolvedEntry {
   url: string;
   resolution: string | null;
   server: string | null;
-  /**
-   * True kalau entry datang dari parser trusted. Bypass filter isVideoUrl
-   * di output final.
-   */
   trusted?: boolean;
 }
 
@@ -407,8 +398,9 @@ export function multiLayerDecode(input: string): DecodeResult | null {
    Inertia data-page parser
    - Kompatibel dengan lexanime, komikcast.info, dan situs lain
      yang pakai Inertia.js (data-page="...")
-   - Support field provider/quality eksplisit DAN field `label`
-     gabungan (misal "otakuwatch3 480p" / "mega 720p").
+   - HANYA ambil dari props.episode (episode yang sedang dibuka).
+     JANGAN loop props.anime.episodes — itu berisi SEMUA episode
+     dan menyebabkan cross-contamination.
    ============================================================ */
 
 interface InertiaMirrorStream {
@@ -470,11 +462,9 @@ function normalizeInertiaStream(s: InertiaMirrorStream): {
   if (!url || typeof url !== 'string') return null;
   if (!/^https?:\/\//i.test(url)) return null;
 
-  // Prioritas 1: field provider/quality eksplisit
   let provider = (s.provider ?? '').trim();
   let quality = (s.quality ?? '').trim();
 
-  // Prioritas 2: field `label` gabungan
   if ((!provider || !quality) && typeof s.label === 'string' && s.label.trim()) {
     const parsed = splitLabel(s.label);
     if (!provider) provider = parsed.provider;
@@ -505,22 +495,26 @@ function extractInertiaEmbeds(html: string): RawEntry[] {
       continue;
     }
 
-    const episodes: InertiaEpisode[] = [];
-    const direct = data.props?.episode;
-    if (direct && Array.isArray(direct.mirror_streams)) episodes.push(direct);
-    const list = data.props?.anime?.episodes;
-    if (Array.isArray(list)) episodes.push(...list);
+    /*
+     * PENTING: HANYA ambil dari props.episode (episode yang sedang dibuka).
+     *
+     * props.anime.episodes berisi SEMUA episode dalam 1 anime — masing-masing
+     * dengan mirror_streams-nya sendiri. Kalau di-loop, semua stream dari
+     * semua episode akan tercampur ke episode yang sedang dibuka.
+     *
+     * Contoh komikcast.info: props.anime.episodes punya 24 episode, dan
+     * kalau semuanya di-extract, episode 1 akan punya ~96 server (URL dari
+     * 24 episode × 4 server). Itu yang bikin "kotak Pandora".
+     */
+    const current = data.props?.episode;
+    if (!current || !Array.isArray(current.mirror_streams)) continue;
 
-    for (const ep of episodes) {
-      if (!Array.isArray(ep.mirror_streams)) continue;
-      for (const s of ep.mirror_streams) {
-        const norm = normalizeInertiaStream(s);
-        if (!norm) continue;
-        if (seen.has(norm.url)) continue;
-        seen.add(norm.url);
-
-        out.push({ url: norm.url, label: norm.label, trusted: true });
-      }
+    for (const s of current.mirror_streams) {
+      const norm = normalizeInertiaStream(s);
+      if (!norm) continue;
+      if (seen.has(norm.url)) continue;
+      seen.add(norm.url);
+      out.push({ url: norm.url, label: norm.label, trusted: true });
     }
   }
   return out;
@@ -677,7 +671,6 @@ export function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
 
   const final: ResolvedEntry[] = [];
 
-  // Pass 1: trusted entries + entries yang lolos isVideoUrl
   for (const [url, info] of resolved) {
     if (info.trusted || isVideoUrl(url)) {
       final.push({
@@ -689,7 +682,6 @@ export function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
     }
   }
 
-  // Pass 2: fallback — semua resolved kalau pass 1 kosong
   if (final.length === 0) {
     for (const [url, info] of resolved) {
       final.push({
@@ -701,7 +693,6 @@ export function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
     }
   }
 
-  // Pass 3: fallback terakhir — unresolved
   if (final.length === 0) {
     for (const [url, info] of unresolved) {
       final.push({
@@ -903,6 +894,13 @@ export function resolveCustomPattern(
   return null;
 }
 
+/**
+ * Extract episode numbers — khusus untuk fungsi auto-detect latest
+ * episode di cron. Di sini kita MEMANG butuh semua episode number
+ * dari props.anime.episodes (untuk tahu episode terbaru yang ada).
+ *
+ * Jangan pakai fungsi ini untuk mengumpulkan streams.
+ */
 export function extractInertiaEpisodeNumbers(html: string): number[] {
   const numbers: number[] = [];
   const seen = new Set<number>();
