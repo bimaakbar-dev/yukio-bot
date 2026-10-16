@@ -5,7 +5,7 @@ import { InlineKeyboard, type Bot } from 'grammy';
 import type { Env } from '../types/env';
 import type { EpisodeObject } from '../types/anime';
 import { getCache, setCache, deleteCache } from '../lib/cache';
-import { githubCommitFile } from '../lib/github';
+import { githubCommitFile, githubGetFile } from '../lib/github';
 import {
   BATCH_MAX,
   looksLikeHtml,
@@ -13,7 +13,6 @@ import {
   buildEpisodeObject,
   fetchUrlViaProxy,
 } from '../services/decode-core';
-
 import {
   chunkRange,
   chunkPath,
@@ -61,6 +60,25 @@ const WIZARD_SITES: Record<SiteKey, SiteConfig> = {
 type ParsedSource =
   | { kind: 'known'; site: SiteKey; slug: string }
   | { kind: 'custom'; pattern: string; host: string };
+
+/**
+ * Cek apakah item episode sudah punya streams valid.
+ * Metadata-only (dari publisher /anime) dianggap BELUM punya streams.
+ */
+function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
+  if (!item) return false;
+  if (!Array.isArray(item.streams)) return false;
+  if (item.streams.length === 0) return false;
+
+  // Pastikan minimal 1 stream punya minimal 1 server dengan URL valid.
+  return item.streams.some(
+    (s) =>
+      Array.isArray(s.servers) &&
+      s.servers.some(
+        (srv) => typeof srv.url === 'string' && srv.url.trim() !== ''
+      )
+  );
+}
 
 function resolveCustomPattern(
   input: string
@@ -216,9 +234,8 @@ async function handleWizardSlug(
     { parse_mode: 'HTML' }
   );
 
-  let file: Awaited<ReturnType<typeof import('../lib/github').githubGetFile>> = null;
+  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
   try {
-    const { githubGetFile } = await import('../lib/github');
     file = await githubGetFile(env, `src/content/anime/${slug}.md`);
   } catch (err) {
     console.error('[BatchWizard] check failed:', err);
@@ -228,7 +245,7 @@ async function handleWizardSlug(
 
   if (!file) {
     await ctx.reply(
-        `❌ <b>Slug tidak ditemukan di data repo</b>\n\n` +
+      `❌ <b>Slug tidak ditemukan di data repo</b>\n\n` +
         `Path: <code>src/content/anime/${escapeHtml(slug)}.md</code>\n\n` +
         `Coba slug lain:`,
       {
@@ -332,7 +349,7 @@ async function handleWizardSource(
       `<b>Contoh range:</b>\n` +
       `• <code>1-6</code> (ep 1 sampai 6)\n` +
       `• <code>4</code> (hanya ep 4)\n\n` +
-      `<i>Kalau file existing sudah ada (misal 1-3), bot akan skip.</i>`,
+      `<i>Episode yang sudah punya streams akan di-skip. Metadata-only akan di-fetch ulang.</i>`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -386,7 +403,7 @@ async function handleWizardRange(
       `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
       `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n` +
       `📊 Range: <b>${start}-${end}</b> (${end - start + 1} ep)\n\n` +
-      `<i>Bot akan cek file existing di <code>episodes/*.json</code>, fetch yang belum ada, lalu merge.</i>`,
+      `<i>Bot akan cek chunk existing. Episode yang sudah punya streams di-skip, yang belum akan di-fetch.</i>`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -466,7 +483,7 @@ async function execBatchWizard(
       `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
   }
 
-  /* ── Kumpulkan daftar chunk yang terpengaruh range ── */
+  /* ── Kumpulkan chunk yang terpengaruh range ── */
   const affectedChunks = new Map<
     string,
     { start: number; end: number; items: Map<number, EpisodeChunkItem> }
@@ -497,7 +514,9 @@ async function execBatchWizard(
     const { start, end } = chunkRange(n);
     const chunk = affectedChunks.get(`${start}-${end}`)!;
 
-    if (chunk.items.has(n)) {
+    // Skip HANYA kalau episode sudah punya streams valid.
+    // Metadata-only (dari /anime publisher) tetap di-fetch.
+    if (hasValidStreams(chunk.items.get(n))) {
       skipped.push(n);
       continue;
     }
@@ -528,22 +547,28 @@ async function execBatchWizard(
     }
 
     const epObj: EpisodeObject = buildEpisodeObject(processed.videos, n);
+
+    // Merge dengan existing item (kalau ada metadata) — preserve title/aired/duration.
+    const prev = chunk.items.get(n) ?? { number: n };
     chunk.items.set(n, {
       number: n,
+      title: prev.title,
+      aired: prev.aired,
+      duration: prev.duration,
       streams: epObj.streams,
+      downloads: prev.downloads,
     });
     added.push(n);
   }
 
-  /* ── Commit tiap chunk yang berubah ── */
+  /* ── Commit hanya chunk yang punya episode BARU ── */
   const committed: { path: string; sha?: string; count: number }[] = [];
 
   for (const chunk of affectedChunks.values()) {
-    // Skip chunk kalau tidak ada item baru (semua existing)
-    const hasNew = [...chunk.items.keys()].some((n) =>
-      added.includes(n) || skipped.includes(n)
+    const newInChunk = [...chunk.items.keys()].filter((n) =>
+      added.includes(n)
     );
-    if (!hasNew && chunk.items.size === 0) continue;
+    if (newInChunk.length === 0) continue;
 
     const sorted = [...chunk.items.values()].sort((a, b) => a.number - b.number);
     const path = chunkPath(slug, chunk.start, chunk.end);
@@ -572,7 +597,8 @@ async function execBatchWizard(
     committed.push({ path, sha: result.sha, count: sorted.length });
   }
 
-  if (committed.length === 0 && added.length === 0) {
+  /* ── Kalau tidak ada fetch sukses & tidak ada skip → truly failed ── */
+  if (added.length === 0 && skipped.length === 0) {
     await ctx.api
       .editMessageText(
         chatId,
@@ -584,14 +610,23 @@ async function execBatchWizard(
     return;
   }
 
+  /* ── Susun pesan hasil ── */
   const lines: string[] = [];
-  lines.push(`✅ <b>Batch ${rangeStart}-${rangeEnd} selesai & pushed!</b>`);
+
+  if (committed.length > 0) {
+    lines.push(`✅ <b>Batch ${rangeStart}-${rangeEnd} selesai & pushed!</b>`);
+  } else {
+    lines.push(`ℹ️ <b>Batch ${rangeStart}-${rangeEnd} selesai.</b>`);
+    lines.push('');
+    lines.push('<i>Semua episode sudah punya streams, tidak ada yang di-commit.</i>');
+  }
+
   lines.push('');
   lines.push(`🎬 <code>${escapeHtml(slug)}</code>`);
 
   if (committed.length === 1) {
     lines.push(`📁 <code>${escapeHtml(committed[0]!.path)}</code>`);
-  } else {
+  } else if (committed.length > 1) {
     lines.push(`📁 ${committed.length} file:`);
     for (const c of committed) {
       lines.push(`  • <code>${escapeHtml(c.path)}</code>`);
@@ -600,7 +635,7 @@ async function execBatchWizard(
 
   lines.push('');
   if (added.length > 0) lines.push(`➕ Baru: Ep ${added.join(', ')}`);
-  if (skipped.length > 0) lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
+  if (skipped.length > 0) lines.push(`⏭️ Skip (sudah ada streams): Ep ${skipped.join(', ')}`);
 
   if (errors.length > 0) {
     lines.push('');
