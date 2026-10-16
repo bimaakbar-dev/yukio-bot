@@ -56,10 +56,14 @@ import {
   clearTrackedSession,
   type Tracker,
 } from '../../lib/telegram-utils';
-
 import { buildPublishKeyboard } from './ui';
 import { publishAnime } from './publisher';
 import { getRepoLabel } from '../../lib/github';
+import {
+  markSectionSelected,
+  getSelectedSections,
+  clearSelectedSections,
+} from '../../lib/publish-selection';
 
 const AI_TIMEOUT_MS = 12000;
 const SOURCE_TIMEOUT_MS = 8000;
@@ -211,6 +215,7 @@ async function handleMetadataMerge(
 }
 
 export function setupAnimeCallbacks(bot: Bot, env: Env): void {
+  /* ── Part characters ── */
   bot.callbackQuery(/^an:cp:(\d+):(q_[a-f0-9]+)$/, async (ctx) => {
     const partIndex = parseInt(ctx.match[1] ?? '0', 10);
     const sessionId = ctx.match[2]!;
@@ -258,6 +263,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
     await markPartSent(env.DB, sessionId, partIndex);
   });
 
+  /* ── Main actions ── */
   bot.callbackQuery(
     /^an:(ms|mk|mo|m|c|e|f|s|v|x|pub|push):(q_[a-f0-9]+)$/,
     async (ctx) => {
@@ -278,11 +284,13 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
+      /* Cancel */
       if (action === 'x') {
         await ctx.answerCallbackQuery({ text: '🗑️ Membersihkan...' });
         const chatId = ctx.chat?.id;
         if (!chatId) return;
         const deleted = await clearTrackedSession(ctx.api, env.DB, chatId, sessionId);
+        await clearSelectedSections(env, sessionId);
         await deleteCharCache(env.DB, sessionId);
         await deleteEpCache(env.DB, sessionId);
         await deleteSession(env.DB, sessionId);
@@ -290,30 +298,38 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
+      /* Show publish confirmation */
       if (action === 'pub') {
         await ctx.answerCallbackQuery({ text: '📤 Menyiapkan...' });
 
+        const selected = await getSelectedSections(env, sessionId);
         const charCache = await getCharCache(env.DB, sessionId);
         const epCache = await getEpCache(env.DB, sessionId);
-
         const repoLabel = escapeHtml(getRepoLabel(env));
+
+        const mark = (key: 'characters' | 'episodes' | 'franchises') =>
+          selected.includes(key) ? '✅' : '⬜';
+
+        const charInfo =
+          charCache && charCache.total > 0 ? ` (${charCache.total})` : '';
+        const epInfo =
+          epCache && epCache.episodes.length > 0
+            ? ` (${epCache.episodes.length})`
+            : '';
+
         const lines: string[] = [];
-        
         lines.push('📋 <b>Preview Publish</b>');
         lines.push('');
         lines.push(`🎬 <code>${escapeHtml(session.title)}</code>`);
+        lines.push(`📦 Tujuan: <b>${repoLabel}</b>`);
         lines.push('');
-        lines.push(`📄 Metadata → <b>${repoLabel}</b>`);
-        
-        if (charCache && charCache.total > 0) {
-          lines.push(`👥 Characters (${charCache.total})`);
-        }
-        if (epCache && epCache.episodes.length > 0) {
-          lines.push(`🎬 Episodes (${epCache.episodes.length})`);
-        }
-        lines.push(`🔗 Franchises (auto-fetch)`);
-        lines.push(`🎤 Actors (dari DB)`);
+        lines.push('📄 Metadata — <b>selalu</b>');
+        lines.push(`${mark('characters')} 👥 Characters${charInfo}`);
+        lines.push(`${mark('episodes')} 🎬 Episodes${epInfo}`);
+        lines.push(`${mark('franchises')} 🔗 Franchises`);
         lines.push('');
+        lines.push('<i>Section tanpa ✅ tidak akan di-commit.</i>');
+        lines.push('<i>Klik section di keyboard utama untuk select.</i>');
         lines.push('<i>Klik ✅ Push untuk commit.</i>');
 
         const kb = buildPublishKeyboard(sessionId);
@@ -326,6 +342,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         return;
       }
 
+      /* Execute publish */
       if (action === 'push') {
         await ctx.answerCallbackQuery({ text: '📤 Pushing...' });
 
@@ -366,8 +383,6 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
             lines.push(`• 🎬 Episodes (${result.counts.episodes})`);
           if (result.counts.franchises > 0)
             lines.push(`• 🔗 Franchises (${result.counts.franchises})`);
-          if (result.counts.actors > 0)
-            lines.push(`• 🎤 Actors (${result.counts.actors})`);
           lines.push('');
           lines.push('⏳ Deploy ~2 menit');
 
@@ -380,6 +395,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
             .catch(() => {});
 
           // cleanup session
+          await clearSelectedSections(env, sessionId);
           await deleteCharCache(env.DB, sessionId);
           await deleteEpCache(env.DB, sessionId);
           await deleteSession(env.DB, sessionId);
@@ -437,6 +453,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         if (action === 'c') {
+          await markSectionSelected(env, sessionId, 'characters');
           const cached = await getCharCache(env.DB, sessionId);
 
           if (cached) {
@@ -515,6 +532,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         if (action === 'e') {
+          await markSectionSelected(env, sessionId, 'episodes');
           const { data: result, error } = await safeFetch(
             () => chainEpisodes(chainCtx),
             30000
@@ -560,6 +578,7 @@ export function setupAnimeCallbacks(bot: Bot, env: Env): void {
         }
 
         if (action === 'f') {
+          await markSectionSelected(env, sessionId, 'franchises');
           const { data: result, error } = await safeFetch(
             () => chainRelations(chainCtx),
             25000
