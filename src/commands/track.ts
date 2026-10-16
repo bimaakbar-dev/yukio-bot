@@ -14,7 +14,6 @@ import {
   type SiteKey,
   type TrackSite,
 } from '../lib/cron/state';
-
 import { updateTrackedAnime } from '../lib/cron/state-extra';
 import { createLazyInit } from '../lib/lazy-init';
 import {
@@ -22,10 +21,9 @@ import {
   getTrackedMessages,
   deleteTrackedMessages,
 } from '../lib/telegram-utils';
-
 import { resolveCustomPattern } from '../services/decode-core';
 
-const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku'];
+const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku', 'komikcast'];
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
 const PER_PAGE = 8;
 const SESSION_TTL_MS = 15 * 60 * 1000;
@@ -246,13 +244,29 @@ function extractSamehadakuSlug(url: string): string | null {
   return null;
 }
 
+function extractKomikcastSlug(url: string): string | null {
+  try {
+    const u = new URL(url.trim());
+    const m = u.pathname.match(/\/anime\/([^/]+)/);
+    return m?.[1]?.toLowerCase() ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function newRescanId(): string {
   return 'rc_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
 function siteLabel(site: TrackSite): string {
-  return site === 'custom' ? '🌐 Custom' : `🎬 ${site}`;
+  if (site === 'custom') return '🌐 Custom';
+  if (site === 'komikcast') return '🎬 komikcast';
+  return `🎬 ${site}`;
 }
+
+/* ============================================================
+   MENU RENDER
+   ============================================================ */
 
 export async function showMainMenu(ctx: Context, env: Env, edit = false): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
@@ -471,6 +485,10 @@ export async function showDetail(
   await ctx.reply(lines.join('\n'), payload);
 }
 
+/* ============================================================
+   EDIT PROMPT
+   ============================================================ */
+
 export async function promptEdit(
   ctx: Context,
   env: Env,
@@ -503,6 +521,7 @@ export async function promptEdit(
         .text('🎬 animesub', `tr:set:${sessionId}:animesub`)
         .row()
         .text('🎬 samehadaku', `tr:set:${sessionId}:samehadaku`)
+        .text('🎬 komikcast', `tr:set:${sessionId}:komikcast`)
         .row()
         .text('❌ Batal', `tr:v:${sh}`);
       break;
@@ -553,7 +572,7 @@ export async function promptEdit(
       break;
 
     case 'source_slug':
-      prompt = `🔗 <b>Edit Source Slug</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <code>${escapeHtml(row.source_slug)}</code>\n\nKirim slug baru, atau URL Samehadaku:`;
+      prompt = `🔗 <b>Edit Source Slug</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <code>${escapeHtml(row.source_slug)}</code>\n\nKirim slug baru${row.site === 'komikcast' ? ' atau URL komikcast' : row.site === 'samehadaku' ? ' atau URL Samehadaku' : ''}:`;
       kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
 
@@ -582,6 +601,10 @@ export async function promptEdit(
     .catch(() => {});
 }
 
+/* ============================================================
+   ADD FLOW
+   ============================================================ */
+
 export async function startAddFlow(ctx: Context, env: Env, userId: number): Promise<void> {
   const sessionId = await createSession(env.DB, userId, 'add_site');
 
@@ -591,6 +614,8 @@ export async function startAddFlow(ctx: Context, env: Env, userId: number): Prom
     '<i>Bot akan cek situs ini setiap hari untuk episode baru.</i>';
 
   const kb = new InlineKeyboard()
+    .text('🎬 komikcast', `tr:site:${sessionId}:komikcast`)
+    .row()
     .text('🎬 lexanime', `tr:site:${sessionId}:lexanime`)
     .text('🎬 animesub', `tr:site:${sessionId}:animesub`)
     .row()
@@ -615,6 +640,10 @@ export async function startAddFlow(ctx: Context, env: Env, userId: number): Prom
 
   await ctx.reply(text, payload);
 }
+
+/* ============================================================
+   CATCHUP
+   ============================================================ */
 
 export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
   const loading = await ctx.reply('🔍 Mencari anime yang tertinggal...');
@@ -725,6 +754,10 @@ export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
       .catch(() => {});
   }
 }
+
+/* ============================================================
+   RESCAN
+   ============================================================ */
 
 async function cleanupRescanSession(
   ctx: Context,
@@ -1006,6 +1039,10 @@ async function execRescan(
   }
 }
 
+/* ============================================================
+   TEXT INPUT
+   ============================================================ */
+
 export async function handleTrackTextV2(ctx: Context, env: Env): Promise<boolean> {
   const userId = ctx.from?.id;
   if (!userId) return false;
@@ -1091,10 +1128,34 @@ async function handleAddSlug(
   });
 
   const site = session.site ?? '';
-  const isSamehadaku = site === 'samehadaku';
-  const prompt = isSamehadaku
-    ? `<b>Step 3/5</b> · Slug di <b>samehadaku</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Opsi:</b>\n• URL anime Samehadaku\n• Slug langsung\n• <code>-</code> kalau sama`
-    : `<b>Step 3/5</b> · Slug di <b>${site}</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Kalau sama:</b> kirim <code>-</code>\n<b>Kalau beda:</b> kirim slug situs`;
+
+  let prompt: string;
+
+  if (site === 'komikcast') {
+    prompt =
+      `<b>Step 3/5</b> · Slug di <b>komikcast</b>\n\n` +
+      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
+      `⚠️ <b>Slug komikcast BEDA dari slug qimochi.</b>\n` +
+      `Kirim slug dari URL komikcast, atau paste URL-nya langsung.\n\n` +
+      `<b>Contoh:</b>\n` +
+      `• URL: <code>https://komikcast.info/anime/2-5-jigen-no-ririsa</code>\n` +
+      `• Kirim: <code>2-5-jigen-no-ririsa</code>\n` +
+      `• Atau paste URL lengkapnya`;
+  } else if (site === 'samehadaku') {
+    prompt =
+      `<b>Step 3/5</b> · Slug di <b>samehadaku</b>\n\n` +
+      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
+      `<b>Opsi:</b>\n` +
+      `• URL anime Samehadaku\n` +
+      `• Slug langsung\n` +
+      `• <code>-</code> kalau sama`;
+  } else {
+    prompt =
+      `<b>Step 3/5</b> · Slug di <b>${site}</b>\n\n` +
+      `🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n` +
+      `<b>Kalau sama:</b> kirim <code>-</code>\n` +
+      `<b>Kalau beda:</b> kirim slug situs`;
+  }
 
   await ctx.reply(prompt, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
   return true;
@@ -1108,9 +1169,32 @@ async function handleAddSource(
 ): Promise<boolean> {
   let sourceSlug: string;
 
+  const isKomikcast = session.site === 'komikcast';
+  const isSamehadaku = session.site === 'samehadaku';
+
   if (input === '-') {
+    if (isKomikcast) {
+      await ctx.reply(
+        '❌ <b>Untuk komikcast, slug tidak boleh "-".</b>\n\nKirim slug komikcast manual (dari URL komikcast), atau paste URL lengkapnya:',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return true;
+    }
     sourceSlug = session.slug ?? '';
-  } else if (session.site === 'samehadaku' && /^https?:\/\//i.test(input)) {
+  } else if (isKomikcast && /^https?:\/\//i.test(input)) {
+    const extracted = extractKomikcastSlug(input);
+    if (!extracted) {
+      await ctx.reply(
+        '❌ URL komikcast invalid.\n\nFormat: <code>https://komikcast.info/anime/{slug}</code>\n\nKirim slug atau URL lain:',
+        { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+      );
+      return true;
+    }
+    sourceSlug = extracted;
+    await ctx.reply(`✅ Slug terdeteksi: <code>${escapeHtml(sourceSlug)}</code>`, {
+      parse_mode: 'HTML',
+    });
+  } else if (isSamehadaku && /^https?:\/\//i.test(input)) {
     const extracted = extractSamehadakuSlug(input);
     if (!extracted) {
       await ctx.reply(
@@ -1358,6 +1442,9 @@ async function handleEditValue(
     let s = input.trim();
     if (session.site === 'samehadaku' && /^https?:\/\//i.test(s)) {
       const extracted = extractSamehadakuSlug(s);
+      if (extracted) s = extracted;
+    } else if (session.site === 'komikcast' && /^https?:\/\//i.test(s)) {
+      const extracted = extractKomikcastSlug(s);
       if (extracted) s = extracted;
     }
     if (SLUG_RE.test(s)) patch.source_slug = s;
@@ -1728,7 +1815,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
 
   /* Add flow — pilih site */
   bot.callbackQuery(
-    /^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku|custom)$/,
+    /^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku|komikcast|custom)$/,
     async (ctx) => {
       const sessionId = ctx.match[1] ?? '';
       const rawSite = ctx.match[2] ?? '';
@@ -1748,9 +1835,17 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
       await updateSession(env.DB, sessionId, { site: siteValue, step: 'add_slug' });
       await ctx.answerCallbackQuery({ text: isCustom ? '🌐 Custom' : rawSite });
 
-      const prompt = isCustom
-        ? '<b>Step 2</b> · Kirim <b>slug anime</b> (kunci di yukio-data).\n\n<i>Contoh: <code>chii-fuyo</code></i>'
-        : '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>';
+      let prompt: string;
+      if (isCustom) {
+        prompt = '<b>Step 2</b> · Kirim <b>slug anime</b> (kunci di yukio-data).\n\n<i>Contoh: <code>chii-fuyo</code></i>';
+      } else if (rawSite === 'komikcast') {
+        prompt =
+          '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n' +
+          '<i>Ini adalah nama file MD di data repo.</i>\n' +
+          '<i>Contoh: <code>25-jigen-no-ririsa</code></i>';
+      } else {
+        prompt = '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>';
+      }
 
       await ctx.api
         .editMessageText(
@@ -1894,6 +1989,8 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
       } else {
         lines.push(`⚠️ <i>Anime URL kosong → cron skip. Set manual via edit.</i>`);
       }
+    } else {
+      lines.push(`🔗 <code>${escapeHtml(session.source_slug ?? '-')}</code>`);
     }
     lines.push(`📅 ${session.schedule_day} ${hh}:${mm} WIB`);
 
@@ -2028,12 +2125,14 @@ async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
     lexanime: 0,
     animesub: 0,
     samehadaku: 0,
+    komikcast: 0,
     custom: 0,
   };
   for (const r of all) {
     if (r.site in counts) counts[r.site as TrackSite]++;
   }
-  const total = counts.lexanime + counts.animesub + counts.samehadaku + counts.custom;
+  const total =
+    counts.lexanime + counts.animesub + counts.samehadaku + counts.komikcast + counts.custom;
   const editId = ctx.callbackQuery!.message!.message_id!;
 
   if (total === 0) {
@@ -2051,6 +2150,7 @@ async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
   if (counts.lexanime > 0) kb.text(`🎬 lexanime (${counts.lexanime})`, 'tr:ds:lexanime').row();
   if (counts.animesub > 0) kb.text(`🎬 animesub (${counts.animesub})`, 'tr:ds:animesub').row();
   if (counts.samehadaku > 0) kb.text(`🎬 samehadaku (${counts.samehadaku})`, 'tr:ds:samehadaku').row();
+  if (counts.komikcast > 0) kb.text(`🎬 komikcast (${counts.komikcast})`, 'tr:ds:komikcast').row();
   if (counts.custom > 0) kb.text(`🌐 custom (${counts.custom})`, 'tr:ds:custom').row();
   kb.text('◀️ Kembali', 'tr:h');
 
