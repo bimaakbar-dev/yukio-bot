@@ -13,6 +13,9 @@ export interface Env {
   YUKIO_DATA_REPO: string;
   YUKIO_DATA_BRANCH: string;
 
+  YUKIO_BACKUP_REPO?: string;
+  YUKIO_BACKUP_BRANCH?: string;
+
   GH_APP_ID: string;
   GH_APP_INSTALLATION_ID: string;
   GH_APP_PRIVATE_KEY: string;
