@@ -15,22 +15,22 @@ const BASE64_PARAM_NAMES = new Set([
 const VIDEO_EXT_RE = /\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i;
 
 const VIDEO_HOSTS = [
-  'player.', 
+  'player.',
   'streamtape',
-  'dood', 
-  'filemoon', 
-  'voe', 
+  'dood',
+  'filemoon',
+  'voe',
   'mp4upload',
-  'mixdrop', 
-  'iixdrop', 
-  'abyss', 
+  'mixdrop',
+  'iixdrop',
+  'abyss',
   'abyssplayer',
-  'framezi', 
+  'framezi',
   'kturbo',
-  'pixeldrain', 
-  'vikingfile', 
-  'buzzheavier', 
-  'mega.nz', 
+  'pixeldrain',
+  'vikingfile',
+  'buzzheavier',
+  'mega.nz',
   'doply',
   'xtwap.top',
   'otakudesu',
@@ -56,6 +56,7 @@ const VIDEO_HOSTS = [
   'lexanime',
   'dropbox.com',
   'sumantritelnologi',
+  'solidfiles',
 ];
 
 const WRAPPER_HOSTS = [
@@ -77,6 +78,7 @@ const SERVER_ALIASES: Record<string, string> = {
   odstream: 'odstream', odcdn: 'odcdn',
   ondesuhd: 'ondesuhd', ondesu: 'ondesu',
   vidhide: 'vidhide',
+  solidfiles: 'solidfiles',
 };
 
 const RSC_EMBED_RE =
@@ -86,12 +88,23 @@ export interface RawEntry {
   base64?: string;
   url?: string;
   label: string | null;
+  /**
+   * True kalau entry berasal dari parser yang sangat spesifik
+   * (Next.js Flight payload / Inertia data-page). URL dijamin embed video,
+   * jadi bypass filter isVideoUrl.
+   */
+  trusted?: boolean;
 }
 
 export interface ResolvedEntry {
   url: string;
   resolution: string | null;
   server: string | null;
+  /**
+   * True kalau entry datang dari parser trusted. Bypass filter isVideoUrl
+   * di output final.
+   */
+  trusted?: boolean;
 }
 
 export interface EpisodeJson {
@@ -449,7 +462,7 @@ function extractInertiaEmbeds(html: string): RawEntry[] {
             ? `[${quality}] ${provider || 'unknown'}`
             : provider || null;
 
-        out.push({ url, label });
+        out.push({ url, label, trusted: true });
       }
     }
   }
@@ -475,6 +488,7 @@ function extractNextJsEmbeds(html: string): RawEntry[] {
     out.push({
       url: link,
       label: `[${quality.toUpperCase()}] ${mirror.toUpperCase()}`,
+      trusted: true,
     });
   }
   return out;
@@ -545,16 +559,23 @@ export function extractEntries(html: string): RawEntry[] {
   return entries;
 }
 
+interface ResolvedInfo {
+  resolution: string | null;
+  server: string | null;
+  trusted: boolean;
+}
+
 export function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
-  const resolved = new Map<string, { resolution: string | null; server: string | null }>();
-  const unresolved = new Map<string, { resolution: string | null; server: string | null }>();
+  const resolved = new Map<string, ResolvedInfo>();
+  const unresolved = new Map<string, ResolvedInfo>();
 
   function resolve(
     url: string,
     resolution: string | null,
     server: string | null,
     depth: number,
-    seen: Set<string>
+    seen: Set<string>,
+    trusted: boolean = false
   ): void {
     if (depth > 4 || seen.has(url)) return;
     seen.add(url);
@@ -562,47 +583,76 @@ export function collectResolvedVideos(entries: RawEntry[]): ResolvedEntry[] {
     if (isWrapper(url)) {
       if (children.length === 0) {
         if (!resolved.has(url) && !unresolved.has(url)) {
-          unresolved.set(url, { resolution, server });
+          unresolved.set(url, { resolution, server, trusted });
         }
       } else {
-        for (const c of children) resolve(c, resolution, server, depth + 1, seen);
+        for (const c of children) {
+          resolve(c, resolution, server, depth + 1, seen, trusted);
+        }
       }
       return;
     }
-    if (!resolved.has(url)) resolved.set(url, { resolution, server });
-    for (const c of children) resolve(c, resolution, server, depth + 1, seen);
+    if (!resolved.has(url)) {
+      resolved.set(url, { resolution, server, trusted });
+    }
+    for (const c of children) {
+      resolve(c, resolution, server, depth + 1, seen, trusted);
+    }
   }
 
   for (const e of entries) {
     const resolution = parseResolution(e.label);
     const server = parseServerName(e.label);
+    const trusted = e.trusted === true;
 
     if (e.url) {
-      resolve(e.url, resolution, server, 0, new Set());
+      resolve(e.url, resolution, server, 0, new Set(), trusted);
       continue;
     }
 
     if (!e.base64) continue;
     const dec = multiLayerDecode(e.base64);
     if (!dec || dec.urls.length === 0) continue;
-    for (const url of dec.urls) resolve(url, resolution, server, 0, new Set());
+    for (const url of dec.urls) {
+      resolve(url, resolution, server, 0, new Set(), trusted);
+    }
   }
 
   const final: ResolvedEntry[] = [];
+
+  // Pass 1: trusted entries + entries yang lolos isVideoUrl
   for (const [url, info] of resolved) {
-    if (isVideoUrl(url)) {
-      final.push({ url, resolution: info.resolution, server: info.server });
+    if (info.trusted || isVideoUrl(url)) {
+      final.push({
+        url,
+        resolution: info.resolution,
+        server: info.server,
+        trusted: info.trusted,
+      });
     }
   }
 
+  // Pass 2: fallback — semua resolved kalau pass 1 kosong
   if (final.length === 0) {
     for (const [url, info] of resolved) {
-      final.push({ url, resolution: info.resolution, server: info.server });
+      final.push({
+        url,
+        resolution: info.resolution,
+        server: info.server,
+        trusted: info.trusted,
+      });
     }
   }
+
+  // Pass 3: fallback terakhir — unresolved
   if (final.length === 0) {
     for (const [url, info] of unresolved) {
-      final.push({ url, resolution: info.resolution, server: info.server });
+      final.push({
+        url,
+        resolution: info.resolution,
+        server: info.server,
+        trusted: info.trusted,
+      });
     }
   }
 
