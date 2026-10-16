@@ -13,6 +13,7 @@ import {
   buildEpisodeObject,
   fetchUrlViaProxy,
 } from '../services/decode-core';
+
 import {
   chunkRange,
   chunkPath,
@@ -159,7 +160,7 @@ async function startBatchWizard(ctx: Context, env: Env): Promise<void> {
     '📦 <b>Batch Wizard</b>\n\n' +
       '<b>Step 1/3</b> · Kirim <b>slug anime</b>.\n\n' +
       '<i>Contoh: <code>jujutsu-kaisen</code></i>\n\n' +
-      'Bot akan cek dulu ke repo yukio-data.',
+      'Bot akan cek dulu ke data repo.',
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -211,7 +212,7 @@ async function handleWizardSlug(
   }
 
   const loading = await ctx.reply(
-    `🔍 Cek <code>${escapeHtml(slug)}</code> ke yukio-data...`,
+    `🔍 Cek <code>${escapeHtml(slug)}</code> ke data repo...`,
     { parse_mode: 'HTML' }
   );
 
@@ -227,7 +228,7 @@ async function handleWizardSlug(
 
   if (!file) {
     await ctx.reply(
-      `❌ <b>Slug tidak ditemukan di yukio-data</b>\n\n` +
+        `❌ <b>Slug tidak ditemukan di data repo</b>\n\n` +
         `Path: <code>src/content/anime/${escapeHtml(slug)}.md</code>\n\n` +
         `Coba slug lain:`,
       {
