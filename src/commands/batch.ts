@@ -61,35 +61,24 @@ const WIZARD_SITES: Record<SiteKey, SiteConfig> = {
     host: 'https://samehadaku.li',
     episodePath: (slug, n) => `${slug}-episode-${n}-subtitle-indonesia/`,
   },
+  komikcast: {
+    host: 'https://komikcast.info',
+    episodePath: (slug, n) => `/anime/${slug}/episode/${n}`,
+  },
 };
 
 type ParsedSource =
   | { kind: 'known'; site: SiteKey; slug: string }
   | { kind: 'custom'; pattern: string; host: string };
 
-/**
- * Bangun fingerprint dari URL untuk dedup yang lebih pintar.
- *
- * Contoh:
- *   https://video.sumantritelnologi.workers.dev/https://desustream.net/abc?x=1
- *   → https://desustream.net/abc?x=1
- *
- * URL biasa (tanpa proxy) tetap seperti aslinya, tapi di-normalize:
- * - lowercase hostname
- * - strip trailing slash
- * - drop fragment (#xxx)
- */
 function fingerprintUrl(url: string): string {
   let u = url.trim();
-
-  // Strip proxy wrapper: <host>/<inner https url>
   const proxyMatch = u.match(/\.workers\.dev\/+(https?:\/\/.+)$/i);
   if (proxyMatch?.[1]) u = proxyMatch[1];
 
   try {
     const parsed = new URL(u);
     parsed.hash = '';
-    // Normalize trailing slash di pathname
     let path = parsed.pathname;
     if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
     return `${parsed.protocol}//${parsed.hostname.toLowerCase()}${path}${parsed.search}`;
@@ -112,11 +101,6 @@ function hasValidStreams(item: EpisodeChunkItem | undefined): boolean {
   );
 }
 
-/**
- * Merge streams: existing + incoming.
- * Dedup by URL fingerprint per quality.
- * Cap jumlah server per quality.
- */
 function mergeStreams(
   existing: EpisodeStream[] | undefined,
   incoming: EpisodeStream[]
@@ -222,13 +206,17 @@ function parseSourceUrl(url: string): ParsedSource | null {
       const slug = u.pathname.match(/\/tonton\/([^/]+)/)?.[1];
       if (slug) return { kind: 'known', site: 'animesub', slug };
     }
-    if (host.includes('samehadaku')) {
+        if (host.includes('samehadaku')) {
       const s1 = u.pathname.match(/\/anime\/([^/]+)/)?.[1];
       if (s1) return { kind: 'known', site: 'samehadaku', slug: s1 };
       const s2 = u.pathname.match(
         /\/([^/]+?)-episode-\d+-subtitle-indonesia/
       )?.[1];
       if (s2) return { kind: 'known', site: 'samehadaku', slug: s2 };
+    }
+    if (host.includes('komikcast')) {
+      const s1 = u.pathname.match(/\/anime\/([^/]+)/)?.[1];
+      if (s1) return { kind: 'known', site: 'komikcast', slug: s1 };
     }
   } catch {
     return null;
