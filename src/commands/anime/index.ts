@@ -21,7 +21,8 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
         '<i>Alur:</i>\n' +
         '1. Fetch metadata (AniList → Shikimori → Kitsu)\n' +
         '2. Klik section: Characters, Episodes, Franchises, Summary\n' +
-        '3. Klik 📤 Publish untuk commit ke data repo\n\n' +
+        '3. Klik 📤 Publish untuk commit ke data repo\n' +
+        '   (section yang tidak di-klik tidak akan di-commit)\n\n' +
         '<i>Ketik /anime end untuk membersihkan session.</i>',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
@@ -33,6 +34,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
     const { deleteCharCache } = await import('../../lib/dba-characters');
     const { deleteEpCache } = await import('../../lib/dba-episodes');
     const { clearTrackedSession, sendAutoDelete } = await import('../../lib/telegram-utils');
+    const { clearSelectedSections } = await import('../../lib/publish-selection');
 
     if (!ctx.from?.id || !ctx.chat?.id) return;
     const session = await getLatestSessionByUser(env.DB, ctx.from.id);
@@ -49,6 +51,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
       ctx.chat.id,
       session.session_id
     );
+    await clearSelectedSections(env, session.session_id);
     await deleteCharCache(env.DB, session.session_id);
     await deleteEpCache(env.DB, session.session_id);
     await deleteSession(env.DB, session.session_id);
@@ -135,7 +138,7 @@ async function handleCommand(ctx: Context, env: Env): Promise<void> {
 
 export const animeCommand: CommandDefinition = {
   name: 'anime',
-  description: 'Tambah anime → yukio-data (fetch + cache + publish)',
+  description: 'Tambah anime → data repo (fetch + cache + publish)',
   usage: '/anime <judul>',
   adminOnly: true,
   handler: handleCommand,
