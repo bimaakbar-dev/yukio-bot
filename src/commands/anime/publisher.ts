@@ -17,9 +17,18 @@ import { filterFranchises } from '../../lib/franchises';
 import { chunkArray, slugify, stripHtml, looksIndonesian } from '../../lib/utils';
 import { askAI } from '../../services/ai';
 import { safeFetch } from '../../lib/dba-common';
+import {
+  EP_PART_SIZE,
+  chunkRange,
+  chunkPath,
+  readEpisodeChunk,
+  serializeChunk,
+  type EpisodeChunkItem,
+} from '../../lib/episode-chunks';
+
+void EP_PART_SIZE;
 
 const CHAR_PART_SIZE = 50;
-const EP_PART_SIZE = 12;
 const MAX_ACTORS_PER_FILE = 500;
 
 interface BuildFilesResult {
@@ -144,6 +153,69 @@ async function resolveBody(
   return aiBody ?? clean;
 }
 
+/**
+ * Bangun file episode chunks dari epCache.
+ * - Path & chunk size mengikuti lib/episode-chunks (kompatibel dengan web qimochi).
+ * - Merge dengan existing chunk: streams/downloads yang sudah ada di-preserve.
+ * - Publisher HANYA menulis metadata (title, aired, duration); streams diisi oleh
+ *   /batch atau cron runner.
+ */
+async function buildEpisodeFiles(
+  env: Env,
+  slug: string,
+  cachedEpisodes: { number: number; title?: string; aired?: string; duration?: number }[]
+): Promise<{ files: FileToCommit[]; count: number }> {
+  const files: FileToCommit[] = [];
+  let count = 0;
+
+  if (cachedEpisodes.length === 0) return { files, count };
+
+  // Group incoming by chunk range (fixed boundary).
+  const byChunk = new Map<string, { start: number; end: number; items: EpisodeChunkItem[] }>();
+  for (const ep of cachedEpisodes) {
+    if (typeof ep.number !== 'number') continue;
+    const { start, end } = chunkRange(ep.number);
+    const key = `${start}-${end}`;
+    if (!byChunk.has(key)) byChunk.set(key, { start, end, items: [] });
+
+    const item: EpisodeChunkItem = { number: ep.number };
+    if (ep.title) item.title = ep.title;
+    if (ep.aired) item.aired = ep.aired;
+    if (typeof ep.duration === 'number') item.duration = ep.duration;
+
+    byChunk.get(key)!.items.push(item);
+  }
+
+  for (const { start, end, items } of byChunk.values()) {
+    const existing = await readEpisodeChunk(env, slug, start, end);
+    const merged = new Map<number, EpisodeChunkItem>();
+    for (const e of existing) merged.set(e.number, e);
+
+    for (const incoming of items) {
+      const prev = merged.get(incoming.number) ?? { number: incoming.number };
+      merged.set(incoming.number, {
+        number: incoming.number,
+        title: incoming.title ?? prev.title,
+        aired: incoming.aired ?? prev.aired,
+        duration: incoming.duration ?? prev.duration,
+        // JANGAN sentuh streams/downloads — biarkan nilai existing kalau ada
+        streams: prev.streams,
+        downloads: prev.downloads,
+      });
+    }
+
+    const sorted = [...merged.values()].sort((a, b) => a.number - b.number);
+    files.push({
+      path: chunkPath(slug, start, end),
+      content: serializeChunk(sorted),
+      itemCount: sorted.length,
+    });
+    count += items.length;
+  }
+
+  return { files, count };
+}
+
 export async function buildFiles(
   env: Env,
   session: SessionRow
@@ -199,22 +271,16 @@ export async function buildFiles(
     }
   }
 
-  /* Episodes */
+  /* Episodes — chunk path & merge lewat helper */
   const epCache = await getEpCache(env.DB, session.session_id);
   if (epCache && epCache.episodes.length > 0) {
-    const sorted = [...epCache.episodes].sort((a, b) => a.number - b.number);
-    const chunks = chunkArray(sorted, EP_PART_SIZE);
-    for (const chunk of chunks) {
-      const first = chunk[0];
-      const last = chunk[chunk.length - 1];
-      if (!first || !last) continue;
-      files.push({
-        path: `data/anime/${slug}/episodes/${first.number}-${last.number}.json`,
-        content: JSON.stringify(chunk, null, 2) + '\n',
-        itemCount: chunk.length,
-      });
-      counts.episodes += chunk.length;
-    }
+    const { files: epFiles, count } = await buildEpisodeFiles(
+      env,
+      slug,
+      epCache.episodes
+    );
+    files.push(...epFiles);
+    counts.episodes += count;
   }
 
   /* Franchises */
