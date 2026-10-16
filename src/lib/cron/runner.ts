@@ -1,10 +1,7 @@
 // src/lib/cron/runner.ts
 import type { Env } from '../../types/env';
 import type { EpisodeObject } from '../../types/anime';
-import {
-  githubCommitFile,
-  githubGetFile,
-} from '../github';
+import { githubCommitFile, githubGetFile } from '../github';
 import {
   listTrackedAnime,
   getTrackedAnime,
@@ -56,7 +53,7 @@ async function updateYukioDataMd(
 
     if (/^updatedAt:\s*.+$/m.test(fm)) {
       fm = fm.replace(/^updatedAt:\s*.+$/m, `updatedAt: "${today}"`);
-    } else if (/^addedAt:\s+.+$/m.test(fm)) {
+    } else if (/^addedAt:\s*.+$/m.test(fm)) {
       fm = fm.replace(/^(addedAt:\s*.+)$/m, `$1\nupdatedAt: "${today}"`);
     } else {
       fm = fm.trimEnd() + `\naddedAt: "${today}"\nupdatedAt: "${today}"`;
@@ -113,12 +110,6 @@ async function fetchEpisodeForRow(
   return fetchEpisode(env, usedSite as SiteKey, row.source_slug, epNumber);
 }
 
-/**
- * Tulis satu episode baru ke chunk yang tepat.
- * Path & format via lib/episode-chunks (kompatibel dengan web qimochi).
- * Merge dengan existing — field lain (title, aired, duration) yang sudah ada
- * dari publisher di-preserve.
- */
 async function commitEpisodeToChunk(
   env: Env,
   slug: string,
@@ -178,9 +169,6 @@ async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessR
   const fresh = await getTrackedAnime(env.DB, slug);
   if (!fresh) return { pushed: 0, error: `Tracked anime hilang: ${slug}` };
 
-  let currentChunkStart = fresh.chunk_start;
-  let currentChunkEnd = fresh.chunk_end;
-
   for (let ep = fresh.last_ep + 1; ep <= latestEp; ep++) {
     const already = await isEpisodePublished(env.DB, slug, ep);
     if (already) continue;
@@ -220,11 +208,9 @@ async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessR
       }
     }
 
-    const { chunkStart, chunkEnd } = await updateTrackedChunkState(env.DB, slug, ep);
+    await updateTrackedChunkState(env.DB, slug, ep);
     await markEpisodePublished(env.DB, slug, ep, usedSite, chunkCommit.sha ?? null);
 
-    currentChunkStart = chunkStart;
-    currentChunkEnd = chunkEnd;
     pushed++;
   }
 
