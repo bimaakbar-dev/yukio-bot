@@ -1,6 +1,6 @@
 === REPO DUMP ===
-Generated: Wed Oct 14 13:09:20 UTC 2026
-Commit: 7fc1fc8
+Generated: Fri Oct 16 03:07:49 UTC 2026
+Commit: a80d235
 
 === STRUCTURE ===
 .
@@ -14,7 +14,6 @@ Commit: 7fc1fc8
 ./src/types
 
 === FILES ===
-./.github/workflows/apply-cms.yml
 ./.github/workflows/deploy.yml
 ./.github/workflows/dump.yml
 ./.github/workflows/generate-lock.yml
@@ -76,93 +75,7 @@ Commit: 7fc1fc8
 === CONTENTS ===
 
 === DUMP COMPLETE ===
-workflows/apply-cms.yml =====
-name: Apply CMS Track
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  apply:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Apply payload
-        run: |
-          if [ ! -f payload.txt ]; then
-            echo "❌ payload.txt not found"
-            exit 1
-          fi
-
-          python3 << 'PYEOF'
-          import re, os, sys
-
-          with open('payload.txt', 'r', encoding='utf-8') as f:
-              content = f.read()
-
-          pattern = re.compile(
-              r'^=== FILE: (.+?) ===\n(.*?)\n=== END ===$',
-              re.MULTILINE | re.DOTALL
-          )
-
-          count = 0
-          for match in pattern.finditer(content):
-              path = match.group(1).strip()
-              body = match.group(2)
-
-              if not path or path.startswith('/'):
-                  print(f'❌ Invalid path: {path}')
-                  sys.exit(1)
-
-              dirn = os.path.dirname(path)
-              if dirn:
-                  os.makedirs(dirn, exist_ok=True)
-
-              with open(path, 'w', encoding='utf-8') as f:
-                  f.write(body)
-
-              print(f'✅ Wrote {path} ({len(body)} bytes)')
-              count += 1
-
-          if count == 0:
-              print('❌ No files matched')
-              sys.exit(1)
-
-          print(f'\n📦 Total: {count} files written')
-          PYEOF
-
-      - name: Cleanup payload
-        run: rm -f payload.txt
-
-      - name: Typecheck (optional)
-        run: |
-          npm install --silent 2>/dev/null || true
-          if [ -f tsconfig.json ]; then
-            npx tsc --noEmit 2>&1 | head -50 || echo "⚠️ typecheck skipped/failed"
-          fi
-
-      - name: Commit & push
-        run: |
-          git add -A
-          if git diff --staged --quiet; then
-            echo "ℹ️ No changes"
-          else
-            git commit -m "feat(track): CMS-style editor via bot"
-            git push
-          fi
-===== END FILE =====
-
-===== FILE: ./.github/workflows/deploy.yml =====
+workflows/deploy.yml =====
 name: Deploy Yukio Bot
 
 on:
@@ -1659,6 +1572,7 @@ export function buildPublishKeyboard(sessionId: string): InlineKeyboard {
 ===== END FILE =====
 
 ===== FILE: ./src/commands/batch.ts =====
+
 // src/commands/batch.ts
 import type { CommandDefinition } from './registry';
 import type { Context } from 'grammy';
@@ -1677,20 +1591,28 @@ import {
 
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 
+type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
+type WizardSite = SiteKey | 'custom';
+
 interface WizardState {
   step: 'awaiting_slug' | 'awaiting_source' | 'awaiting_range' | 'ready';
   slug: string | null;
   sourceUrl: string | null;
-  sourceSite: string | null;
+  sourceSite: WizardSite | null;
+  /** Untuk site known: slug di situs sumber. Untuk custom: hostname saja. */
   sourceSlug: string | null;
+  /** Khusus custom: URL template dengan placeholder `{n}`. */
+  customPattern: string | null;
   rangeStart: number | null;
   rangeEnd: number | null;
 }
 
-const WIZARD_SITES: Record<
-  string,
-  { host: string; episodePath: (slug: string, n: number) => string }
-> = {
+interface SiteConfig {
+  host: string;
+  episodePath: (slug: string, n: number) => string;
+}
+
+const WIZARD_SITES: Record<SiteKey, SiteConfig> = {
   lexanime: {
     host: 'https://lexanime.web.id',
     episodePath: (slug, n) => `/tonton/${slug}/episode-${n}-sub-indo`,
@@ -1705,33 +1627,94 @@ const WIZARD_SITES: Record<
   },
 };
 
-function parseSourceUrl(url: string): { site: string; slug: string } | null {
-  try {
-    const u = new URL(url.trim());
-    const host = u.hostname.toLowerCase();
+type ParsedSource =
+  | { kind: 'known'; site: SiteKey; slug: string }
+  | { kind: 'custom'; pattern: string; host: string };
 
-    if (host.includes('lexanime')) {
-      const m = u.pathname.match(/\/tonton\/([^\/]+)/);
-      if (m?.[1]) return { site: 'lexanime', slug: m[1] };
-    }
-    if (host.includes('animesub')) {
-      const m = u.pathname.match(/\/tonton\/([^\/]+)/);
-      if (m?.[1]) return { site: 'animesub', slug: m[1] };
-    }
-    if (host.includes('samehadaku')) {
-      const m1 = u.pathname.match(/\/anime\/([^\/]+)/);
-      if (m1?.[1]) return { site: 'samehadaku', slug: m1[1] };
-      const m2 = u.pathname.match(/\/([^\/]+?)-episode-\d+-subtitle-indonesia/);
-      if (m2?.[1]) return { site: 'samehadaku', slug: m2[1] };
-    }
-    return null;
+/**
+ * Auto-detect pola episode di URL → template dengan `{n}`.
+ * Return null kalau tidak ada pola yang bisa dipakai.
+ */
+function resolveCustomPattern(
+  input: string
+): { pattern: string; host: string } | null {
+  const trimmed = input.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  // Hostname — substitute {n} biar URL valid untuk parsing.
+  let host: string;
+  try {
+    host = new URL(trimmed.replace(/\{n\}/g, '1')).hostname.toLowerCase();
   } catch {
     return null;
   }
+
+  // 1) User sudah kasih {n} eksplisit
+  if (/\{n\}/.test(trimmed)) {
+    return { pattern: trimmed, host };
+  }
+
+  // 2) "episode-5", "ep_12", "EP.3", dst.
+  const m1 = trimmed.match(/^(.*?)(episode|ep|eps)([-_.]?)(\d+)(.*)$/i);
+  if (m1) {
+    const prefix = m1[1] ?? '';
+    const keyword = m1[2] ?? 'episode';
+    const sep = m1[3] ?? '';
+    const suffix = m1[5] ?? '';
+    return { pattern: `${prefix}${keyword}${sep}{n}${suffix}`, host };
+  }
+
+  // 3) URL diakhiri segmen angka: /watch/foo/12, /watch/foo/12/, /watch/foo/12?x=1
+  const m2 = trimmed.match(/^(.*\/)(\d+)(\D.*)?$/);
+  if (m2) {
+    const prefix = m2[1] ?? '';
+    const suffix = m2[3] ?? '';
+    return { pattern: `${prefix}{n}${suffix}`, host };
+  }
+
+  return null;
+}
+
+function parseSourceUrl(url: string): ParsedSource | null {
+  const trimmed = url.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  try {
+    const u = new URL(trimmed.replace(/\{n\}/g, '1'));
+    const host = u.hostname.toLowerCase();
+
+    if (host.includes('lexanime')) {
+      const slug = u.pathname.match(/\/tonton\/([^/]+)/)?.[1];
+      if (slug) return { kind: 'known', site: 'lexanime', slug };
+    }
+    if (host.includes('animesub')) {
+      const slug = u.pathname.match(/\/tonton\/([^/]+)/)?.[1];
+      if (slug) return { kind: 'known', site: 'animesub', slug };
+    }
+    if (host.includes('samehadaku')) {
+      const s1 = u.pathname.match(/\/anime\/([^/]+)/)?.[1];
+      if (s1) return { kind: 'known', site: 'samehadaku', slug: s1 };
+      const s2 = u.pathname.match(
+        /\/([^/]+?)-episode-\d+-subtitle-indonesia/
+      )?.[1];
+      if (s2) return { kind: 'known', site: 'samehadaku', slug: s2 };
+    }
+  } catch {
+    return null;
+  }
+
+  const custom = resolveCustomPattern(trimmed);
+  if (custom) {
+    return { kind: 'custom', pattern: custom.pattern, host: custom.host };
+  }
+  return null;
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 async function startBatchWizard(ctx: Context, env: Env): Promise<void> {
@@ -1744,6 +1727,7 @@ async function startBatchWizard(ctx: Context, env: Env): Promise<void> {
     sourceUrl: null,
     sourceSite: null,
     sourceSlug: null,
+    customPattern: null,
     rangeStart: null,
     rangeEnd: null,
   };
@@ -1776,13 +1760,13 @@ export async function handleBatchWizardText(
   if (!state) return false;
 
   if (state.step === 'awaiting_slug') {
-    return await handleWizardSlug(ctx, env, userId, state, text);
+    return handleWizardSlug(ctx, env, userId, state, text);
   }
   if (state.step === 'awaiting_source') {
-    return await handleWizardSource(ctx, env, userId, state, text);
+    return handleWizardSource(ctx, env, userId, state, text);
   }
   if (state.step === 'awaiting_range') {
-    return await handleWizardRange(ctx, env, userId, state, text);
+    return handleWizardRange(ctx, env, userId, state, text);
   }
   return false;
 }
@@ -1809,7 +1793,7 @@ async function handleWizardSlug(
     { parse_mode: 'HTML' }
   );
 
-  let file = null;
+  let file: Awaited<ReturnType<typeof githubGetFile>> = null;
   try {
     file = await githubGetFile(env, `src/content/anime/${slug}.md`);
   } catch (err) {
@@ -1840,10 +1824,16 @@ async function handleWizardSlug(
     `✅ <b>Slug ditemukan!</b>\n\n` +
       `<b>Step 2/3</b> · Kirim <b>URL source</b>.\n\n` +
       `🎬 Repo: <code>${escapeHtml(slug)}</code>\n\n` +
-      `<b>Format URL yang didukung:</b>\n` +
+      `<b>A. Situs dikenal (slug otomatis):</b>\n` +
       `• <code>https://lexanime.web.id/tonton/{slug}/</code>\n` +
       `• <code>https://animesub.web.id/tonton/{slug}/</code>\n` +
-      `• <code>https://samehadaku.li/anime/{slug}/</code>`,
+      `• <code>https://samehadaku.li/anime/{slug}/</code>\n\n` +
+      `<b>B. Situs lain (custom):</b>\n` +
+      `• Kirim URL episode dengan placeholder <code>{n}</code>:\n` +
+      `  <code>https://situs.com/foo/episode-{n}</code>\n` +
+      `• Atau kirim contoh URL episode (bot auto-detect):\n` +
+      `  <code>https://situs.com/foo/episode-1</code>\n` +
+      `  <code>https://situs.com/watch/foo/1</code>`,
     {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -1865,10 +1855,14 @@ async function handleWizardSource(
   if (!parsed) {
     await ctx.reply(
       '❌ URL tidak dikenali.\n\n' +
-        'Format yang didukung:\n' +
+        '<b>Situs dikenal:</b>\n' +
         '• <code>https://lexanime.web.id/tonton/{slug}/</code>\n' +
         '• <code>https://animesub.web.id/tonton/{slug}/</code>\n' +
         '• <code>https://samehadaku.li/anime/{slug}/</code>\n\n' +
+        '<b>Custom URL:</b> pastikan ada nomor episode, atau pakai placeholder:\n' +
+        '• <code>https://situs.com/foo/episode-{n}</code>\n' +
+        '• <code>https://situs.com/foo/episode-1</code>\n' +
+        '• <code>https://situs.com/watch/foo/1</code>\n\n' +
         'Coba lagi:',
       {
         parse_mode: 'HTML',
@@ -1881,17 +1875,37 @@ async function handleWizardSource(
 
   state.step = 'awaiting_range';
   state.sourceUrl = text.trim();
-  state.sourceSite = parsed.site;
-  state.sourceSlug = parsed.slug;
+
+  if (parsed.kind === 'known') {
+    state.sourceSite = parsed.site;
+    state.sourceSlug = parsed.slug;
+    state.customPattern = null;
+  } else {
+    state.sourceSite = 'custom';
+    state.sourceSlug = parsed.host;
+    state.customPattern = parsed.pattern;
+  }
+
   await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
+
+  const siteLabel =
+    parsed.kind === 'known' ? parsed.site : `custom (${parsed.host})`;
+
+  let patternLabel: string;
+  if (parsed.kind === 'known') {
+    const cfg = WIZARD_SITES[parsed.site];
+    patternLabel = `${cfg.host}${cfg.episodePath(parsed.slug, 1)}`;
+  } else {
+    patternLabel = parsed.pattern;
+  }
 
   await ctx.reply(
     `✅ <b>Source OK!</b>\n\n` +
       `<b>Step 3/3</b> · Kirim <b>range episode</b>.\n\n` +
-      `🎬 Repo: <code>${escapeHtml(state.slug!)}</code>\n` +
-      `🔗 Site: <b>${parsed.site}</b>\n` +
-      `📼 Source: <code>${escapeHtml(parsed.slug)}</code>\n\n` +
-      `<b>Contoh:</b>\n` +
+      `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
+      `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+      `📼 URL sample ep 1: <code>${escapeHtml(patternLabel)}</code>\n\n` +
+      `<b>Contoh range:</b>\n` +
       `• <code>1-6</code> (ep 1 sampai 6)\n` +
       `• <code>4</code> (hanya ep 4)\n\n` +
       `<i>Kalau file existing sudah ada (misal 1-3), bot akan skip.</i>`,
@@ -1920,7 +1934,7 @@ async function handleWizardRange(
     return true;
   }
 
-  const start = parseInt(m[1]!, 10);
+  const start = parseInt(m[1] ?? '0', 10);
   const end = m[2] ? parseInt(m[2], 10) : start;
 
   if (start < 1 || end < start || end - start + 1 > BATCH_MAX) {
@@ -1936,11 +1950,17 @@ async function handleWizardRange(
   state.rangeEnd = end;
   await setCache(env.DB, `bw:${userId}`, state, WIZARD_TTL_MS);
 
+  const siteLabel = state.sourceSite ?? '-';
+  const sourceLabel =
+    state.sourceSite === 'custom'
+      ? (state.customPattern ?? '-')
+      : (state.sourceSlug ?? '-');
+
   await ctx.reply(
     `📋 <b>Konfirmasi Batch</b>\n\n` +
-      `🎬 Repo: <code>${escapeHtml(state.slug!)}</code>\n` +
-      `🔗 Site: <b>${state.sourceSite}</b>\n` +
-      `📼 Source: <code>${escapeHtml(state.sourceSlug!)}</code>\n` +
+      `🎬 Repo: <code>${escapeHtml(state.slug ?? '?')}</code>\n` +
+      `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+      `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n` +
       `📊 Range: <b>${start}-${end}</b> (${end - start + 1} ep)\n\n` +
       `<i>Bot akan cek file existing di <code>episodes/streams/</code>, fetch yang belum ada, lalu merge.</i>`,
     {
@@ -1960,15 +1980,24 @@ async function execBatchWizard(
   userId: number
 ): Promise<void> {
   const state = await getCache<WizardState>(env.DB, `bw:${userId}`);
+  if (!state || state.step !== 'ready') {
+    await ctx.answerCallbackQuery({
+      text: '⏱️ Session kadaluarsa',
+      show_alert: true,
+    });
+    return;
+  }
+
+  const slug = state.slug;
+  const sourceSite = state.sourceSite;
+  const rangeStart = state.rangeStart;
+  const rangeEnd = state.rangeEnd;
+
   if (
-    !state ||
-    state.step !== 'ready' ||
-    !state.slug ||
-    !state.sourceUrl ||
-    !state.sourceSite ||
-    !state.sourceSlug ||
-    state.rangeStart === null ||
-    state.rangeEnd === null
+    !slug ||
+    !sourceSite ||
+    rangeStart === null ||
+    rangeEnd === null
   ) {
     await ctx.answerCallbackQuery({
       text: '⏱️ Session kadaluarsa',
@@ -1981,48 +2010,80 @@ async function execBatchWizard(
 
   const loadingMsgId = ctx.callbackQuery!.message!.message_id!;
   const chatId = ctx.chat!.id;
-
-  const { slug, sourceSite, sourceSlug, rangeStart, rangeEnd } = state;
   const total = rangeEnd - rangeStart + 1;
 
+  /* ── Build URL builder ───────────────────────────────── */
+  let epUrlBuilder: (n: number) => string;
+
+  if (sourceSite === 'custom') {
+    const pattern = state.customPattern;
+    if (!pattern) {
+      await ctx.api
+        .editMessageText(
+          chatId,
+          loadingMsgId,
+          '❌ Pattern custom hilang. Ulangi /batch.',
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+    epUrlBuilder = (n) => pattern.replace(/\{n\}/g, String(n));
+  } else {
+    // TS narrow sourceSite → SiteKey
+    const siteConfig = WIZARD_SITES[sourceSite];
+    const sourceSlug = state.sourceSlug;
+    if (!sourceSlug) {
+      await ctx.api
+        .editMessageText(
+          chatId,
+          loadingMsgId,
+          '❌ Source slug hilang. Ulangi /batch.',
+          { parse_mode: 'HTML' }
+        )
+        .catch(() => {});
+      return;
+    }
+    epUrlBuilder = (n) =>
+      `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
+  }
+
+  /* ── Read existing chunks ────────────────────────────── */
   const existing = new Map<number, EpisodeObject>();
   try {
     const dir = await githubListDir(env, `data/anime/${slug}/episodes/streams`);
     for (const item of dir) {
       if (item.type !== 'file' || !item.name.endsWith('.json')) continue;
-      const file = await githubGetFile(env, `data/anime/${slug}/episodes/streams/${item.name}`);
+      const file = await githubGetFile(
+        env,
+        `data/anime/${slug}/episodes/streams/${item.name}`
+      );
       if (!file) continue;
       try {
-        const eps = JSON.parse(file.content) as EpisodeObject[];
+        const eps = JSON.parse(file.content) as unknown;
         if (Array.isArray(eps)) {
-          for (const ep of eps) {
+          for (const ep of eps as EpisodeObject[]) {
             if (typeof ep.number === 'number') existing.set(ep.number, ep);
           }
         }
-      } catch {}
+      } catch {
+        /* ignore malformed */
+      }
     }
   } catch (err) {
     console.warn('[BatchWizard] read existing failed:', err);
   }
 
-  const siteConfig = WIZARD_SITES[sourceSite];
-  if (!siteConfig) {
-    await ctx.api
-      .editMessageText(chatId, loadingMsgId, `❌ Site tidak dikenal: ${escapeHtml(sourceSite)}`, {
-        parse_mode: 'HTML',
-      })
-      .catch(() => {});
-    return;
-  }
-
+  /* ── Fetch loop ──────────────────────────────────────── */
   const merged: EpisodeObject[] = [];
   const errors: { number: number; error: string }[] = [];
   const added: number[] = [];
   const skipped: number[] = [];
 
   for (let n = rangeStart; n <= rangeEnd; n++) {
-    if (existing.has(n)) {
-      merged.push(existing.get(n)!);
+    const cached = existing.get(n);
+    if (cached) {
+      merged.push(cached);
       skipped.push(n);
       continue;
     }
@@ -2037,7 +2098,7 @@ async function execBatchWizard(
       )
       .catch(() => {});
 
-    const epUrl = `${siteConfig.host}${siteConfig.episodePath(sourceSlug, n)}`;
+    const epUrl = epUrlBuilder(n);
     const { body, debug } = await fetchUrlViaProxy(env, epUrl);
 
     if (!body) {
@@ -2058,17 +2119,22 @@ async function execBatchWizard(
 
   merged.sort((a, b) => a.number - b.number);
 
-  if (merged.length === 0) {
+  const first = merged[0];
+  const last = merged[merged.length - 1];
+  if (!first || !last) {
     await ctx.api
-      .editMessageText(chatId, loadingMsgId, `❌ Tidak ada episode yang berhasil di-fetch.`, {
-        parse_mode: 'HTML',
-      })
+      .editMessageText(
+        chatId,
+        loadingMsgId,
+        '❌ Tidak ada episode yang berhasil di-fetch.',
+        { parse_mode: 'HTML' }
+      )
       .catch(() => {});
     return;
   }
 
-  const minEp = merged[0]!.number;
-  const maxEp = merged[merged.length - 1]!.number;
+  const minEp = first.number;
+  const maxEp = last.number;
   const combinedJson = JSON.stringify(merged, null, 2) + '\n';
   const totalUrls = merged.reduce(
     (sum, r) => sum + r.streams.reduce((s, q) => s + q.servers.length, 0),
@@ -2106,8 +2172,12 @@ async function execBatchWizard(
     lines.push(`📦 Total: <b>${merged.length}</b> ep (${minEp}-${maxEp})`);
     lines.push(`🎬 URL: <b>${totalUrls}</b>`);
 
-    if (skipped.length > 0) lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
-    if (added.length > 0) lines.push(`➕ Baru: Ep ${added.join(', ')}`);
+    if (skipped.length > 0) {
+      lines.push(`⏭️ Skip (existing): Ep ${skipped.join(', ')}`);
+    }
+    if (added.length > 0) {
+      lines.push(`➕ Baru: Ep ${added.join(', ')}`);
+    }
 
     if (errors.length > 0) {
       lines.push('');
@@ -2134,24 +2204,26 @@ async function execBatchWizard(
       })
       .catch(() => {});
 
-    // Retain slug + source untuk batch berikutnya — hanya range yang reset
+    // Retain slug + source, reset range
     const nextState: WizardState = {
       step: 'awaiting_range',
       slug: state.slug,
       sourceUrl: state.sourceUrl,
       sourceSite: state.sourceSite,
       sourceSlug: state.sourceSlug,
+      customPattern: state.customPattern,
       rangeStart: null,
       rangeEnd: null,
     };
     await setCache(env.DB, `bw:${userId}`, nextState, WIZARD_TTL_MS);
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'unknown';
     console.error('[BatchWizard] push failed:', err);
     await ctx.api
       .editMessageText(
         chatId,
         loadingMsgId,
-        `❌ <b>Error:</b> <code>${escapeHtml((err?.message ?? 'unknown').slice(0, 300))}</code>`,
+        `❌ <b>Error:</b> <code>${escapeHtml(msg.slice(0, 300))}</code>`,
         { parse_mode: 'HTML' }
       )
       .catch(() => {});
@@ -2169,7 +2241,7 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
     if (!userId) return;
 
     const state = await getCache<WizardState>(env.DB, `bw:${userId}`);
-    if (!state || !state.slug || !state.sourceSlug || !state.sourceSite) {
+    if (!state || !state.slug || !state.sourceSite) {
       await ctx.answerCallbackQuery({
         text: '⏱️ Session habis. Kirim /batch lagi.',
         show_alert: true,
@@ -2179,14 +2251,23 @@ export function setupBatchWizardCallbacks(bot: Bot, env: Env): void {
 
     await ctx.answerCallbackQuery({ text: '🔄' });
 
+    const siteLabel =
+      state.sourceSite === 'custom'
+        ? `custom (${state.sourceSlug ?? '-'})`
+        : state.sourceSite;
+    const sourceLabel =
+      state.sourceSite === 'custom'
+        ? (state.customPattern ?? '-')
+        : (state.sourceSlug ?? '-');
+
     await ctx.api
       .editMessageText(
         ctx.chat!.id,
         ctx.callbackQuery!.message!.message_id!,
         `🔄 <b>Range Baru</b>\n\n` +
           `🎬 Repo: <code>${escapeHtml(state.slug)}</code>\n` +
-          `🔗 Site: <b>${state.sourceSite}</b>\n` +
-          `📼 Source: <code>${escapeHtml(state.sourceSlug)}</code>\n\n` +
+          `🔗 Site: <b>${escapeHtml(siteLabel)}</b>\n` +
+          `📼 Source: <code>${escapeHtml(sourceLabel)}</code>\n\n` +
           `Kirim <b>range episode</b> baru.\n` +
           `Contoh: <code>7-12</code> atau <code>13</code>`,
         {
@@ -2246,7 +2327,6 @@ export const batchCommand: CommandDefinition = {
     await startBatchWizard(ctx, env);
   },
 };
-
 ===== END FILE =====
 
 ===== FILE: ./src/commands/database/actions.ts =====
@@ -4632,6 +4712,7 @@ import {
   saveTrackedAnime,
   isInScheduleWindow,
   type SiteKey,
+  type TrackSite,
 } from '../lib/cron/state';
 import { updateTrackedAnime } from '../lib/cron/state-extra';
 import { createLazyInit } from '../lib/lazy-init';
@@ -4640,6 +4721,7 @@ import {
   getTrackedMessages,
   deleteTrackedMessages,
 } from '../lib/telegram-utils';
+import { resolveCustomPattern } from '../services/decode-core';
 
 const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku'];
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
@@ -4653,6 +4735,8 @@ export type EditStep =
   | 'add_site'
   | 'add_slug'
   | 'add_source'
+  | 'add_pattern'
+  | 'add_anime_url'
   | 'add_day'
   | 'add_hour'
   | 'add_confirm'
@@ -4665,6 +4749,8 @@ export interface TrackSessionRow {
   site: string | null;
   slug: string | null;
   source_slug: string | null;
+  custom_episode_pattern: string | null;
+  custom_anime_url: string | null;
   schedule_day: string | null;
   schedule_hour: number | null;
   schedule_minute: number | null;
@@ -4674,7 +4760,7 @@ export interface TrackSessionRow {
   expires_at: number;
 }
 
-const ensureSessionDb = createLazyInit('TrackSessV2', async (db) => {
+const ensureSessionDb = createLazyInit('TrackSessV3', async (db) => {
   await db
     .prepare(
       `CREATE TABLE IF NOT EXISTS track_sessions_v2 (
@@ -4694,6 +4780,17 @@ const ensureSessionDb = createLazyInit('TrackSessV2', async (db) => {
       )`
     )
     .run();
+
+  try {
+    await db
+      .prepare('ALTER TABLE track_sessions_v2 ADD COLUMN custom_episode_pattern TEXT')
+      .run();
+  } catch {}
+  try {
+    await db
+      .prepare('ALTER TABLE track_sessions_v2 ADD COLUMN custom_anime_url TEXT')
+      .run();
+  } catch {}
 });
 
 async function createSession(
@@ -4709,9 +4806,11 @@ async function createSession(
   await db
     .prepare(
       `INSERT INTO track_sessions_v2
-        (session_id, user_id, step, site, slug, source_slug, schedule_day,
-         schedule_hour, schedule_minute, buffer_min, edit_field, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (session_id, user_id, step, site, slug, source_slug,
+         custom_episode_pattern, custom_anime_url,
+         schedule_day, schedule_hour, schedule_minute,
+         buffer_min, edit_field, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       sessionId,
@@ -4720,6 +4819,8 @@ async function createSession(
       initial.site ?? null,
       initial.slug ?? null,
       initial.source_slug ?? null,
+      initial.custom_episode_pattern ?? null,
+      initial.custom_anime_url ?? null,
       initial.schedule_day ?? null,
       initial.schedule_hour ?? null,
       initial.schedule_minute ?? null,
@@ -4847,6 +4948,10 @@ function newRescanId(): string {
   return 'rc_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
+function siteLabel(site: TrackSite): string {
+  return site === 'custom' ? '🌐 Custom' : `🎬 ${site}`;
+}
+
 /* ============================================================
    MENU RENDER
    ============================================================ */
@@ -4942,7 +5047,8 @@ export async function showList(ctx: Context, env: Env, page = 0): Promise<void> 
   for (const r of items) {
     const icon = r.status === 'active' ? '🟢' : r.status === 'paused' ? '⏸️' : '✅';
     const pending = isInScheduleWindow(r) ? ' ⚠️' : '';
-    const label = `${icon} ${r.slug}${pending}`;
+    const siteIcon = r.site === 'custom' ? '🌐' : '🎬';
+    const label = `${icon} ${siteIcon} ${r.slug}${pending}`;
     const short = label.length > 50 ? label.slice(0, 48) + '…' : label;
     kb.text(short, `tr:v:${hashSlug(r.slug)}`).row();
   }
@@ -5000,8 +5106,13 @@ export async function showDetail(
   const lines: string[] = [];
   lines.push(`📄 <code>${escapeHtml(row.slug)}</code>${pending}`);
   lines.push('');
-  lines.push(`🎬 Site: <b>${row.site}</b>`);
-  lines.push(`🔗 Source: <code>${escapeHtml(row.source_slug)}</code>`);
+  lines.push(`🎬 Site: <b>${siteLabel(row.site)}</b>`);
+  if (row.site === 'custom') {
+    lines.push(`📼 Pattern: <code>${escapeHtml(row.custom_episode_pattern ?? '-')}</code>`);
+    lines.push(`🔍 Anime URL: <code>${escapeHtml(row.custom_anime_url ?? '-')}</code>`);
+  } else {
+    lines.push(`🔗 Source: <code>${escapeHtml(row.source_slug)}</code>`);
+  }
   lines.push(`📅 ${row.schedule_day} ${hh}:${mm} WIB`);
   lines.push(`${statusIcon} Status: <b>${row.status}</b>`);
   lines.push(`📼 Last ep: <b>${row.last_ep}</b>`);
@@ -5015,11 +5126,19 @@ export async function showDetail(
   lines.push('');
   lines.push('<i>Pilih field untuk edit:</i>');
 
-  const kb = new InlineKeyboard()
-    .text('🎬 Site', `tr:e:${sh}:site`)
-    .text('🔗 Source', `tr:e:${sh}:source_slug`)
-    .row()
-    .text('📅 Hari', `tr:e:${sh}:schedule_day`)
+  const kb = new InlineKeyboard();
+
+  if (row.site === 'custom') {
+    kb.text('📼 Pattern', `tr:e:${sh}:custom_pattern`)
+      .text('🔍 Anime URL', `tr:e:${sh}:custom_anime_url`)
+      .row();
+  } else {
+    kb.text('🎬 Site', `tr:e:${sh}:site`)
+      .text('🔗 Source', `tr:e:${sh}:source_slug`)
+      .row();
+  }
+
+  kb.text('📅 Hari', `tr:e:${sh}:schedule_day`)
     .text('⏰ Jam', `tr:e:${sh}:schedule_hour`)
     .row()
     .text('📼 Last Ep', `tr:e:${sh}:last_ep`)
@@ -5144,6 +5263,16 @@ export async function promptEdit(
       kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
       break;
 
+    case 'custom_pattern':
+      prompt = `📼 <b>Edit Custom Pattern</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <code>${escapeHtml(row.custom_episode_pattern ?? '-')}</code>\n\nKirim URL pattern episode (pakai <code>{n}</code>):\n<code>https://situs.com/anime/foo/episode/{n}</code>\n\nAtau kirim contoh URL episode, bot auto-detect:`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
+      break;
+
+    case 'custom_anime_url':
+      prompt = `🔍 <b>Edit Anime URL</b>\n\nAnime: <code>${escapeHtml(slug)}</code>\nSekarang: <code>${escapeHtml(row.custom_anime_url ?? '-')}</code>\n\nKirim URL halaman anime (untuk auto-detect episode terbaru):\n<code>https://situs.com/anime/foo</code>\n\nAtau kirim <code>-</code> untuk kosongkan:`;
+      kb = new InlineKeyboard().text('❌ Batal', `tr:v:${sh}`);
+      break;
+
     default:
       await ctx.answerCallbackQuery({ text: '❌ Field tidak dikenal' }).catch(() => {});
       return;
@@ -5168,7 +5297,7 @@ export async function startAddFlow(ctx: Context, env: Env, userId: number): Prom
 
   const text =
     '<b>➕ Track Anime Baru</b>\n\n' +
-    '<b>Step 1/5</b> · Pilih situs sumber:\n\n' +
+    '<b>Step 1</b> · Pilih situs sumber:\n\n' +
     '<i>Bot akan cek situs ini setiap hari untuk episode baru.</i>';
 
   const kb = new InlineKeyboard()
@@ -5176,6 +5305,8 @@ export async function startAddFlow(ctx: Context, env: Env, userId: number): Prom
     .text('🎬 animesub', `tr:site:${sessionId}:animesub`)
     .row()
     .text('🎬 samehadaku', `tr:site:${sessionId}:samehadaku`)
+    .row()
+    .text('🌐 Custom URL', `tr:site:${sessionId}:custom`)
     .row()
     .text('❌ Batal', `tr:x:${sessionId}`);
 
@@ -5376,7 +5507,8 @@ async function showRescanList(
   const kb = new InlineKeyboard();
   for (const r of items) {
     const icon = r.status === 'active' ? '🟢' : r.status === 'paused' ? '⏸️' : '✅';
-    const label = `${icon} ${r.slug} — ep ${r.last_ep}`;
+    const siteIcon = r.site === 'custom' ? '🌐' : '🎬';
+    const label = `${icon} ${siteIcon} ${r.slug} — ep ${r.last_ep}`;
     const short = label.length > 55 ? label.slice(0, 53) + '…' : label;
     kb.text(short, `tr:rcv:${sid}:${hashSlug(r.slug)}`).row();
   }
@@ -5432,7 +5564,7 @@ async function showRescanDetail(
   lines.push('🔄 <b>Rescan — Detail</b>');
   lines.push('');
   lines.push(`🆔 <code>${escapeHtml(row.slug)}</code>`);
-  lines.push(`🎬 Site: ${row.site}`);
+  lines.push(`🎬 Site: ${siteLabel(row.site)}`);
   lines.push(`📼 Last ep: <b>${row.last_ep}</b>`);
   lines.push(`📦 Chunk: <b>${row.chunk_start}-${row.chunk_end}</b>`);
   lines.push('');
@@ -5611,6 +5743,10 @@ export async function handleTrackTextV2(ctx: Context, env: Env): Promise<boolean
       return await handleAddSlug(ctx, env, session, text);
     case 'add_source':
       return await handleAddSource(ctx, env, session, text);
+    case 'add_pattern':
+      return await handleAddPattern(ctx, env, session, text);
+    case 'add_anime_url':
+      return await handleAddAnimeUrl(ctx, env, session, text);
     case 'add_hour':
       return await handleAddHour(ctx, env, session, text);
     case 'edit_value':
@@ -5645,16 +5781,42 @@ async function handleAddSlug(
     return true;
   }
 
+  const isCustom = session.site === 'custom';
+
+  if (isCustom) {
+    await updateSession(env.DB, session.session_id, {
+      slug,
+      source_slug: slug,
+      step: 'add_pattern',
+    });
+
+    await ctx.reply(
+      `<b>Step 3</b> · Kirim <b>URL pattern episode</b>.\n\n🆔 Repo: <code>${escapeHtml(slug)}</code>\n\n` +
+        `<b>Cara 1 — pakai placeholder</b> <code>{n}</code>:\n` +
+        `<code>https://situs.com/anime/foo/episode/{n}</code>\n\n` +
+        `<b>Cara 2 — kirim contoh URL episode</b> (bot auto-detect):\n` +
+        `<code>https://situs.com/anime/foo/episode/1</code>\n` +
+        `<code>https://situs.com/watch/foo/1</code>`,
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${session.session_id}`),
+      }
+    );
+    return true;
+  }
+
   await updateSession(env.DB, session.session_id, {
     slug,
     source_slug: slug,
     step: 'add_source',
   });
 
-  const isSamehadaku = session.site === 'samehadaku';
+  const site = session.site ?? '';
+  const isSamehadaku = site === 'samehadaku';
   const prompt = isSamehadaku
     ? `<b>Step 3/5</b> · Slug di <b>samehadaku</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Opsi:</b>\n• URL anime Samehadaku\n• Slug langsung\n• <code>-</code> kalau sama`
-    : `<b>Step 3/5</b> · Slug di <b>${session.site}</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Kalau sama:</b> kirim <code>-</code>\n<b>Kalau beda:</b> kirim slug situs`;
+    : `<b>Step 3/5</b> · Slug di <b>${site}</b>\n\n🆔 Qimochi: <code>${escapeHtml(slug)}</code>\n\n<b>Kalau sama:</b> kirim <code>-</code>\n<b>Kalau beda:</b> kirim slug situs`;
 
   await ctx.reply(prompt, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
   return true;
@@ -5711,6 +5873,87 @@ async function handleAddSource(
   return true;
 }
 
+async function handleAddPattern(
+  ctx: Context,
+  env: Env,
+  session: TrackSessionRow,
+  input: string
+): Promise<boolean> {
+  const parsed = resolveCustomPattern(input);
+
+  if (!parsed) {
+    await ctx.reply(
+      '❌ URL pattern tidak dikenali.\n\n' +
+        '<b>Cara 1:</b> pakai placeholder <code>{n}</code>:\n' +
+        '<code>https://situs.com/anime/foo/episode/{n}</code>\n\n' +
+        '<b>Cara 2:</b> kirim contoh URL dengan nomor episode:\n' +
+        '<code>https://situs.com/anime/foo/episode/1</code>\n\n' +
+        'Coba lagi:',
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
+    );
+    return true;
+  }
+
+  await updateSession(env.DB, session.session_id, {
+    custom_episode_pattern: parsed.pattern,
+    step: 'add_anime_url',
+  });
+
+  await ctx.reply(
+    `<b>Step 4</b> · Kirim <b>URL halaman anime</b>.\n\n` +
+      `📼 Pattern: <code>${escapeHtml(parsed.pattern)}</code>\n\n` +
+      `Ini dipakai buat auto-detect episode terbaru.\n` +
+      `<b>Contoh:</b>\n` +
+      `<code>https://situs.com/anime/foo</code>\n\n` +
+      `<i>Kirim <code>-</code> kalau nggak ada / mau set manual.</i>`,
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${session.session_id}`),
+    }
+  );
+  return true;
+}
+
+async function handleAddAnimeUrl(
+  ctx: Context,
+  env: Env,
+  session: TrackSessionRow,
+  input: string
+): Promise<boolean> {
+  let animeUrl: string | null = null;
+
+  if (input !== '-') {
+    if (!/^https?:\/\//i.test(input)) {
+      await ctx.reply('❌ URL invalid. Kirim URL atau <code>-</code>:', {
+        parse_mode: 'HTML',
+      });
+      return true;
+    }
+    animeUrl = input.trim();
+  }
+
+  await updateSession(env.DB, session.session_id, {
+    custom_anime_url: animeUrl,
+    step: 'add_day',
+  });
+
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < 7; i++) {
+    kb.text(DAYS_SHORT[i]!, `tr:day:${session.session_id}:${DAYS[i]}`);
+    if ((i + 1) % 4 === 0) kb.row();
+  }
+  kb.text('🎲 Random', `tr:day:${session.session_id}:Random`).row();
+  kb.text('❌ Batal', `tr:x:${session.session_id}`);
+
+  await ctx.reply('<b>Step 5</b> · Pilih hari rilis:', {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: kb,
+  });
+  return true;
+}
+
 async function handleAddHour(
   ctx: Context,
   env: Env,
@@ -5735,17 +5978,30 @@ async function handleAddHour(
 
   const hh = String(parsed.hour).padStart(2, '0');
   const mm = String(parsed.minute).padStart(2, '0');
+  const isCustom = session.site === 'custom';
 
-  await ctx.reply(
-    `📋 <b>Konfirmasi</b>\n\n🎬 Site: <b>${session.site}</b>\n🆔 <code>${escapeHtml(session.slug ?? '-')}</code>\n🔗 <code>${escapeHtml(session.source_slug ?? '-')}</code>\n📅 ${session.schedule_day} ${hh}:${mm} WIB\n\n<i>Klik Simpan.</i>`,
-    {
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      reply_markup: new InlineKeyboard()
-        .text('✅ Simpan', `tr:save:${session.session_id}`)
-        .text('❌ Batal', `tr:x:${session.session_id}`),
-    }
-  );
+  const lines: string[] = [];
+  lines.push(`📋 <b>Konfirmasi</b>`);
+  lines.push('');
+  lines.push(`🎬 Site: <b>${siteLabel((session.site ?? 'lexanime') as TrackSite)}</b>`);
+  lines.push(`🆔 <code>${escapeHtml(session.slug ?? '-')}</code>`);
+  if (isCustom) {
+    lines.push(`📼 Pattern: <code>${escapeHtml(session.custom_episode_pattern ?? '-')}</code>`);
+    lines.push(`🔍 Anime URL: <code>${escapeHtml(session.custom_anime_url ?? '-')}</code>`);
+  } else {
+    lines.push(`🔗 <code>${escapeHtml(session.source_slug ?? '-')}</code>`);
+  }
+  lines.push(`📅 ${session.schedule_day} ${hh}:${mm} WIB`);
+  lines.push('');
+  lines.push('<i>Klik Simpan.</i>');
+
+  await ctx.reply(lines.join('\n'), {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: new InlineKeyboard()
+      .text('✅ Simpan', `tr:save:${session.session_id}`)
+      .text('❌ Batal', `tr:x:${session.session_id}`),
+  });
   return true;
 }
 
@@ -5828,6 +6084,15 @@ async function handleEditValue(
     }
     if (SLUG_RE.test(s)) patch.source_slug = s;
     else error = 'Slug invalid';
+  } else if (field === 'custom_pattern') {
+    const parsed = resolveCustomPattern(input);
+    if (parsed) patch.custom_episode_pattern = parsed.pattern;
+    else error = 'URL pattern invalid';
+  } else if (field === 'custom_anime_url') {
+    const t = input.trim();
+    if (t === '-') patch.custom_anime_url = null;
+    else if (/^https?:\/\//i.test(t)) patch.custom_anime_url = t;
+    else error = 'URL invalid atau "-"';
   }
 
   if (error) {
@@ -6147,7 +6412,7 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     await showList(ctx, env, 0);
   });
 
-  /* Delete menu — collapsed: quick delete by site */
+  /* Delete menu */
   bot.callbackQuery(/^tr:dm$/, async (ctx) => {
     await ctx.answerCallbackQuery().catch(() => {});
     await showDeleteMenu(ctx, env);
@@ -6155,62 +6420,74 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
 
   bot.callbackQuery(/^tr:ds:(\w+)$/, async (ctx) => {
     const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
+    if (site !== 'custom' && !isValidSite(site)) {
       await ctx.answerCallbackQuery({ text: '❌' });
       return;
     }
     await ctx.answerCallbackQuery().catch(() => {});
-    await showDeleteSite(ctx, env, site);
+    await showDeleteSite(ctx, env, site as TrackSite);
   });
 
   bot.callbackQuery(/^tr:dall:(\w+)$/, async (ctx) => {
     const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
+    if (site !== 'custom' && !isValidSite(site)) {
       await ctx.answerCallbackQuery({ text: '❌' });
       return;
     }
     await ctx.answerCallbackQuery({ text: '⚠️' });
-    await confirmDeleteAll(ctx, env, site);
+    await confirmDeleteAll(ctx, env, site as TrackSite);
   });
 
   bot.callbackQuery(/^tr:dally:(\w+)$/, async (ctx) => {
     const site = ctx.match[1] ?? '';
-    if (!isValidSite(site)) {
+    if (site !== 'custom' && !isValidSite(site)) {
       await ctx.answerCallbackQuery({ text: '❌' });
       return;
     }
     await ctx.answerCallbackQuery({ text: '🗑️' });
-    await execDeleteAll(ctx, env, site);
+    await execDeleteAll(ctx, env, site as TrackSite);
   });
 
-  /* Add flow */
-  bot.callbackQuery(/^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku)$/, async (ctx) => {
-    const sessionId = ctx.match[1] ?? '';
-    const site = (ctx.match[2] ?? '') as SiteKey;
-    const session = await getSession(env.DB, sessionId);
-    if (!session) {
-      await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
-      return;
+  /* Add flow — pilih site */
+  bot.callbackQuery(
+    /^tr:site:(ts_[a-z0-9]+):(lexanime|animesub|samehadaku|custom)$/,
+    async (ctx) => {
+      const sessionId = ctx.match[1] ?? '';
+      const rawSite = ctx.match[2] ?? '';
+      const session = await getSession(env.DB, sessionId);
+      if (!session) {
+        await ctx.answerCallbackQuery({ text: '⏱️', show_alert: true });
+        return;
+      }
+      if (ctx.from?.id !== session.user_id) {
+        await ctx.answerCallbackQuery({ text: '⛔' });
+        return;
+      }
+
+      const isCustom = rawSite === 'custom';
+      const siteValue: TrackSite = isCustom ? 'custom' : (rawSite as SiteKey);
+
+      await updateSession(env.DB, sessionId, { site: siteValue, step: 'add_slug' });
+      await ctx.answerCallbackQuery({ text: isCustom ? '🌐 Custom' : rawSite });
+
+      const prompt = isCustom
+        ? '<b>Step 2</b> · Kirim <b>slug anime</b> (kunci di yukio-data).\n\n<i>Contoh: <code>chii-fuyo</code></i>'
+        : '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>';
+
+      await ctx.api
+        .editMessageText(
+          ctx.chat!.id,
+          ctx.callbackQuery!.message!.message_id!,
+          prompt,
+          {
+            parse_mode: 'HTML',
+            link_preview_options: { is_disabled: true },
+            reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
+          }
+        )
+        .catch(() => {});
     }
-    if (ctx.from?.id !== session.user_id) {
-      await ctx.answerCallbackQuery({ text: '⛔' });
-      return;
-    }
-    await updateSession(env.DB, sessionId, { site, step: 'add_slug' });
-    await ctx.answerCallbackQuery({ text: site });
-    await ctx.api
-      .editMessageText(
-        ctx.chat!.id,
-        ctx.callbackQuery!.message!.message_id!,
-        '<b>Step 2/5</b> · Kirim <b>slug anime</b> qimochi.\n\n<i>Contoh: <code>tensei-goblin-dakedo-shitsumon-aru</code></i>',
-        {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-          reply_markup: new InlineKeyboard().text('❌ Batal', `tr:x:${sessionId}`),
-        }
-      )
-      .catch(() => {});
-  });
+  );
 
   bot.callbackQuery(/^tr:day:(ts_[a-z0-9]+):([A-Za-z]+)$/, async (ctx) => {
     const sessionId = ctx.match[1] ?? '';
@@ -6226,11 +6503,15 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
     }
     await updateSession(env.DB, sessionId, { schedule_day: day, step: 'add_hour' });
     await ctx.answerCallbackQuery({ text: day });
+
+    const isCustom = session.site === 'custom';
+    const stepLabel = isCustom ? 'Step 6' : 'Step 5/5';
+
     await ctx.api
       .editMessageText(
         ctx.chat!.id,
         ctx.callbackQuery!.message!.message_id!,
-        `<b>Step 5/5</b> · Hari: <b>${day}</b>\n\nKirim <b>jam rilis</b> (WIB):\n\n• <code>18</code> → 18:00\n• <code>18:30</code> → 18:30`,
+        `<b>${stepLabel}</b> · Hari: <b>${day}</b>\n\nKirim <b>jam rilis</b> (WIB):\n\n• <code>18</code> → 18:00\n• <code>18:30</code> → 18:30`,
         {
           parse_mode: 'HTML',
           link_preview_options: { is_disabled: true },
@@ -6251,41 +6532,98 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
       await ctx.answerCallbackQuery({ text: '⛔' });
       return;
     }
+
     if (
       !session.site ||
       !session.slug ||
-      !session.source_slug ||
       !session.schedule_day ||
       session.schedule_hour === null
     ) {
       await ctx.answerCallbackQuery({ text: '❌ Data kurang', show_alert: true });
       return;
     }
-    const site = session.site as SiteKey;
-    const fallbackSite: SiteKey | null =
-      site === 'lexanime' ? 'animesub' : site === 'animesub' ? 'lexanime' : null;
 
-    await saveTrackedAnime(env.DB, {
-      slug: session.slug,
-      site,
-      sourceSlug: session.source_slug,
-      fallbackSite,
-      scheduleDay: session.schedule_day,
-      scheduleHour: session.schedule_hour,
-      scheduleMinute: session.schedule_minute ?? 0,
-      bufferMin: session.buffer_min,
-    });
+    const site = session.site as TrackSite;
+    const isCustom = site === 'custom';
+
+    if (isCustom) {
+      if (!session.custom_episode_pattern) {
+        await ctx.answerCallbackQuery({ text: '❌ Pattern kosong', show_alert: true });
+        return;
+      }
+      if (!session.custom_anime_url) {
+        await ctx.answerCallbackQuery({
+          text: '⚠️ Anime URL kosong. Cron tidak akan bisa auto-detect.',
+          show_alert: true,
+        });
+      }
+
+      await saveTrackedAnime(env.DB, {
+        slug: session.slug,
+        site: 'custom',
+        sourceSlug: session.source_slug ?? session.slug,
+        fallbackSite: null,
+        scheduleDay: session.schedule_day,
+        scheduleHour: session.schedule_hour,
+        scheduleMinute: session.schedule_minute ?? 0,
+        bufferMin: session.buffer_min,
+        customEpisodePattern: session.custom_episode_pattern,
+        customAnimeUrl: session.custom_anime_url,
+      });
+    } else {
+      if (!session.source_slug) {
+        await ctx.answerCallbackQuery({ text: '❌ Source slug kosong', show_alert: true });
+        return;
+      }
+
+      const siteKey = site as SiteKey;
+      const fallbackSite: SiteKey | null =
+        siteKey === 'lexanime'
+          ? 'animesub'
+          : siteKey === 'animesub'
+            ? 'lexanime'
+            : null;
+
+      await saveTrackedAnime(env.DB, {
+        slug: session.slug,
+        site: siteKey,
+        sourceSlug: session.source_slug,
+        fallbackSite,
+        scheduleDay: session.schedule_day,
+        scheduleHour: session.schedule_hour,
+        scheduleMinute: session.schedule_minute ?? 0,
+        bufferMin: session.buffer_min,
+        customEpisodePattern: null,
+        customAnimeUrl: null,
+      });
+    }
+
     await deleteSession(env.DB, sessionId);
     await ctx.answerCallbackQuery({ text: '✅' });
 
     const hh = String(session.schedule_hour).padStart(2, '0');
     const mm = String(session.schedule_minute ?? 0).padStart(2, '0');
 
+    const lines: string[] = [];
+    lines.push(`✅ <b>Anime di-track!</b>`);
+    lines.push('');
+    lines.push(`🆔 <code>${escapeHtml(session.slug)}</code>`);
+    lines.push(`🎬 ${siteLabel(site)}`);
+    if (isCustom) {
+      lines.push(`📼 <code>${escapeHtml(session.custom_episode_pattern ?? '-')}</code>`);
+      if (session.custom_anime_url) {
+        lines.push(`🔍 <code>${escapeHtml(session.custom_anime_url)}</code>`);
+      } else {
+        lines.push(`⚠️ <i>Anime URL kosong → cron skip. Set manual via edit.</i>`);
+      }
+    }
+    lines.push(`📅 ${session.schedule_day} ${hh}:${mm} WIB`);
+
     await ctx.api
       .editMessageText(
         ctx.chat!.id,
         ctx.callbackQuery!.message!.message_id!,
-        `✅ <b>Anime di-track!</b>\n\n🆔 <code>${escapeHtml(session.slug)}</code>\n🎬 ${site}\n📅 ${session.schedule_day} ${hh}:${mm} WIB`,
+        lines.join('\n'),
         { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, reply_markup: undefined }
       )
       .catch(() => {});
@@ -6408,11 +6746,16 @@ export function setupTrackCallbacks(bot: Bot, env: Env): void {
 
 async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
-  const counts: Record<SiteKey, number> = { lexanime: 0, animesub: 0, samehadaku: 0 };
+  const counts: Record<TrackSite, number> = {
+    lexanime: 0,
+    animesub: 0,
+    samehadaku: 0,
+    custom: 0,
+  };
   for (const r of all) {
-    if (r.site in counts) counts[r.site]++;
+    if (r.site in counts) counts[r.site as TrackSite]++;
   }
-  const total = counts.lexanime + counts.animesub + counts.samehadaku;
+  const total = counts.lexanime + counts.animesub + counts.samehadaku + counts.custom;
   const editId = ctx.callbackQuery!.message!.message_id!;
 
   if (total === 0) {
@@ -6430,6 +6773,7 @@ async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
   if (counts.lexanime > 0) kb.text(`🎬 lexanime (${counts.lexanime})`, 'tr:ds:lexanime').row();
   if (counts.animesub > 0) kb.text(`🎬 animesub (${counts.animesub})`, 'tr:ds:animesub').row();
   if (counts.samehadaku > 0) kb.text(`🎬 samehadaku (${counts.samehadaku})`, 'tr:ds:samehadaku').row();
+  if (counts.custom > 0) kb.text(`🌐 custom (${counts.custom})`, 'tr:ds:custom').row();
   kb.text('◀️ Kembali', 'tr:h');
 
   await ctx.api
@@ -6446,14 +6790,14 @@ async function showDeleteMenu(ctx: Context, env: Env): Promise<void> {
     .catch(() => {});
 }
 
-async function showDeleteSite(ctx: Context, env: Env, site: SiteKey): Promise<void> {
+async function showDeleteSite(ctx: Context, env: Env, site: TrackSite): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
   const list = all.filter((r) => r.site === site).sort((a, b) => a.slug.localeCompare(b.slug));
   const editId = ctx.callbackQuery!.message!.message_id!;
 
   if (list.length === 0) {
     await ctx.api
-      .editMessageText(ctx.chat!.id, editId, `📭 Tidak ada anime dari <b>${site}</b>.`, {
+      .editMessageText(ctx.chat!.id, editId, `📭 Tidak ada anime dari <b>${siteLabel(site)}</b>.`, {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         reply_markup: new InlineKeyboard().text('◀️ Kembali', 'tr:dm'),
@@ -6463,7 +6807,7 @@ async function showDeleteSite(ctx: Context, env: Env, site: SiteKey): Promise<vo
   }
 
   const lines: string[] = [];
-  lines.push(`🗑️ <b>Hapus dari ${escapeHtml(site)}</b>`);
+  lines.push(`🗑️ <b>Hapus dari ${siteLabel(site)}</b>`);
   lines.push('');
   lines.push(`📊 Total: <b>${list.length}</b>`);
   lines.push('');
@@ -6484,7 +6828,7 @@ async function showDeleteSite(ctx: Context, env: Env, site: SiteKey): Promise<vo
     .catch(() => {});
 }
 
-async function confirmDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<void> {
+async function confirmDeleteAll(ctx: Context, env: Env, site: TrackSite): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
   const list = all.filter((r) => r.site === site);
   const editId = ctx.callbackQuery!.message!.message_id!;
@@ -6492,7 +6836,7 @@ async function confirmDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<
   const lines: string[] = [];
   lines.push('⚠️ <b>Konfirmasi Hapus Semua</b>');
   lines.push('');
-  lines.push(`Yakin hapus <b>${list.length}</b> anime dari <b>${escapeHtml(site)}</b>?`);
+  lines.push(`Yakin hapus <b>${list.length}</b> anime dari <b>${siteLabel(site)}</b>?`);
   lines.push('');
   for (const r of list.slice(0, 10)) lines.push(`• <code>${escapeHtml(r.slug)}</code>`);
   if (list.length > 10) lines.push(`<i>… dan ${list.length - 10} lainnya</i>`);
@@ -6510,7 +6854,7 @@ async function confirmDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<
     .catch(() => {});
 }
 
-async function execDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<void> {
+async function execDeleteAll(ctx: Context, env: Env, site: TrackSite): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
   const list = all.filter((r) => r.site === site);
   let deleted = 0;
@@ -6523,7 +6867,7 @@ async function execDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<voi
     .editMessageText(
       ctx.chat!.id,
       editId,
-      `✅ <b>Hapus selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${escapeHtml(site)}</b>`,
+      `✅ <b>Hapus selesai</b>\n\n🗑️ Dihapus: <b>${deleted}</b>\nSitus: <b>${siteLabel(site)}</b>`,
       {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
@@ -6532,6 +6876,7 @@ async function execDeleteAll(ctx: Context, env: Env, site: SiteKey): Promise<voi
     )
     .catch(() => {});
 }
+
 ===== END FILE =====
 
 ===== FILE: ./src/commands/va.ts =====
@@ -7256,6 +7601,11 @@ import type { Env } from '../../types/env';
 import type { EpisodeObject } from '../../types/anime';
 import { safeFetch } from '../dba-common';
 import type { SiteKey } from './state';
+import {
+  decodeInput,
+  buildEpisodeObject,
+  extractInertiaEpisodeNumbers,
+} from '../../services/decode-core';
 
 interface SiteConfig {
   host: string;
@@ -7287,7 +7637,7 @@ const SITES: Record<SiteKey, SiteConfig> = {
 
 const FETCH_TIMEOUT_MS = 12000;
 
-async function fetchViaProxy(env: Env, url: string): Promise<string | null> {
+export async function fetchViaProxy(env: Env, url: string): Promise<string | null> {
   const proxyUrl = env.VAL_TOWN_FETCH_URL;
   if (!proxyUrl) {
     console.error('[Fetcher] VAL_TOWN_FETCH_URL tidak di-set');
@@ -7350,6 +7700,58 @@ export async function fetchLatestEpisodeNumber(
   if (site === 'samehadaku') return parseLatestEpisodeSamehadaku(html);
   return parseLatestEpisodeLexanime(html);
 }
+
+/* ── Custom site support ── */
+
+export async function fetchLatestEpisodeNumberCustom(
+  env: Env,
+  animeUrl: string | null
+): Promise<number | null> {
+  if (!animeUrl || !/^https?:\/\//i.test(animeUrl)) return null;
+
+  const html = await fetchViaProxy(env, animeUrl);
+  if (!html) return null;
+
+  // Try Inertia payload first
+  const inertiaEps = extractInertiaEpisodeNumbers(html);
+  if (inertiaEps.length > 0) return Math.max(...inertiaEps);
+
+  // Fallback: regex
+  const numbers = new Set<number>();
+  for (const m of html.matchAll(/\/episode\/(\d+)/gi)) {
+    const n = parseInt(m[1] ?? '', 10);
+    if (!isNaN(n) && n > 0 && n < 10000) numbers.add(n);
+  }
+  for (const m of html.matchAll(/episode[-\s](\d+)/gi)) {
+    const n = parseInt(m[1] ?? '', 10);
+    if (!isNaN(n) && n > 0 && n < 10000) numbers.add(n);
+  }
+  for (const m of html.matchAll(/\bep\s*(\d+)\b/gi)) {
+    const n = parseInt(m[1] ?? '', 10);
+    if (!isNaN(n) && n > 0 && n < 10000) numbers.add(n);
+  }
+
+  if (numbers.size === 0) return null;
+  return Math.max(...numbers);
+}
+
+export async function fetchEpisodeCustom(
+  env: Env,
+  pattern: string,
+  epNumber: number
+): Promise<EpisodeObject | null> {
+  const url = pattern.replace(/\{n\}/g, String(epNumber));
+  const html = await fetchViaProxy(env, url);
+  if (!html) return null;
+  if (html.length < 2000 && /404|not found/i.test(html)) return null;
+
+  const processed = decodeInput(html, 'html');
+  if (!processed) return null;
+
+  return buildEpisodeObject(processed.videos, epNumber);
+}
+
+/* ── Known site (existing) ── */
 
 interface ParsedEpisode {
   sourceUrl: string;
@@ -7527,6 +7929,7 @@ export async function fetchEpisode(
     ],
   };
 }
+
 ===== END FILE =====
 
 ===== FILE: ./src/lib/cron/runner.ts =====
@@ -7549,9 +7952,15 @@ import {
   writeCronLog,
   isInScheduleWindow,
   type SiteKey,
+  type TrackSite,
   type TrackedAnimeRow,
 } from './state';
-import { fetchLatestEpisodeNumber, fetchEpisode } from './fetcher';
+import {
+  fetchLatestEpisodeNumber,
+  fetchEpisode,
+  fetchLatestEpisodeNumberCustom,
+  fetchEpisodeCustom,
+} from './fetcher';
 
 const MAX_ANIME_PER_RUN = 5;
 
@@ -7646,19 +8055,55 @@ interface ProcessResult {
   error: string | null;
 }
 
-async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessResult> {
-  const { slug, site, source_slug, fallback_site } = row;
+interface DetectResult {
+  latest: number | null;
+  usedSite: TrackSite;
+}
 
-  let latestEp = await fetchLatestEpisodeNumber(env, site, source_slug);
-  let usedSite: SiteKey = site;
-
-  if (latestEp === null && fallback_site) {
-    latestEp = await fetchLatestEpisodeNumber(env, fallback_site, source_slug);
-    if (latestEp !== null) usedSite = fallback_site;
+async function detectLatest(
+  env: Env,
+  row: TrackedAnimeRow
+): Promise<DetectResult> {
+  if (row.site === 'custom') {
+    const n = await fetchLatestEpisodeNumberCustom(env, row.custom_anime_url);
+    return { latest: n, usedSite: 'custom' };
   }
 
+  let latest = await fetchLatestEpisodeNumber(env, row.site, row.source_slug);
+  let usedSite: TrackSite = row.site;
+
+  if (latest === null && row.fallback_site) {
+    latest = await fetchLatestEpisodeNumber(env, row.fallback_site, row.source_slug);
+    if (latest !== null) usedSite = row.fallback_site;
+  }
+
+  return { latest, usedSite };
+}
+
+async function fetchEpisodeForRow(
+  env: Env,
+  row: TrackedAnimeRow,
+  usedSite: TrackSite,
+  epNumber: number
+): Promise<EpisodeObject | null> {
+  if (usedSite === 'custom') {
+    if (!row.custom_episode_pattern) return null;
+    return fetchEpisodeCustom(env, row.custom_episode_pattern, epNumber);
+  }
+  return fetchEpisode(env, usedSite as SiteKey, row.source_slug, epNumber);
+}
+
+async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessResult> {
+  const { slug } = row;
+
+  if (row.site === 'custom' && !row.custom_episode_pattern) {
+    return { pushed: 0, error: `Custom site tanpa episode pattern untuk ${slug}` };
+  }
+
+  const { latest: latestEp, usedSite } = await detectLatest(env, row);
+
   if (latestEp === null) {
-    return { pushed: 0, error: `Semua site gagal cek latest ep untuk ${slug}` };
+    return { pushed: 0, error: `Gagal cek latest ep untuk ${slug}` };
   }
 
   if (latestEp <= row.last_ep) {
@@ -7679,14 +8124,19 @@ async function processOneAnime(env: Env, row: TrackedAnimeRow): Promise<ProcessR
     const already = await isEpisodePublished(env.DB, slug, ep);
     if (already) continue;
 
-    let episode = await fetchEpisode(env, usedSite, source_slug, ep);
-    if (!episode && usedSite !== (fallback_site ?? site)) {
-      episode = await fetchEpisode(env, fallback_site as SiteKey, source_slug, ep);
-      if (episode) usedSite = fallback_site as SiteKey;
+    let episode = await fetchEpisodeForRow(env, row, usedSite, ep);
+
+    if (
+      !episode &&
+      usedSite !== 'custom' &&
+      row.fallback_site &&
+      usedSite !== row.fallback_site
+    ) {
+      episode = await fetchEpisode(env, row.fallback_site, row.source_slug, ep);
     }
 
     if (!episode) {
-      lastError = `Ep ${ep} tidak bisa di-fetch dari semua site`;
+      lastError = `Ep ${ep} tidak bisa di-fetch`;
       break;
     }
 
@@ -7807,6 +8257,7 @@ export async function runManualCheck(env: Env, slug: string): Promise<CronRunRes
     errors: result.error ? [result.error] : [],
   };
 }
+
 ===== END FILE =====
 
 ===== FILE: ./src/lib/cron/state-extra.ts =====
@@ -7862,10 +8313,11 @@ import type { D1Database } from '@cloudflare/workers-types';
 import { createLazyInit } from '../lazy-init';
 
 export type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
+export type TrackSite = SiteKey | 'custom';
 
 export interface TrackedAnimeRow {
   slug: string;
-  site: SiteKey;
+  site: TrackSite;
   source_slug: string;
   fallback_site: SiteKey | null;
   schedule_day: string;
@@ -7878,6 +8330,8 @@ export interface TrackedAnimeRow {
   status: 'active' | 'paused' | 'finished';
   last_check_at: number | null;
   last_push_at: number | null;
+  custom_episode_pattern: string | null;
+  custom_anime_url: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -7909,6 +8363,8 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
         status           TEXT NOT NULL DEFAULT 'active',
         last_check_at    INTEGER,
         last_push_at     INTEGER,
+        custom_episode_pattern TEXT,
+        custom_anime_url       TEXT,
         created_at       INTEGER NOT NULL,
         updated_at       INTEGER NOT NULL
       )`
@@ -7918,6 +8374,18 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
   try {
     await db
       .prepare('ALTER TABLE tracked_anime ADD COLUMN schedule_minute INTEGER NOT NULL DEFAULT 0')
+      .run();
+  } catch {}
+
+  try {
+    await db
+      .prepare('ALTER TABLE tracked_anime ADD COLUMN custom_episode_pattern TEXT')
+      .run();
+  } catch {}
+
+  try {
+    await db
+      .prepare('ALTER TABLE tracked_anime ADD COLUMN custom_anime_url TEXT')
       .run();
   } catch {}
 
@@ -7957,13 +8425,15 @@ export const ensureCronDb = createLazyInit('Cron', async (db) => {
 
 export interface SaveTrackedAnimeInput {
   slug: string;
-  site: SiteKey;
+  site: TrackSite;
   sourceSlug: string;
   fallbackSite: SiteKey | null;
   scheduleDay: string;
   scheduleHour: number;
   scheduleMinute?: number;
   bufferMin?: number;
+  customEpisodePattern?: string | null;
+  customAnimeUrl?: string | null;
 }
 
 export async function saveTrackedAnime(
@@ -7978,8 +8448,8 @@ export async function saveTrackedAnime(
       `INSERT INTO tracked_anime
         (slug, site, source_slug, fallback_site, schedule_day, schedule_hour,
          schedule_minute, buffer_min, chunk_start, chunk_end, last_ep, status,
-         created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', ?, ?)
+         custom_episode_pattern, custom_anime_url, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', ?, ?, ?, ?)
        ON CONFLICT(slug) DO UPDATE SET
          site = excluded.site,
          source_slug = excluded.source_slug,
@@ -7988,6 +8458,8 @@ export async function saveTrackedAnime(
          schedule_hour = excluded.schedule_hour,
          schedule_minute = excluded.schedule_minute,
          buffer_min = excluded.buffer_min,
+         custom_episode_pattern = excluded.custom_episode_pattern,
+         custom_anime_url = excluded.custom_anime_url,
          status = 'active',
          updated_at = excluded.updated_at`
     )
@@ -8000,6 +8472,8 @@ export async function saveTrackedAnime(
       data.scheduleHour,
       data.scheduleMinute ?? 0,
       data.bufferMin ?? 60,
+      data.customEpisodePattern ?? null,
+      data.customAnimeUrl ?? null,
       now,
       now
     )
@@ -8091,7 +8565,7 @@ export async function markEpisodePublished(
   db: D1Database,
   slug: string,
   epNumber: number,
-  site: SiteKey,
+  site: TrackSite,
   commitSha: string | null
 ): Promise<void> {
   await ensureCronDb(db);
@@ -8204,6 +8678,7 @@ export function isInScheduleWindow(row: TrackedAnimeRow): boolean {
 
   return true;
 }
+
 ===== END FILE =====
 
 ===== FILE: ./src/lib/dba-characters.ts =====
@@ -10337,10 +10812,23 @@ const BASE64_PARAM_NAMES = new Set([
 const VIDEO_EXT_RE = /\.(mp4|m3u8|mkv|webm|ts|mov)(\?|#|$)/i;
 
 const VIDEO_HOSTS = [
-  'player.', 'streamtape', 'dood', 'filemoon', 'voe', 'mp4upload',
-  'mixdrop', 'iixdrop', 'abyss', 'abyssplayer',
-  'framezi', 'kturbo',
-  'pixeldrain', 'vikingfile', 'buzzheavier', 'mega.nz', 'doply',
+  'player.', 
+  'streamtape',
+  'dood', 
+  'filemoon', 
+  'voe', 
+  'mp4upload',
+  'mixdrop', 
+  'iixdrop', 
+  'abyss', 
+  'abyssplayer',
+  'framezi', 
+  'kturbo',
+  'pixeldrain', 
+  'vikingfile', 
+  'buzzheavier', 
+  'mega.nz', 
+  'doply',
   'xtwap.top',
   'otakudesu',
   'kuramanime',
@@ -10364,6 +10852,7 @@ const VIDEO_HOSTS = [
   'animesub',
   'lexanime',
   'dropbox.com',
+  'sumantritelnologi',
 ];
 
 const WRAPPER_HOSTS = [
@@ -10698,6 +11187,72 @@ export function multiLayerDecode(input: string): DecodeResult | null {
   return { output: current, layers, urls: extractUrlsFromDecoded(current) };
 }
 
+interface InertiaMirrorStream {
+  provider?: string;
+  quality?: string;
+  url?: string;
+  stream_url?: string;
+  original_url?: string;
+}
+
+interface InertiaEpisode {
+  number?: number;
+  mirror_streams?: InertiaMirrorStream[];
+}
+
+interface InertiaPageData {
+  component?: string;
+  props?: {
+    episode?: InertiaEpisode;
+    anime?: { episodes?: InertiaEpisode[] };
+  };
+}
+
+function extractInertiaEmbeds(html: string): RawEntry[] {
+  const out: RawEntry[] = [];
+  const seen = new Set<string>();
+
+  const re = /\bdata-page\s*=\s*"([^"]+)"/gi;
+  for (const m of html.matchAll(re)) {
+    const encoded = m[1];
+    if (!encoded || encoded.length < 50) continue;
+
+    let data: InertiaPageData;
+    try {
+      data = JSON.parse(htmlDecode(encoded)) as InertiaPageData;
+    } catch {
+      continue;
+    }
+
+    const episodes: InertiaEpisode[] = [];
+    const direct = data.props?.episode;
+    if (direct && Array.isArray(direct.mirror_streams)) episodes.push(direct);
+    const list = data.props?.anime?.episodes;
+    if (Array.isArray(list)) episodes.push(...list);
+
+    for (const ep of episodes) {
+      if (!Array.isArray(ep.mirror_streams)) continue;
+      for (const s of ep.mirror_streams) {
+        const url = s.stream_url ?? s.original_url ?? s.url;
+        if (!url || typeof url !== 'string') continue;
+        if (!/^https?:\/\//i.test(url)) continue;
+        if (seen.has(url)) continue;
+        seen.add(url);
+
+        const provider = (s.provider ?? '').trim();
+        const quality = (s.quality ?? '').trim();
+        const label =
+          quality && quality.toLowerCase() !== 'default'
+            ? `[${quality}] ${provider || 'unknown'}`
+            : provider || null;
+
+        out.push({ url, label });
+      }
+    }
+  }
+  return out;
+}
+
 function extractNextJsEmbeds(html: string): RawEntry[] {
   const out: RawEntry[] = [];
   const seen = new Set<string>();
@@ -10726,9 +11281,16 @@ export function extractEntries(html: string): RawEntry[] {
   const entries: RawEntry[] = [];
   const seen = new Set<string>();
 
+  for (const e of extractInertiaEmbeds(html)) {
+    const key = e.url ?? e.base64 ?? '';
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    entries.push(e);
+  }
+
   for (const e of extractNextJsEmbeds(html)) {
-    const key = e.url!;
-    if (seen.has(key)) continue;
+    const key = e.url ?? '';
+    if (!key || seen.has(key)) continue;
     seen.add(key);
     entries.push(e);
   }
@@ -10956,8 +11518,9 @@ export async function fetchUrlViaProxy(
     }
 
     return { body: data.body, debug };
-  } catch (err: any) {
-    debug.error = `fetch threw: ${err?.message ?? 'unknown'}`;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'unknown';
+    debug.error = `fetch threw: ${msg}`;
     return { body: null, debug };
   }
 }
@@ -10993,6 +11556,76 @@ export function buildBatchUrls(input: string, start: number, end: number): strin
   }
   return urls;
 }
+
+export function resolveCustomPattern(
+  input: string
+): { pattern: string; host: string } | null {
+  const trimmed = input.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return null;
+
+  let host: string;
+  try {
+    host = new URL(trimmed.replace(/\{n\}/g, '1')).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+
+  if (/\{n\}/.test(trimmed)) {
+    return { pattern: trimmed, host };
+  }
+
+  const m1 = trimmed.match(/^(.*?)(episode|ep|eps)([-_.]?)(\d+)(.*)$/i);
+  if (m1) {
+    const prefix = m1[1] ?? '';
+    const keyword = m1[2] ?? 'episode';
+    const sep = m1[3] ?? '';
+    const suffix = m1[5] ?? '';
+    return { pattern: `${prefix}${keyword}${sep}{n}${suffix}`, host };
+  }
+
+  const m2 = trimmed.match(/^(.*\/)(\d+)(\D.*)?$/);
+  if (m2) {
+    const prefix = m2[1] ?? '';
+    const suffix = m2[3] ?? '';
+    return { pattern: `${prefix}{n}${suffix}`, host };
+  }
+
+  return null;
+}
+
+export function extractInertiaEpisodeNumbers(html: string): number[] {
+  const numbers: number[] = [];
+  const seen = new Set<number>();
+  const re = /\bdata-page\s*=\s*"([^"]+)"/gi;
+
+  for (const m of html.matchAll(re)) {
+    const encoded = m[1];
+    if (!encoded || encoded.length < 50) continue;
+
+    let data: InertiaPageData;
+    try {
+      data = JSON.parse(htmlDecode(encoded)) as InertiaPageData;
+    } catch {
+      continue;
+    }
+
+    const episodes: InertiaEpisode[] = [];
+    const direct = data.props?.episode;
+    if (direct) episodes.push(direct);
+    const list = data.props?.anime?.episodes;
+    if (Array.isArray(list)) episodes.push(...list);
+
+    for (const ep of episodes) {
+      const n = ep.number;
+      if (typeof n === 'number' && n > 0 && !seen.has(n)) {
+        seen.add(n);
+        numbers.push(n);
+      }
+    }
+  }
+  return numbers;
+}
+
 ===== END FILE =====
 
 ===== FILE: ./src/services/kitsu.ts =====
