@@ -14,6 +14,7 @@ import {
   type SiteKey,
   type TrackSite,
 } from '../lib/cron/state';
+
 import { updateTrackedAnime } from '../lib/cron/state-extra';
 import { createLazyInit } from '../lib/lazy-init';
 import {
@@ -21,6 +22,7 @@ import {
   getTrackedMessages,
   deleteTrackedMessages,
 } from '../lib/telegram-utils';
+
 import { resolveCustomPattern } from '../services/decode-core';
 
 const ALL_SITES: SiteKey[] = ['lexanime', 'animesub', 'samehadaku'];
@@ -252,10 +254,6 @@ function siteLabel(site: TrackSite): string {
   return site === 'custom' ? '🌐 Custom' : `🎬 ${site}`;
 }
 
-/* ============================================================
-   MENU RENDER
-   ============================================================ */
-
 export async function showMainMenu(ctx: Context, env: Env, edit = false): Promise<void> {
   const all = await listAllTrackedAnime(env.DB);
   const total = all.length;
@@ -473,10 +471,6 @@ export async function showDetail(
   await ctx.reply(lines.join('\n'), payload);
 }
 
-/* ============================================================
-   EDIT PROMPT
-   ============================================================ */
-
 export async function promptEdit(
   ctx: Context,
   env: Env,
@@ -588,10 +582,6 @@ export async function promptEdit(
     .catch(() => {});
 }
 
-/* ============================================================
-   ADD FLOW
-   ============================================================ */
-
 export async function startAddFlow(ctx: Context, env: Env, userId: number): Promise<void> {
   const sessionId = await createSession(env.DB, userId, 'add_site');
 
@@ -625,10 +615,6 @@ export async function startAddFlow(ctx: Context, env: Env, userId: number): Prom
 
   await ctx.reply(text, payload);
 }
-
-/* ============================================================
-   CATCHUP
-   ============================================================ */
 
 export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
   const loading = await ctx.reply('🔍 Mencari anime yang tertinggal...');
@@ -739,10 +725,6 @@ export async function handleCatchup(ctx: Context, env: Env): Promise<void> {
       .catch(() => {});
   }
 }
-
-/* ============================================================
-   RESCAN
-   ============================================================ */
 
 async function cleanupRescanSession(
   ctx: Context,
@@ -1024,10 +1006,6 @@ async function execRescan(
   }
 }
 
-/* ============================================================
-   TEXT INPUT
-   ============================================================ */
-
 export async function handleTrackTextV2(ctx: Context, env: Env): Promise<boolean> {
   const userId = ctx.from?.id;
   if (!userId) return false;
@@ -1075,7 +1053,7 @@ async function handleAddSlug(
 
   if (!file) {
     await ctx.reply(
-      `❌ <b>Markdown belum ada di yukio-data.</b>\n\nPath: <code>${escapeHtml(path)}</code>\n\n<i>Push dulu via /anime.</i>`,
+      `❌ <b>Markdown belum ada di data repo.</b>\n\nPath: <code>${escapeHtml(path)}</code>\n\n<i>Push dulu via /anime.</i>`,
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }
     );
     return true;
