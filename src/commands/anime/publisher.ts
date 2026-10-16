@@ -5,12 +5,11 @@ import type { FileToCommit } from '../../lib/github';
 import { githubCommitMultipleFiles } from '../../lib/github';
 import { getCharCache } from '../../lib/dba-characters';
 import { getEpCache } from '../../lib/dba-episodes';
-import { getAllVoiceActors } from '../../lib/dba-voice-actors';
 import {
   chainRelations,
   type UnifiedCharacter,
-  type UnifiedVoiceActor,
   type UnifiedRelation,
+  type UnifiedVoiceActor,
 } from '../../services/qimochi-chain-extras';
 import { buildMetadataYaml } from '../../services/qimochi-yaml';
 import { filterFranchises } from '../../lib/franchises';
@@ -18,18 +17,18 @@ import { chunkArray, slugify, stripHtml, looksIndonesian } from '../../lib/utils
 import { askAI } from '../../services/ai';
 import { safeFetch } from '../../lib/dba-common';
 import {
-  EP_PART_SIZE,
   chunkRange,
   chunkPath,
   readEpisodeChunk,
   serializeChunk,
   type EpisodeChunkItem,
 } from '../../lib/episode-chunks';
-
-void EP_PART_SIZE;
+import {
+  getSelectedSections,
+  type PublishSection,
+} from '../../lib/publish-selection';
 
 const CHAR_PART_SIZE = 50;
-const MAX_ACTORS_PER_FILE = 500;
 
 interface BuildFilesResult {
   files: FileToCommit[];
@@ -42,6 +41,7 @@ interface BuildFilesResult {
     franchises: number;
     actors: number;
   };
+  selected: PublishSection[];
 }
 
 function resolveSlug(session: SessionRow): string {
@@ -71,35 +71,6 @@ function sanitizeCharacter(c: UnifiedCharacter): {
   };
   if (c.nameNative) out.nameNative = c.nameNative.trim();
   if (c.image && /^https?:\/\//.test(c.image)) out.image = c.image.trim();
-  return out;
-}
-
-function sanitizeActor(va: {
-  id: string;
-  name: string;
-  nameNative: string | null;
-  image: string | null;
-  defaultLanguage: string | null;
-}): {
-  id: string;
-  name: string;
-  nameNative?: string;
-  image?: string;
-  defaultLanguage?: string;
-} {
-  const out: {
-    id: string;
-    name: string;
-    nameNative?: string;
-    image?: string;
-    defaultLanguage?: string;
-  } = {
-    id: va.id.trim().toLowerCase() || 'unknown',
-    name: va.name.trim() || 'Unknown',
-  };
-  if (va.nameNative) out.nameNative = va.nameNative.trim();
-  if (va.image && /^https?:\/\//.test(va.image)) out.image = va.image.trim();
-  if (va.defaultLanguage) out.defaultLanguage = va.defaultLanguage.trim();
   return out;
 }
 
@@ -153,13 +124,6 @@ async function resolveBody(
   return aiBody ?? clean;
 }
 
-/**
- * Bangun file episode chunks dari epCache.
- * - Path & chunk size mengikuti lib/episode-chunks (kompatibel dengan web qimochi).
- * - Merge dengan existing chunk: streams/downloads yang sudah ada di-preserve.
- * - Publisher HANYA menulis metadata (title, aired, duration); streams diisi oleh
- *   /batch atau cron runner.
- */
 async function buildEpisodeFiles(
   env: Env,
   slug: string,
@@ -170,7 +134,6 @@ async function buildEpisodeFiles(
 
   if (cachedEpisodes.length === 0) return { files, count };
 
-  // Group incoming by chunk range (fixed boundary).
   const byChunk = new Map<string, { start: number; end: number; items: EpisodeChunkItem[] }>();
   for (const ep of cachedEpisodes) {
     if (typeof ep.number !== 'number') continue;
@@ -198,7 +161,6 @@ async function buildEpisodeFiles(
         title: incoming.title ?? prev.title,
         aired: incoming.aired ?? prev.aired,
         duration: incoming.duration ?? prev.duration,
-        // JANGAN sentuh streams/downloads — biarkan nilai existing kalau ada
         streams: prev.streams,
         downloads: prev.downloads,
       });
@@ -222,6 +184,7 @@ export async function buildFiles(
 ): Promise<BuildFilesResult> {
   const slug = resolveSlug(session);
   const files: FileToCommit[] = [];
+  const selected = await getSelectedSections(env, session.session_id);
 
   let media: AniListMedia | null = null;
   if (session.metadata) {
@@ -238,6 +201,7 @@ export async function buildFiles(
     kitsuId: session.kitsu_id ?? null,
   });
 
+  // Metadata selalu di-commit
   files.push({
     path: `src/content/anime/${slug}.md`,
     content: `${yaml}\n\n${body}\n`,
@@ -252,39 +216,43 @@ export async function buildFiles(
     actors: 0,
   };
 
-  /* Characters */
-  const charCache = await getCharCache(env.DB, session.session_id);
-  if (charCache && charCache.chars.length > 0) {
-    const sanitized = charCache.chars.map(sanitizeCharacter);
-    const chunks = chunkArray(sanitized, CHAR_PART_SIZE);
-    let cursor = 1;
-    for (const chunk of chunks) {
-      const start = cursor;
-      const end = cursor + chunk.length - 1;
-      files.push({
-        path: `data/anime/${slug}/characters/${start}-${end}.json`,
-        content: JSON.stringify(chunk, null, 2) + '\n',
-        itemCount: chunk.length,
-      });
-      cursor = end + 1;
-      counts.characters += chunk.length;
+  /* Characters — hanya kalau user klik 👥 Characters */
+  if (selected.includes('characters')) {
+    const charCache = await getCharCache(env.DB, session.session_id);
+    if (charCache && charCache.chars.length > 0) {
+      const sanitized = charCache.chars.map(sanitizeCharacter);
+      const chunks = chunkArray(sanitized, CHAR_PART_SIZE);
+      let cursor = 1;
+      for (const chunk of chunks) {
+        const start = cursor;
+        const end = cursor + chunk.length - 1;
+        files.push({
+          path: `data/anime/${slug}/characters/${start}-${end}.json`,
+          content: JSON.stringify(chunk, null, 2) + '\n',
+          itemCount: chunk.length,
+        });
+        cursor = end + 1;
+        counts.characters += chunk.length;
+      }
     }
   }
 
-  /* Episodes — chunk path & merge lewat helper */
-  const epCache = await getEpCache(env.DB, session.session_id);
-  if (epCache && epCache.episodes.length > 0) {
-    const { files: epFiles, count } = await buildEpisodeFiles(
-      env,
-      slug,
-      epCache.episodes
-    );
-    files.push(...epFiles);
-    counts.episodes += count;
+  /* Episodes — hanya kalau user klik 🎬 Episodes */
+  if (selected.includes('episodes')) {
+    const epCache = await getEpCache(env.DB, session.session_id);
+    if (epCache && epCache.episodes.length > 0) {
+      const { files: epFiles, count } = await buildEpisodeFiles(
+        env,
+        slug,
+        epCache.episodes
+      );
+      files.push(...epFiles);
+      counts.episodes += count;
+    }
   }
 
-  /* Franchises */
-  if (session.mal_id) {
+  /* Franchises — hanya kalau user klik 🔗 Franchises */
+  if (selected.includes('franchises') && session.mal_id) {
     const { data: result } = await safeFetch(
       () =>
         chainRelations({
@@ -307,37 +275,11 @@ export async function buildFiles(
     }
   }
 
-  /* Actors */
-  const vas = await getAllVoiceActors(env.DB);
-  if (vas.length > 0) {
-    const sanitized = vas.map(sanitizeActor);
-    const groups = new Map<string, typeof sanitized>();
-    for (const va of sanitized) {
-      const first = (va.id.charAt(0) || '').toLowerCase();
-      const letter = /^[a-z]$/.test(first) ? first : '_';
-      if (!groups.has(letter)) groups.set(letter, []);
-      groups.get(letter)!.push(va);
-    }
-    for (const [letter, items] of groups) {
-      items.sort((a, b) => a.id.localeCompare(b.id));
-      const chunks = chunkArray(items, MAX_ACTORS_PER_FILE);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i]!;
-        const path =
-          chunks.length === 1
-            ? `data/actors/${letter}.json`
-            : `data/actors/${letter}-${i + 1}.json`;
-        files.push({
-          path,
-          content: JSON.stringify(chunk, null, 2) + '\n',
-          itemCount: chunk.length,
-        });
-        counts.actors += chunk.length;
-      }
-    }
-  }
+  /* Actors — di-skip dari publish. Tidak ada section untuk ini.
+   * Kalau butuh update actor files, jalankan command terpisah.
+   */
 
-  return { files, slug, body, counts };
+  return { files, slug, body, counts, selected };
 }
 
 export interface PublishResult {
@@ -348,6 +290,7 @@ export interface PublishResult {
   slug: string;
   filesCount: number;
   counts: BuildFilesResult['counts'];
+  selected: PublishSection[];
 }
 
 export async function publishAnime(
@@ -370,6 +313,7 @@ export async function publishAnime(
         franchises: 0,
         actors: 0,
       },
+      selected: [],
     };
   }
 
@@ -387,6 +331,7 @@ export async function publishAnime(
     slug: built.slug,
     filesCount: built.files.length,
     counts: built.counts,
+    selected: built.selected,
   };
 }
 
