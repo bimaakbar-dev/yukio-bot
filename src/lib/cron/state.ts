@@ -2,7 +2,7 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { createLazyInit } from '../lazy-init';
 
-export type SiteKey = 'lexanime' | 'animesub' | 'samehadaku';
+export type SiteKey = 'lexanime' | 'animesub' | 'samehadaku' | 'komikcast';
 export type TrackSite = SiteKey | 'custom';
 
 export interface TrackedAnimeRow {
